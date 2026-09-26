@@ -12,12 +12,13 @@
 //! the model reads.
 
 const std = @import("std");
-const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const marker = "fx-compactor-v1\n";
+/// How checkpoints written by the previous compactor begin.
+const legacy_handoff_open = "<context_handoff>";
 
 /// One compacted turn, shown word for word except for the summary of its
 /// work.
@@ -76,14 +77,14 @@ pub fn encode(alloc: Allocator, payload: Payload) Allocator.Error![]u8 {
     return out.toOwnedSlice() catch error.OutOfMemory;
 }
 
-pub fn isPayload(summary: []const u8) bool {
+fn isPayload(summary: []const u8) bool {
     return std.mem.startsWith(u8, summary, marker);
 }
 
 /// True when the checkpoint stands in for everything before it, so earlier
 /// raw turns and older checkpoints are no longer part of the context.
 pub fn replacesPriorContext(summary: []const u8) bool {
-    return isPayload(summary) or std.mem.startsWith(u8, summary, types.context_handoff_open);
+    return isPayload(summary) or std.mem.startsWith(u8, summary, legacy_handoff_open);
 }
 
 /// Checkpoints written by the previous compactor name a state file in the
@@ -344,7 +345,7 @@ test "the saved line names only what can be opened" {
 
 test "older checkpoints are recognized but not parsed" {
     const alloc = testing.allocator;
-    const handoff = types.context_handoff_open ++ "\n## Conversation summary\n> earlier\n" ++ types.context_handoff_close;
+    const handoff = legacy_handoff_open ++ "\n## Conversation summary\n> earlier\n</context_handoff>";
     try testing.expect(replacesPriorContext(handoff));
     try testing.expect(!isPayload(handoff));
     try testing.expect(try modelText(alloc, handoff) == null);
@@ -370,7 +371,7 @@ test "older checkpoints yield their exact users from the named state file" {
     const state = "{\"version\":1,\"summary\":\"Earlier work.\",\"users\":[\"okay so you saying that if 2 GB exeeds then what happens ? \",\"yes\"],\"archives\":[]}";
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(state, &digest, .{});
-    const summary = try std.fmt.allocPrint(arena, "{s}\n## Conversation summary\n> fx-compaction-state-v1 result-state-1-2.txt {d} {x}\n> Task state:\n", .{ types.context_handoff_open, state.len, digest });
+    const summary = try std.fmt.allocPrint(arena, "{s}\n## Conversation summary\n> fx-compaction-state-v1 result-state-1-2.txt {d} {x}\n> Task state:\n", .{ legacy_handoff_open, state.len, digest });
     const ref = legacyStateRef(summary).?;
     try testing.expectEqualStrings("result-state-1-2.txt", ref.handle);
     const payload = (try parseLegacyState(arena, ref, state)).?;
@@ -383,6 +384,6 @@ test "older checkpoints yield their exact users from the named state file" {
     try testing.expectEqual(@as(usize, 0), payload.turn_count);
     // Bytes that do not match the checkpoint are not trusted.
     try testing.expect(try parseLegacyState(arena, ref, state[0 .. state.len - 1]) == null);
-    try testing.expect(legacyStateRef(types.context_handoff_open ++ "no state here") == null);
+    try testing.expect(legacyStateRef(legacy_handoff_open ++ "no state here") == null);
     try testing.expect(legacyStateRef(marker ++ "{}") == null);
 }

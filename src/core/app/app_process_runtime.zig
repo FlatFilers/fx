@@ -116,14 +116,6 @@ pub fn Runtime(comptime App: type) type {
                 error.ConnectionSetupTimedOut => return alloc.dupe(u8, "Connection setup timed out after 30 seconds."),
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Connection setup failed: TLS could not be initialized."),
                 error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
-                error.InvalidCompactionHandoff => return alloc.dupe(
-                    u8,
-                    "The model did not return a usable context summary. Your existing context was kept. Try /compact again or send a follow-up.",
-                ),
-                error.CompactionResultStorageUnavailable => return alloc.dupe(
-                    u8,
-                    "Context could not be compacted because older tool results could not be preserved. Save the session or restore writable session storage, then try again.",
-                ),
                 else => {},
             }
             if (detailedErrorSummary(err)) |detail| {
@@ -180,9 +172,9 @@ test "compaction activity error routing requires exact operation and turn proven
         .api_key = @constCast("fixture"),
         .history = &.{},
     } };
-    const provenance: compaction_activity.ErrorProvenance = .{ .operation_id = id, .turn_id = 7, .err = error.InvalidCompactionHandoff };
-    try std.testing.expect(compactionErrorHandled(task, provenance, error.InvalidCompactionHandoff));
-    try std.testing.expect(!compactionErrorHandled(task, null, error.InvalidCompactionHandoff));
+    const provenance: compaction_activity.ErrorProvenance = .{ .operation_id = id, .turn_id = 7, .err = error.ModelFailed };
+    try std.testing.expect(compactionErrorHandled(task, provenance, error.ModelFailed));
+    try std.testing.expect(!compactionErrorHandled(task, null, error.ModelFailed));
     try std.testing.expect(!compactionErrorHandled(task, provenance, error.OutOfMemory));
     var stale = provenance;
     stale.operation_id = @enumFromInt(2);
@@ -281,31 +273,6 @@ test "formatErrorBody describes terminal connection setup failures plainly" {
     const unrelated_timeout = try Rt.formatErrorBody(alloc, "request failed", error.ConnectionTimedOut);
     defer alloc.free(unrelated_timeout);
     try std.testing.expectEqualStrings("request failed: ConnectionTimedOut", unrelated_timeout);
-}
-
-test "formatErrorBody explains how to retry an unusable compaction summary" {
-    const alloc = std.testing.allocator;
-    const body = try Runtime(DummyApp).formatErrorBody(alloc, "request failed", error.InvalidCompactionHandoff);
-    defer alloc.free(body);
-    try std.testing.expect(std.mem.find(u8, body, "context was kept") != null);
-    try std.testing.expect(std.mem.find(u8, body, "/compact") != null);
-    try std.testing.expect(std.mem.find(u8, body, "follow-up") != null);
-}
-
-test "formatErrorBody explains compaction result storage failure" {
-    const alloc = std.testing.allocator;
-    const Rt = Runtime(DummyApp);
-    const body = try Rt.formatErrorBody(
-        alloc,
-        "request failed",
-        error.CompactionResultStorageUnavailable,
-    );
-    defer alloc.free(body);
-
-    try std.testing.expectEqualStrings(
-        "Context could not be compacted because older tool results could not be preserved. Save the session or restore writable session storage, then try again.",
-        body,
-    );
 }
 
 test "formatToolExecutionError includes detail for MissingField" {

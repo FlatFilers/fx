@@ -7477,7 +7477,7 @@ test "vision parsed record transfer allocation failure releases the parsed owner
     );
 }
 
-test "vision authorized catalog retains historical access outside budgeted model history" {
+test "vision authorized catalog retains historical access outside compacted model history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7489,6 +7489,11 @@ test "vision authorized catalog retains historical access outside budgeted model
             .user = .{ .text = @constCast("historical turn"), .images = source_images },
             .assistant = @constCast("historical answer"),
         } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("historical turn inspected an image"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("newer turn without images") },
             .assistant = @constCast("newer answer"),
@@ -7496,17 +7501,19 @@ test "vision authorized catalog retains historical access outside budgeted model
     };
     const catalog = try session_runtime.collect_image_catalog(alloc, &history, &.{});
     defer types.freeImageAttachmentSlice(alloc, catalog);
-    var budget_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer budget_arena_state.deinit();
-    var budgeted_messages: std.ArrayList(ChatMessage) = .empty;
-    try session_runtime.appendHistoryChatMessagesBudgeted(
-        budget_arena_state.allocator(),
-        &budgeted_messages,
+    var context_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer context_arena_state.deinit();
+    var context_messages: std.ArrayList(ChatMessage) = .empty;
+    try session_runtime.appendActiveContextHistoryChatMessages(
+        context_arena_state.allocator(),
+        &context_messages,
         &history,
-        .{ .max_tokens = 1 },
+        1,
     );
-    for (budgeted_messages.items) |message| {
+    try std.testing.expect(context_messages.items.len > 0);
+    for (context_messages.items) |message| {
         try std.testing.expectEqual(@as(usize, 0), message.images.len);
+        if (message.content) |content| try std.testing.expect(std.mem.find(u8, content, "historical answer") == null);
     }
 
     const provider_json = try visionProviderSuccess(alloc, &.{41});

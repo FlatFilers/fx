@@ -2261,9 +2261,6 @@ pub const InterruptedHistoryTurn = struct {
     cancellation_origin: CancellationOrigin = .turn,
 };
 
-pub const context_handoff_open = "<context_handoff>";
-pub const context_handoff_close = "</context_handoff>";
-
 pub const CompactedSummaryHistoryTurn = struct {
     summary: []u8,
     removed_turn_count: usize,

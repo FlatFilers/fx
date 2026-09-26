@@ -1,12 +1,10 @@
 const std = @import("std");
 const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
-const session_runtime = @import("../../session/session.zig");
 const stream_provider = @import("../stream_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
-const HistoryTurn = types.HistoryTurn;
 
 const textTokens = token_estimate.textTokens;
 
@@ -261,6 +259,7 @@ test "buildProviderPrompt separates instructions from chronological messages" {
 }
 
 test "buildProviderPrompt keeps compacted session context out of instructions" {
+    const session_runtime = @import("../../session/session.zig");
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -292,7 +291,7 @@ test "buildProviderPrompt keeps compacted session context out of instructions" {
         .status = .success,
         .model_view_covers_full_file = true,
     }};
-    const history = [_]HistoryTurn{
+    const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("LEADING_SUMMARY_ONLY"),
             .removed_turn_count = 2,

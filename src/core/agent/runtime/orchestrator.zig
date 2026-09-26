@@ -19,7 +19,6 @@ const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
-const session_child_store = @import("../../session/session_child_store.zig");
 const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
@@ -6342,6 +6341,7 @@ test "automatic compaction interruption persists transport cancellation and pres
 
 test "compaction activity transaction settles only after publication and preserves failures" {
     const support = @import("tests/support.zig");
+    const session_child_store = @import("../../session/session_child_store.zig");
     const Host = struct {
         fake: support.FakeAgentRuntimeDeps,
         worker: worker_runtime.WorkerRuntime = .{},

@@ -19,7 +19,7 @@ const HANDOFF = `INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
 const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
-const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Your existing context was kept|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
+const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
 
 type Trigger = "manual" | "auto" | "overflow" | "ordinary";
 type Outcome = "success" | "cancel" | "empty" | "provider-error";

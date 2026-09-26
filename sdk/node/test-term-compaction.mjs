@@ -98,13 +98,15 @@ async function runScenario(name) {
   const wasm = await readFile(wasmPath);
   const head = "HOST_HISTORY_HEAD_73b4", tail = "HOST_HISTORY_TAIL_b149";
   let handoff;
-  // Several ordinary exchanges leave older history outside the retained suffix,
-  // without pushing a cancelled attempt's followup over the automatic threshold.
+  // Each ordinary reply is larger than the turns kept unchanged and too long to
+  // keep word for word, so compacting older turns asks for a summary. Three of
+  // them stay below the automatic threshold, even with a cancelled attempt's
+  // followup.
   const automatic = name === "auto-cancel-headers";
   const seedTurns = automatic ? 1 : 3;
-  const seedReply = (turn) => `${turn === 1 ? head : `HOST_HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(automatic ? 18_000 : 400)}HOST_SEED_DONE_${turn}${turn === seedTurns ? `\n${tail}` : ""}`;
+  const seedReply = (turn) => `${turn === 1 ? head : `HOST_HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(automatic ? 18_000 : 1_800)}HOST_SEED_DONE_${turn}${turn === seedTurns ? `\n${tail}` : ""}`;
   const activity = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
-  const forbidden = /Compacting|compaction|Context compacted|No context to compact|Your existing context was kept|HOST_INTERNAL_HANDOFF_268a/i;
+  const forbidden = /Compacting|compaction|Context compacted|No context to compact|HOST_INTERNAL_HANDOFF_268a/i;
   const emptyComposer = (text) => text.split("\n").some((line) => /^[ \t]*(?:┃|❯|>)[ \t]*$/.test(line));
   const records = new Map();
   const requests = [];
@@ -233,12 +235,11 @@ async function runScenario(name) {
     await stop();
     phase = "attempt";
     await start(["--resume", sessionId]);
-    if (automatic) {
-      active.runtime.write("/model\r");
-      await waitFor(() => grid(active.terminal).includes("128K context") && grid(active.terminal).includes("tab provider"), "model capabilities loaded");
-      active.runtime.write("\x1b");
-      await waitFor(() => !grid(active.terminal).includes("tab provider") && emptyComposer(grid(active.terminal)), "model catalog closed");
-    }
+    // A known context window bounds the turns kept unchanged, so older turns compact.
+    active.runtime.write("/model\r");
+    await waitFor(() => grid(active.terminal).includes("128K context") && grid(active.terminal).includes("tab provider"), "model capabilities loaded");
+    active.runtime.write("\x1b");
+    await waitFor(() => !grid(active.terminal).includes("tab provider") && emptyComposer(grid(active.terminal)), "model catalog closed");
     const beforeCommits = commits;
     const beforeBytes = [...records.values()][0].bytes.slice();
     const cancelledPrompt = "Cancel this automatic summary before headers.";

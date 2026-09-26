@@ -19,7 +19,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const feedback_runtime = @import("../feedback/runtime.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
-const compactor = @import("../compactor/compactor.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const image_commands = @import("../images/image_commands.zig");
 const mcp_auth = @import("../mcp/mcp_auth.zig");
@@ -4556,6 +4555,7 @@ test "trace notice distinguishes Markdown file outcomes without a feedback CTA" 
 }
 
 test "trace compaction summary renders recorded events without file tracing" {
+    const compactor = @import("../compactor/compactor.zig");
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
