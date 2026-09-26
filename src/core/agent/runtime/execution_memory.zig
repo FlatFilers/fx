@@ -1372,7 +1372,6 @@ test "saved read_tool_result preparation preserves exact secret-like output" {
 }
 
 test "retrieved output remains backed across the inline cap" {
-    const compaction = @import("context_compaction.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1412,21 +1411,14 @@ test "retrieved output remains backed across the inline cap" {
         try std.testing.expectEqual(@min(case.bytes, case.cap), prepared.model_output.len);
         try std.testing.expect(std.mem.startsWith(u8, prepared.model_output, head));
         try std.testing.expect(std.mem.find(u8, prepared.model_output, "[redacted]") == null);
-        var messages = [_]ChatMessage{.{ .role = .tool, .tool_call_id = "retrieval-cap", .tool_name = "read_tool_result", .content = prepared.model_output, .tool_result_memory = prepared.memory }};
         if (case.bytes > case.cap and storage != .unavailable) {
             const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredRetrieval;
             try std.testing.expectEqual(case.bytes, prepared.memory.stored_output_bytes);
             const stored = try result_store.readForReplayManaged(arena, &capability, handle, case.bytes);
             try std.testing.expectEqualStrings(raw, stored);
-            try compaction.promoteMessageResults(arena, &messages, .{ .managed = &capability }, 0);
-            try std.testing.expectEqualStrings(handle, messages[0].tool_result_memory.?.output_handle.?);
         } else {
             try std.testing.expect(prepared.memory.output_handle == null);
-            if (case.bytes > case.cap) {
-                try std.testing.expectError(error.IncompleteCompactionResult, compaction.promoteMessageResults(arena, &messages, .unavailable, 0));
-            } else {
-                try std.testing.expectEqualStrings(raw, prepared.model_output);
-            }
+            if (case.bytes <= case.cap) try std.testing.expectEqualStrings(raw, prepared.model_output);
         }
     };
 }
@@ -1455,7 +1447,6 @@ test "retrieved output storage failure does not publish an unbacked result" {
 
 test "saved tool output preparation keeps builtins and dynamic tools compactable" {
     const builtins = @import("../../../builtins/tools.zig");
-    const compaction = @import("context_compaction.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1479,9 +1470,6 @@ test "saved tool output preparation keeps builtins and dynamic tools compactable
         }, toolCall("tool-preparation", name, "{}"), raw);
         const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredOutput;
         try std.testing.expectEqual(raw.len, prepared.memory.stored_output_bytes);
-        var messages = [_]ChatMessage{.{ .role = .tool, .tool_call_id = "tool-preparation", .tool_name = name, .content = prepared.model_output, .tool_result_memory = prepared.memory }};
-        try compaction.promoteMessageResults(arena, &messages, .{ .legacy_dir = dir }, 0);
-        try std.testing.expectEqualStrings(handle, messages[0].tool_result_memory.?.output_handle.?);
         const stored = try result_store.readByRange(arena, dir, handle, 1, 16384);
         try std.testing.expect(std.mem.find(u8, stored, raw) != null);
     }

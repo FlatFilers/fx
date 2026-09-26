@@ -9,6 +9,7 @@ const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_json = @import("../session/session_json.zig");
+const compactor = @import("../compactor/compactor.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -1752,7 +1753,10 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) 
     switch (turn) {
         .compacted_summary => |entry| {
             try writer.print("[compacted] removed_turns={d} compactions={d}\n", .{ entry.removed_turn_count, entry.compaction_count });
-            try writeTextBlock(writer, entry.summary);
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena_state.deinit();
+            const rendered = compactor.modelText(arena_state.allocator(), entry.summary) catch null;
+            try writeTextBlock(writer, rendered orelse entry.summary);
         },
         .assistant => |entry| {
             try writeSessionUserTurnText(writer, entry.user);

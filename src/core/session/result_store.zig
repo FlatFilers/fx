@@ -5,6 +5,8 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
+const compactor = @import("../compactor/compactor.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -737,6 +739,47 @@ fn readStoredTextManaged(
     return file.readToEnd(alloc, stored_text_max_bytes);
 }
 
+/// This session's tool-results folder as fx-compactor's record store. The
+/// store borrows `capability`.
+pub fn compactorStore(capability: *session_child_store.SessionChildCapability) compactor.Store {
+    return .{ .context = capability, .vtable = &.{
+        .write = writeCompactorFile,
+        .list = listCompactorFiles,
+        .read = readCompactorFile,
+    } };
+}
+
+fn writeCompactorFile(context: *anyopaque, alloc: Allocator, name: []const u8, content: []const u8) compactor.Store.Error!void {
+    const capability: *session_child_store.SessionChildCapability = @ptrCast(@alignCast(context));
+    var entry = capability.atomicReplace(alloc, .tool_results, name, content) catch |err| return compactorStoreError("write", name, err);
+    entry.deinit(alloc);
+}
+
+fn listCompactorFiles(context: *anyopaque, arena: Allocator) compactor.Store.Error![]const []const u8 {
+    const capability: *session_child_store.SessionChildCapability = @ptrCast(@alignCast(context));
+    const entries = capability.iterate(arena, .tool_results) catch |err| return compactorStoreError("list", "", err);
+    return entries.names;
+}
+
+fn readCompactorFile(context: *anyopaque, arena: Allocator, name: []const u8, max_bytes: usize) compactor.Store.Error![]const u8 {
+    const capability: *session_child_store.SessionChildCapability = @ptrCast(@alignCast(context));
+    var file = capability.openFileReadOnly(arena, .tool_results, name) catch |err| return compactorStoreError("open", name, err);
+    defer file.deinit();
+    const size = (file.stat() catch |err| return compactorStoreError("stat", name, err)).size;
+    return file.readRange(arena, 0, @intCast(@min(size, max_bytes))) catch |err| compactorStoreError("read", name, err);
+}
+
+fn compactorStoreError(operation: []const u8, name: []const u8, err: anyerror) compactor.Store.Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.FileNotFound => error.FileNotFound,
+        else => {
+            debug_trace.logf("context_compaction", "record store {s} failed name={s} err={s}", .{ operation, name, @errorName(err) });
+            return error.StoreFailed;
+        },
+    };
+}
+
 fn validateHandle(handle: []const u8) !void {
     if (isImageHandle(handle)) return validateHandle(handle[6..]);
     if (handle.len == 0 or handle.len > 160) return error.InvalidHandle;
@@ -769,6 +812,30 @@ test "large result storage creates stable handle and bounded preview" {
     defer alloc.free(@constCast(again.memory.output_handle.?));
     defer alloc.free(@constCast(again.memory.preview.?));
     try std.testing.expectEqualStrings(prepared.memory.output_handle.?, again.memory.output_handle.?);
+}
+
+test "the tool-results folder serves as the compactor's record store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
+    defer capability.deinit();
+    const store = compactorStore(&capability);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try store.write(alloc, "compacted-T1.txt", "T1 shell: ls\nResult:\nfirst\n");
+    try store.write(alloc, "compacted-T1.txt", "T1 shell: ls\nResult:\nreplaced\n");
+    const names = try store.list(arena);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("compacted-T1.txt", names[0]);
+    try std.testing.expectEqualStrings("T1 shell: ls\nResult:\nreplaced\n", try store.read(arena, "compacted-T1.txt", 1024));
+    try std.testing.expectEqualStrings("T1 shell", try store.read(arena, "compacted-T1.txt", 8));
+    try std.testing.expectError(error.FileNotFound, store.read(arena, "compacted-T2.txt", 1024));
+    try std.testing.expectError(error.StoreFailed, store.write(alloc, "../escape.txt", "no"));
 }
 
 test "diff content packs round trip, bound, and reject tampering" {

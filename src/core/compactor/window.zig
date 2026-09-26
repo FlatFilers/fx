@@ -1,0 +1,436 @@
+//! Which part of the conversation fx-compactor compacts. The newest turns stay
+//! unchanged within a budget small enough that compaction always frees room;
+//! everything older is compacted.
+
+const std = @import("std");
+const settings = @import("settings.zig");
+const session_runtime = @import("../session/session.zig");
+const token_estimate = @import("../shared/token_estimate.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
+const trace = @import("trace.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
+const types = @import("../shared/types.zig");
+
+const Allocator = std.mem.Allocator;
+const HistoryTurn = types.HistoryTurn;
+
+/// The newest turns kept unchanged, and the newest compacted turns shown word
+/// for word, may each use at most this share of the compaction point.
+const kept_percent: usize = 20;
+const max_kept_turns: usize = 4;
+
+/// How large the conversation is and may be, in estimated tokens.
+pub const Size = struct {
+    /// Where automatic compaction starts, when the model's size is known.
+    compact_at_tokens: ?usize,
+    /// The model's usable input, when known.
+    usable_tokens: ?usize,
+    /// The request that needs the room, when there is one.
+    request_tokens: ?usize = null,
+    /// The provider rejected that request as too large, so the estimate was
+    /// wrong and the kept part is bounded by the request instead.
+    overflow: bool = false,
+
+    /// The sizes for a model, compacting automatically at `percent` of its
+    /// usable input.
+    pub fn of(capabilities: model_capabilities.Capabilities, percent: u8) Size {
+        return .{
+            .compact_at_tokens = compactAtTokens(capabilities, percent),
+            .usable_tokens = usableInputTokens(capabilities),
+        };
+    }
+
+    /// The request has reached the automatic compaction point.
+    pub fn due(self: Size) bool {
+        const at = self.compact_at_tokens orelse return false;
+        const request = self.request_tokens orelse return false;
+        return request >= at;
+    }
+
+    /// Compaction must free room: without it the request cannot be sent.
+    fn required(self: Size) bool {
+        const request = self.request_tokens orelse return self.overflow;
+        return self.overflow or request > (self.usable_tokens orelse std.math.maxInt(usize));
+    }
+};
+
+/// Request size, in tokens, at which automatic compaction starts: `percent`
+/// of the model's usable input.
+fn compactAtTokens(capabilities: model_capabilities.Capabilities, percent: u8) ?usize {
+    const usable = usableInputTokens(capabilities) orelse return null;
+    const bounded = @min(settings.max_percent, @max(settings.min_percent, percent));
+    return usable / 100 * bounded + usable % 100 * bounded / 100;
+}
+
+/// The model's input room: its context window less the room it keeps for
+/// output.
+fn usableInputTokens(capabilities: model_capabilities.Capabilities) ?usize {
+    const context_window = capabilities.context_window orelse return null;
+    const context_tokens: usize = @intCast(context_window);
+    // Reserve exactly what the request asks for; that limit is always below the window.
+    const output_tokens: usize = model_capabilities.requestOutputTokens(capabilities) orelse return context_tokens;
+    return context_tokens - output_tokens;
+}
+
+fn keptTokens(compact_at_tokens: usize) usize {
+    return compact_at_tokens / 100 * kept_percent + compact_at_tokens % 100 * kept_percent / 100;
+}
+
+const textTokens = token_estimate.textTokens;
+
+const RetainedContext = struct {
+    cut: types.ContextHistoryCut,
+    newest_exchange_tokens: usize,
+    estimated_tokens: usize,
+};
+
+/// Selects complete execution steps. Payloads are measured, never shortened.
+fn selectRecentContext(history: []const HistoryTurn, target: usize, input_capacity: ?usize, options: struct {
+    provider: ?model_provider.ProviderSelection = null,
+    reject_oversized_tool_step: bool = false,
+    max_turns: ?usize = null,
+}) RetainedContext {
+    var raw_count = session_runtime.rawHistoryTurnCount(history);
+    var selected = types.ContextHistoryCut{ .turns = raw_count };
+    var total: usize = 0;
+    var newest: usize = 0;
+    var selected_any = false;
+    var turns_used: usize = 0;
+    var index = history.len;
+    history_scan: while (index > 0) {
+        index -= 1;
+        const turn = history[index];
+        if (turn == .compacted_summary) continue;
+        if (options.max_turns) |limit| if (selected_any and turns_used >= limit) break;
+        raw_count -= 1;
+        const user = switch (turn) {
+            .assistant => |entry| entry.user.text,
+            .interrupted => |entry| entry.user.text,
+            .compacted_summary => unreachable,
+        };
+        const reply = switch (turn) {
+            .assistant => |entry| entry.assistant,
+            .interrupted => |entry| entry.assistant orelse "",
+            .compacted_summary => unreachable,
+        };
+        const execution = switch (turn) {
+            .assistant => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => unreachable,
+        };
+        const replay = switch (turn) {
+            .assistant => |entry| entry.provider_replay,
+            .interrupted => null,
+            .compacted_summary => unreachable,
+        };
+        var base = textTokens(user) +| textTokens(reply) +| replay_tokens(replay, options.provider) +| 8;
+        var steering_index = execution.steering.len;
+        var step_index = execution.tool_steps.len;
+        if (step_index == 0) {
+            for (execution.steering) |entry| {
+                base +|= textTokens(entry.text);
+                if (entry.assistant_prefix) |prefix| base +|= textTokens(prefix);
+            }
+            if (input_capacity) |capacity| {
+                if (!selected_any and base >= capacity) break :history_scan;
+            }
+            if (selected_any and (raw_count == 0 or total +| base > target)) break;
+            total +|= base;
+            selected = .{ .turns = raw_count };
+            if (!selected_any) newest = total;
+            selected_any = true;
+            turns_used += 1;
+            continue;
+        }
+        var turn_counted = false;
+        while (step_index > 0) {
+            step_index -= 1;
+            var cost = base +| executionStepTokens(execution.tool_steps[step_index], options.provider);
+            var next_steering = steering_index;
+            while (next_steering > 0 and execution.steering[next_steering - 1].after_tool_step_count >= step_index) {
+                next_steering -= 1;
+                cost +|= textTokens(execution.steering[next_steering].text);
+                if (execution.steering[next_steering].assistant_prefix) |prefix| cost +|= textTokens(prefix);
+            }
+            if (!selected_any and options.reject_oversized_tool_step and cost > target) break :history_scan;
+            if (input_capacity) |capacity| {
+                if (!selected_any and cost >= capacity) break :history_scan;
+            }
+            if (selected_any and ((raw_count == 0 and step_index == 0) or total +| cost > target)) return .{
+                .cut = selected,
+                .newest_exchange_tokens = newest,
+                .estimated_tokens = total,
+            };
+            total +|= cost;
+            selected = .{ .turns = raw_count, .tool_steps = step_index, .steering = next_steering };
+            if (!selected_any) newest = total;
+            selected_any = true;
+            if (!turn_counted) turns_used += 1;
+            turn_counted = true;
+            steering_index = next_steering;
+            base = 0;
+        }
+    }
+    return .{ .cut = selected, .newest_exchange_tokens = newest, .estimated_tokens = total };
+}
+
+fn replay_tokens(replay: ?types.ProviderReplay, provider: ?model_provider.ProviderSelection) usize {
+    const value = replay orelse return 0;
+    if (provider) |route| if (!value.matches(route)) return 0;
+    return textTokens(value.parts_json);
+}
+
+fn executionStepTokens(step: types.ToolExecutionStep, provider: ?model_provider.ProviderSelection) usize {
+    var total: usize = 8 +| replay_tokens(step.provider_replay, provider);
+    if (step.assistant) |text| total +|= textTokens(text);
+    for (step.tool_calls) |call| {
+        total +|= textTokens(call.id) +| textTokens(call.name) +| textTokens(call.arguments_json) +| 8;
+    }
+    for (step.tool_results) |result| {
+        total +|= textTokens(result.tool_call_id) +| textTokens(result.tool_name) +| textTokens(result.output) +| 8;
+    }
+    return total;
+}
+
+pub const Window = struct {
+    /// The newest checkpoint before `older`.
+    earlier: ?[]const u8,
+    /// Raw turns to compact, oldest first.
+    older: []HistoryTurn,
+    /// The raw part that stays after the checkpoint.
+    retained_history: []HistoryTurn,
+    cut: types.ContextHistoryCut,
+    /// Token budget of the part kept unchanged. The newest compacted turns
+    /// may use the same for their exact messages and replies.
+    kept_tokens: usize,
+
+    /// True when the cut falls inside a turn: that turn's user message stays
+    /// with the part kept after the checkpoint.
+    pub fn splitsLastTurn(self: Window) bool {
+        return self.older.len > 0 and (self.cut.tool_steps > 0 or self.cut.steering > 0);
+    }
+};
+
+/// Chooses what to compact. Null when nothing needs compacting. When the
+/// request cannot be sent otherwise, compacts everything before giving up
+/// with `ContextCapacityExceeded`. Slices are arena-owned.
+pub fn choose(
+    arena: Allocator,
+    history: []const HistoryTurn,
+    active: ?types.AssistantHistoryTurn,
+    size: Size,
+    route: model_provider.ProviderSelection,
+    trace_ctx: debug_trace.TraceContext,
+) !?Window {
+    var kept = keptTokens(size.compact_at_tokens orelse size.request_tokens orelse std.math.maxInt(usize));
+    if (size.overflow) if (size.request_tokens) |tokens| {
+        kept = @min(kept, keptTokens(tokens));
+    };
+    while (true) {
+        const window = try split(arena, history, active, kept, size.usable_tokens, route);
+        if (window.older.len > 0) return window;
+        if (!size.required()) return null;
+        if (kept == 0) {
+            trace.failure(trace_ctx, .retention_exhausted, "estimated_tokens={d}", .{size.request_tokens orelse 0});
+            return error.ContextCapacityExceeded;
+        }
+        trace.failure(trace_ctx, .retention_forced_zero, "estimated_tokens={d} kept_tokens={d}", .{ size.request_tokens orelse 0, kept });
+        kept = 0;
+    }
+}
+
+/// Splits the context: the newest turns stay unchanged, at most
+/// `max_kept_turns` of them within `kept_tokens`; everything older is
+/// compacted. `kept_tokens == 0` keeps nothing.
+fn split(
+    arena: Allocator,
+    history: []const HistoryTurn,
+    active: ?types.AssistantHistoryTurn,
+    kept_tokens: usize,
+    input_capacity: ?usize,
+    route: model_provider.ProviderSelection,
+) !Window {
+    var combined: std.ArrayList(HistoryTurn) = .empty;
+    try combined.appendSlice(arena, history);
+    if (active) |turn| try combined.append(arena, .{ .assistant = turn });
+    var cut: types.ContextHistoryCut = if (kept_tokens == 0)
+        .{ .turns = session_runtime.rawHistoryTurnCount(combined.items) }
+    else
+        selectRecentContext(combined.items, kept_tokens, input_capacity, .{
+            .provider = route,
+            .reject_oversized_tool_step = true,
+            .max_turns = max_kept_turns,
+        }).cut;
+    if (active) |turn| {
+        // The unfinished turn lives outside `history`; compacting all of it
+        // means cutting after its last completed exchange.
+        const active_index = session_runtime.rawHistoryTurnCount(history);
+        if (cut.turns > active_index) cut = .{
+            .turns = active_index,
+            .tool_steps = turn.execution.tool_steps.len,
+            .steering = turn.execution.steering.len,
+        };
+    }
+    var earlier: ?[]const u8 = null;
+    for (history) |turn| {
+        if (turn == .compacted_summary) earlier = turn.compacted_summary.summary;
+    }
+    return .{
+        .earlier = earlier,
+        .older = try session_runtime.contextHistoryRange(arena, combined.items, .{}, cut),
+        .retained_history = try session_runtime.contextHistoryRange(arena, history, cut, null),
+        .cut = cut,
+        .kept_tokens = kept_tokens,
+    };
+}
+
+const testing = std.testing;
+const selection: model_provider.ProviderSelection = .{ .provider = .gateway, .model = "fixture-model" };
+
+test "compactor input budget follows normal model capacity" {
+    try testing.expectEqual(@as(?usize, 296_816), usableInputTokens(.{ .context_window = 500_000, .max_output_tokens = 203_184 }));
+    try testing.expectEqual(@as(?usize, 500_000 - 32_768), usableInputTokens(.{ .context_window = 500_000, .max_output_tokens = 500_000 }));
+    try testing.expectEqual(@as(?usize, null), usableInputTokens(.{}));
+}
+
+test "retained context budgets provider replay on completed exchanges" {
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ ("r" ** 80_000) ++ "\"}}}]" };
+    var steps = [_]types.ToolExecutionStep{
+        .{ .assistant = @constCast("one"), .provider_replay = replay },
+        .{ .assistant = @constCast("two"), .provider_replay = replay },
+        .{ .assistant = @constCast("three"), .provider_replay = replay },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("continue") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    const selected = selectRecentContext(&history, 5_990, 119_808, .{});
+    try testing.expectEqual(@as(usize, 2), selected.cut.tool_steps);
+    try testing.expect(selected.newest_exchange_tokens >= 20_000);
+    const changed_model = selectRecentContext(&history, 5_990, 119_808, .{ .provider = .{ .provider = .gateway, .model = "fixture/other" } });
+    try testing.expectEqual(@as(usize, 1), changed_model.cut.tool_steps);
+    try testing.expect(changed_model.newest_exchange_tokens < 100);
+}
+
+test "retained context budgets replay on standalone assistant replies" {
+    const turn = types.AssistantHistoryTurn{
+        .user = .{ .text = @constCast("continue") },
+        .assistant = @constCast("small reply"),
+        .provider_replay = .{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ ("r" ** 80_000) ++ "\"}}}]" },
+    };
+    const history = [_]HistoryTurn{ .{ .assistant = turn }, .{ .assistant = turn }, .{ .assistant = turn } };
+    const selected = selectRecentContext(&history, 5_990, 119_808, .{});
+    try testing.expectEqual(@as(usize, 2), selected.cut.turns);
+    try testing.expect(selected.newest_exchange_tokens >= 20_000);
+}
+
+test "retained context selects whole parallel tool exchanges without shortening results" {
+    const body = "large output " ** 2000;
+    const calls = [_]types.ToolCall{
+        .{ .id = "one", .name = "read_file", .arguments_json = "{}" },
+        .{ .id = "two", .name = "read_file", .arguments_json = "{}" },
+    };
+    const results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("one"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast(body), .output_bytes = body.len, .stored_output_bytes = body.len },
+        .{ .tool_call_id = @constCast("two"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast(body), .output_bytes = body.len, .stored_output_bytes = body.len },
+    };
+    const steps = [_]types.ToolExecutionStep{
+        .{ .assistant = @constCast("earlier work") },
+        .{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) },
+    };
+    const history = [_]HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("old request") }, .assistant = @constCast("old answer") } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("current request") }, .assistant = @constCast(""), .execution = .{ .tool_steps = @constCast(&steps) } } },
+    };
+    const selected = selectRecentContext(&history, 5000, null, .{});
+    try testing.expectEqual(@as(usize, 1), selected.cut.turns);
+    try testing.expectEqual(@as(usize, 1), selected.cut.tool_steps);
+    try testing.expect(selected.newest_exchange_tokens > 5000);
+    try testing.expectEqualStrings(body, results[0].output);
+    try testing.expectEqualStrings(body, results[1].output);
+    const over_capacity = selectRecentContext(&history, 5000, 10_000, .{});
+    try testing.expectEqual(@as(usize, 2), over_capacity.cut.turns);
+    try testing.expectEqual(@as(usize, 0), over_capacity.cut.tool_steps);
+    try testing.expectEqual(@as(usize, 0), over_capacity.estimated_tokens);
+    try testing.expectEqualStrings(body, results[0].output);
+    try testing.expectEqualStrings(body, results[1].output);
+}
+
+test "retained context keeps at most the requested number of turns" {
+    var history: [6]HistoryTurn = undefined;
+    for (&history) |*turn| turn.* = .{ .assistant = .{ .user = .{ .text = @constCast("question") }, .assistant = @constCast("answer") } };
+    const unlimited = selectRecentContext(&history, 100_000, null, .{});
+    try testing.expectEqual(@as(usize, 1), unlimited.cut.turns);
+    const limited = selectRecentContext(&history, 100_000, null, .{ .max_turns = 4 });
+    try testing.expectEqual(@as(usize, 2), limited.cut.turns);
+}
+
+test "automatic compaction starts at the configured share of usable input" {
+    const capabilities = model_capabilities.Capabilities{ .context_window = 1_000_000, .max_output_tokens = 128_000 };
+    try testing.expectEqual(@as(?usize, 697_600), compactAtTokens(capabilities, 80));
+    try testing.expectEqual(@as(?usize, 87_200), compactAtTokens(capabilities, 10));
+    try testing.expectEqual(@as(?usize, 697_600), compactAtTokens(capabilities, 100));
+    try testing.expectEqual(@as(?usize, 87_200), compactAtTokens(capabilities, 1));
+    try testing.expectEqual(@as(?usize, null), compactAtTokens(.{}, 80));
+    try testing.expectEqual(@as(usize, 139_520), keptTokens(697_600));
+}
+
+test "the window keeps the newest turns and compacts the rest" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var history: [7]HistoryTurn = undefined;
+    history[0] = .{ .compacted_summary = .{ .summary = @constCast("earlier checkpoint"), .removed_turn_count = 3, .compaction_count = 1 } };
+    for (history[1..]) |*turn| turn.* = .{ .assistant = .{ .user = .{ .text = @constCast("question") }, .assistant = @constCast("answer") } };
+    const window = try split(arena, &history, null, 100_000, null, selection);
+    try testing.expectEqual(types.ContextHistoryCut{ .turns = 2 }, window.cut);
+    try testing.expectEqualStrings("earlier checkpoint", window.earlier.?);
+    try testing.expectEqual(@as(usize, 4), window.retained_history.len);
+    const everything = try split(arena, &history, null, 0, null, selection);
+    try testing.expectEqual(types.ContextHistoryCut{ .turns = 6 }, everything.cut);
+    try testing.expectEqual(@as(usize, 0), everything.retained_history.len);
+}
+
+test "the window ends an unfinished turn at its completed exchange" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const calls = [_]types.ToolCall{.{ .id = "large-write", .name = "write_file", .arguments_json = "x" ** 32_000 }};
+    const results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("large-write"),
+        .tool_name = @constCast("write_file"),
+        .status = .success,
+        .output = @constCast("written"),
+        .output_bytes = 7,
+        .stored_output_bytes = 7,
+    }};
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
+    const turn = types.AssistantHistoryTurn{
+        .user = .{ .text = @constCast("write once") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = @constCast(&steps) },
+    };
+    const active = try split(arena_state.allocator(), &.{}, turn, 800, 4_000, selection);
+    try testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, active.cut);
+    try testing.expectEqual(@as(usize, 1), active.older.len);
+    try testing.expectEqual(@as(usize, 0), active.retained_history.len);
+    const saved = try split(arena_state.allocator(), &.{.{ .assistant = turn }}, null, 800, 4_000, selection);
+    try testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, saved.cut);
+    try testing.expectEqual(@as(usize, 0), saved.retained_history.len);
+}
+
+test "nothing is compacted unless it is due or required" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const history = [_]HistoryTurn{.{ .assistant = .{ .user = .{ .text = @constCast("hi") }, .assistant = @constCast("hello") } }};
+    // One small turn fits the kept budget: nothing to compact.
+    try testing.expect(try choose(arena, &history, null, .{ .compact_at_tokens = 100_000, .usable_tokens = 120_000 }, selection, .{}) == null);
+    // A request the model cannot take forces everything into the summary.
+    const forced = (try choose(arena, &history, null, .{ .compact_at_tokens = 100_000, .usable_tokens = 120_000, .request_tokens = 130_000 }, selection, .{})).?;
+    try testing.expectEqual(@as(usize, 0), forced.kept_tokens);
+    try testing.expectEqual(@as(usize, 1), forced.older.len);
+    // With nothing left to compact, the request cannot be sent.
+    try testing.expectError(error.ContextCapacityExceeded, choose(arena, &.{}, null, .{ .compact_at_tokens = 100_000, .usable_tokens = 120_000, .overflow = true, .request_tokens = 130_000 }, selection, .{}));
+}

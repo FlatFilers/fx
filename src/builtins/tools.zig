@@ -216,7 +216,7 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. When to use: inspect more after a tool-result preview or command-output handle says retained output is available. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns and tool calls saved by compaction open by their ID as the handle, like M12 or T12, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn or tool call. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -774,7 +774,7 @@ pub const vision = ToolSpec{
 };
 
 const read_tool_result_range_properties = [_]model_tool_schema.Property{
-    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output." },
+    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output, or a saved turn or tool call ID like M12 or T12." },
     .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset. Defaults to 1." },
     .{ .name = "byte_count", .json_type = .integer, .description = "Optional positive byte count. Bounded by the tool." },
 };
@@ -784,9 +784,18 @@ const read_tool_result_query_properties = [_]model_tool_schema.Property{
     .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Non-empty literal line query." },
 };
 
+const read_tool_result_search_properties = [_]model_tool_schema.Property{.{
+    .name = "search",
+    .json_type = .array,
+    .bounds = &.{ .min_items = 1, .max_items = 3 },
+    .shape = &.{ .array_values = .{ .json_type = .string } },
+    .description = "One to three searches over turns and tool calls saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
+}};
+
 const read_tool_result_input_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &read_tool_result_range_properties, .required = &.{"handle"}, .additional_properties = false },
     .{ .properties = &read_tool_result_query_properties, .required = &.{ "handle", "query" }, .additional_properties = false },
+    .{ .properties = &read_tool_result_search_properties, .required = &.{"search"}, .additional_properties = false },
 };
 
 const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
@@ -804,7 +813,7 @@ pub const read_tool_result = ToolSpec{
                 .name = "request",
                 .json_type = .object,
                 .shape = &.{ .object = &read_tool_result_request_schema },
-                .description = "Choose one request: handle plus query, or handle plus an optional byte range.",
+                .description = "Choose one request: handle plus query, handle plus an optional byte range, or search.",
             }},
             .required = &.{"request"},
             .additional_properties = false,
@@ -933,7 +942,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "51b79260638620ff5f046a835b16f37d50dead5156206b600d0357177edf23d7",
+        "1173c7b3ec65df9d86c15556fb3b340cfb4e7e7c33f8236153bd96943d9aeda0",
         &actual_hex,
     );
 }
@@ -1674,9 +1683,13 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     try std.testing.expect(!input_schema.get("additionalProperties").?.bool);
     const request = input_schema.get("properties").?.object.get("request").?.object;
     const alternatives = request.get("oneOf").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), alternatives.len);
+    try std.testing.expectEqual(@as(usize, 3), alternatives.len);
     const range = alternatives[0].object;
     const query = alternatives[1].object;
+    const search = alternatives[2].object;
+    try std.testing.expectEqualStrings("search", search.get("required").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, 3), search.get("properties").?.object.get("search").?.object.get("maxItems").?.integer);
+    try std.testing.expect(search.get("properties").?.object.get("handle") == null);
     try std.testing.expect(range.get("properties").?.object.get("query") == null);
     try std.testing.expect(query.get("properties").?.object.get("start_byte") == null);
     try std.testing.expect(query.get("properties").?.object.get("byte_count") == null);

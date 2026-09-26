@@ -97,6 +97,17 @@ Slugs are the gateway's provider identifiers (letters, digits, dashes, for examp
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
 
+## Context compaction
+
+When a conversation fills the model's context, fx compacts it so the work can continue. The newest few turns stay unchanged. The newest compacted turns keep your messages word for word, and the assistant's final replies too as long as they fit; the conversation's own model summarizes the rest of each turn, and older turns fold into one summary. Every compacted turn is saved word for word with an ID like `M3`, and every tool call with its full input and output with an ID like `T12`; the agent can search them by text or open one by ID with `read_tool_result`. Run `/compact` to compact now.
+
+Automatic compaction starts when a request reaches 80 percent of the model's usable input. Set `auto_compact_percent` in `~/.fx/settings.json` to any value from 10 to 80, or `FX_AUTO_COMPACT_PERCENT` for a single launch:
+
+```jsonc
+// ~/.fx/settings.json
+{ "auto_compact_percent": 60 }
+```
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

@@ -293,11 +293,12 @@ describe("configured providers", () => {
           summaries++;
           return completion(body.model, "The child is retaining repeated context details and should continue acknowledging them.");
         }
-        return completion(body.model, "child reply", Math.ceil(JSON.stringify(body).length / 4));
+        // Context pressure comes from the child's own replies, which compaction summarizes.
+        return completion(body.model, "child reply " + "detail ".repeat(2000), Math.ceil(JSON.stringify(body).length / 4));
       }
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       parentTurns++;
-      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns} ` + "detail ".repeat(2000), ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
+      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns}`, ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
     });
     (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 512, supports_tool_use: true };
     f.save();

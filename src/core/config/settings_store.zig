@@ -5,6 +5,7 @@ const mem_utils = @import("../shared/mem_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
@@ -1921,6 +1922,11 @@ fn validateKnownSettingsObject(
     }
     if (object.get("max_tool_result_bytes")) |value| {
         if (value != .integer or value.integer < tool_result_limits.min_configured_tool_result_bytes) {
+            return error.InvalidSettingsFormat;
+        }
+    }
+    if (object.get("auto_compact_percent")) |value| {
+        if (value != .integer or value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) {
             return error.InvalidSettingsFormat;
         }
     }

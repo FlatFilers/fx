@@ -46,6 +46,7 @@ const tool_dispatch = @import("tool_dispatch.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
@@ -119,6 +120,8 @@ pub const Context = struct {
     max_read_file_line_len: usize,
     max_command_output_bytes: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    /// Passed to subagent turns. See `Config.auto_compact_percent`.
+    auto_compact_percent: u8 = compactor.default_percent,
     api_key: []const u8,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     gateway_team: ?[]const u8 = null,

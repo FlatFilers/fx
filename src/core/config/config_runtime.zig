@@ -4,6 +4,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
@@ -46,6 +47,9 @@ pub const Settings = struct {
     yolo_acknowledged: ?bool = null,
     max_agent_steps: ?usize = null,
     max_tool_result_bytes: ?usize = null,
+    /// Share of usable input, 10 to 80 percent, at which automatic
+    /// compaction starts. Profile-only.
+    auto_compact_percent: ?u8 = null,
     context_limits: context_limits.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
@@ -1542,6 +1546,11 @@ fn parseProfileOnlyFields(
     parse_workspace_statusline: bool,
 ) !void {
     if (root.object.contains("skill_match_fuzzy")) return error.RetiredSkillMatchFuzzy;
+    if (root.object.get("auto_compact_percent")) |value| {
+        if (value != .integer) return error.InvalidAutoCompactPercentType;
+        if (value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) return error.InvalidAutoCompactPercentValue;
+        settings.auto_compact_percent = @intCast(value.integer);
+    }
     if (root.object.get("model")) |model_value| {
         const value = model_value;
         if (value != .string) return error.InvalidModelType;
@@ -1811,6 +1820,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
+    if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
@@ -4362,4 +4372,17 @@ test "theme setting rejects non-string values" {
     var parsed = try parseSettingsJson(std.testing.allocator, "{\"theme\":\"cursor-light\"}");
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("cursor-light", parsed.theme.?);
+}
+
+test "auto compaction percent is a profile setting between 10 and 80" {
+    var global = try parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":50}");
+    defer global.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, 50), global.auto_compact_percent);
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":90}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":5}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":-1}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentType, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":\"50\"}"));
+    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"auto_compact_percent\":50}", .project);
+    defer project.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, null), project.auto_compact_percent);
 }

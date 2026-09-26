@@ -10,6 +10,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const generation_usage_provider = @import("generation_usage_provider.zig");
+const compactor = @import("../compactor/compactor.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
 const command_replay_store = @import("command_replay_store.zig");
 pub const session_usage = @import("session_usage.zig");
@@ -2521,7 +2522,7 @@ pub fn appendHistoryChatMessages(
 /// Projects the latest current checkpoint and its suffix for semantic
 /// compaction. Without a current checkpoint, projects raw canonical turns and
 /// returns the message boundary whose result provenance remains uncertain.
-pub fn appendCompactionHistoryChatMessages(
+fn appendCompactionHistoryChatMessages(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
@@ -2554,11 +2555,7 @@ pub fn appendCompactionHistoryChatMessages(
 
 fn isCurrentCompactionCheckpoint(turn: HistoryTurn) bool {
     return switch (turn) {
-        .compacted_summary => |entry| std.mem.startsWith(
-            u8,
-            entry.summary,
-            core_types.context_handoff_open,
-        ),
+        .compacted_summary => |entry| compactor.replacesPriorContext(entry.summary),
         else => false,
     };
 }
@@ -3383,6 +3380,7 @@ pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguag
 }
 
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {
+    if (try compactor.modelText(alloc, summary)) |text| return text;
     return std.fmt.allocPrint(
         alloc,
         "{s}{s}\n\n{s}\n{s}",
@@ -4630,7 +4628,6 @@ test "interrupted history projects marker and aborted tool result" {
 }
 
 test "interrupted tool diagnostics remain complete for compaction" {
-    const compaction = @import("../agent/runtime/context_compaction.zig");
     const replay_handle = "cancelled-output.bin";
     const oversized_handle = "h" ** 129;
     const presentations = [_]?CancelledCommandPresentation{
@@ -4654,16 +4651,10 @@ test "interrupted tool diagnostics remain complete for compaction" {
                 } }};
                 var messages: std.ArrayList(core_types.ChatMessage) = .empty;
                 try appendHistoryChatMessagesImpl(alloc, &messages, &history, projection);
-                // Compaction must accept the complete diagnostic, not claim the tool completed.
-                try compaction.promoteMessageResults(alloc, messages.items, .unavailable, 0);
+                // Compaction saves this diagnostic as the tool's output; it must
+                // say the tool did not complete.
                 const result = messages.items[2];
-                try std.testing.expectEqual(.failure, result.tool_result_status.?);
                 try std.testing.expectEqualStrings("cancelled-call", result.tool_call_id.?);
-                const memory = result.tool_result_memory.?;
-                try std.testing.expectEqual(result.content.?.len, memory.output_bytes);
-                try std.testing.expectEqual(result.content.?.len, memory.stored_output_bytes);
-                try std.testing.expect(!memory.truncated);
-                try std.testing.expect(memory.output_handle == null);
                 try std.testing.expect(std.mem.startsWith(u8, result.content.?, aborted_tool_output));
                 try std.testing.expectEqual(@as(usize, if (index == 3) 1 else 0), std.mem.count(u8, result.content.?, replay_handle));
                 try std.testing.expect(std.mem.find(u8, result.content.?, oversized_handle) == null);

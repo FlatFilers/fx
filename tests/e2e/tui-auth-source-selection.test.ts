@@ -24,6 +24,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  fakeGatewayToolCall,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -161,9 +162,11 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
       if (!compacting && workingRequests === 2) {
         return Response.json({ error: { code: "context_length_exceeded", message: "maximum context length exceeded" } }, { status: 400 });
       }
+      // The first reply is too long to keep word for word, so compaction
+      // must ask this provider for a summary.
       const text = compacting
         ? "The earlier request established the saved facts."
-        : workingRequests === 1 ? "SAVED_PROVIDER_FACTS" : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
+        : workingRequests === 1 ? "SAVED_PROVIDER_FACTS ".repeat(2_000) : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
           `data: ${JSON.stringify({ type: "response.completed", response: { id: `response-${bodies.length}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
@@ -6559,7 +6562,11 @@ tmuxTest(
     stderrPath = join(home, "stderr.log");
     const tracePath = join(home, "trace.log");
     writeFileSync(stderrPath, "");
+    // The first turn reads a file, so compaction has work to summarize and
+    // asks the model with the refreshed login.
+    writeFileSync(join(home, "compact-auth-notes.txt"), "notes\n");
     gateway = startFakeGateway([
+      fakeGatewayToolCall("compact-auth-read", "read_file", { path: "compact-auth-notes.txt" }),
       fakeGatewayFinalText("COMPACT_AUTH_FIRST_REPLY"),
       fakeGatewayFinalText("COMPACT_AUTH_SECOND_REPLY"),
       fakeGatewayFinalText("The conversation established COMPACT_AUTH_FIRST and COMPACT_AUTH_SECOND."),
@@ -6577,7 +6584,7 @@ tmuxTest(
     await session.waitForText("COMPACT_AUTH_FIRST_REPLY", TIMEOUT);
     await session.sendText("Remember COMPACT_AUTH_SECOND.");
     await session.waitForText("COMPACT_AUTH_SECOND_REPLY", TIMEOUT);
-    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests).toHaveLength(3);
     expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
     await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
     await session.sendText("/status");
@@ -6588,7 +6595,7 @@ tmuxTest(
     const before = readFileSync(historyPath, "utf8");
     await session.sendText("/compact");
     await waitForTrace(tracePath, "manual_compaction_auth_pending", TIMEOUT);
-    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests).toHaveLength(3);
     await session.sendText("/compact");
     await session.sendLiteral("PRESERVE_COMPACTION_DRAFT");
     await session.waitForText("PRESERVE_COMPACTION_DRAFT", 1_000);
@@ -6602,16 +6609,16 @@ tmuxTest(
     expect(scrollback).toContain("PRESERVE_COMPACTION_DRAFT");
     expect(scrollback).not.toContain("Context compacted.");
     expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
-    expect(gateway.requests).toHaveLength(3);
-    expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
-    expect(JSON.parse(gateway.requests[2].body).tools ?? []).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests[3].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
+    expect(JSON.parse(gateway.requests[3].body).tools ?? []).toHaveLength(0);
     expect(readFileSync(historyPath, "utf8").startsWith(before)).toBe(true);
     const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
     await session.sendKeys("C-u");
     await session.sendText("Continue after the manual compaction.");
     await session.waitForText("COMPACT_AUTH_CONTINUED", TIMEOUT);
-    expect(gateway.requests).toHaveLength(4);
+    expect(gateway.requests).toHaveLength(5);
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
     expect(readFileSync(stderrPath, "utf8")).toBe("");

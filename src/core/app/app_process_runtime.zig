@@ -5,7 +5,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
-const diagnostics = @import("../workspace/diagnostics.zig");
+const compactor = @import("../compactor/compactor.zig");
 
 fn compactionErrorHandled(work: worker_runtime.WorkItem, provenance: ?compaction_activity.ErrorProvenance, err: anyerror) bool {
     const failure = provenance orelse return false;
@@ -53,7 +53,7 @@ pub fn Runtime(comptime App: type) type {
             app.processQueuedWork(work, &failure_provenance) catch |err| {
                 settleCompactionWorkFailure(&app.worker, work, err);
                 if (compactionErrorHandled(work, failure_provenance, err)) {
-                    diagnostics.traceCompactionLog(true, "interactive error retained err={s}", .{@errorName(err)});
+                    compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
                 } else if (err != error.RouteRecoveryStopped) {
                     const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                     defer std.heap.c_allocator.free(body);
@@ -155,7 +155,7 @@ pub fn Runtime(comptime App: type) type {
                 app.processQueuedWork(work, &failure_provenance) catch |err| {
                     settleCompactionWorkFailure(&app.worker, work, err);
                     if (compactionErrorHandled(work, failure_provenance, err)) {
-                        diagnostics.traceCompactionLog(true, "interactive error retained err={s}", .{@errorName(err)});
+                        compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
                     } else if (err != error.RouteRecoveryStopped) {
                         const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
                         defer std.heap.c_allocator.free(body);
