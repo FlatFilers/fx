@@ -47,8 +47,6 @@ const LineRead = struct {
 };
 
 const TestControls = if (builtin.is_test) struct {
-    scan_block_bytes: usize = default_scan_block_bytes,
-    lock_ops: io_mod.LockOps = .{},
     fail_compaction_before_rename: bool = false,
     fail_clear_after_rename: bool = false,
     fail_layout_creation: bool = false,
@@ -61,6 +59,8 @@ pub const Store = struct {
     display_path: []u8,
     durable_home: ?io_mod.VerifiedDir = null,
     indeterminate: bool = false,
+    scan_block_bytes: usize = default_scan_block_bytes,
+    lock_ops: io_mod.LockOps = .{},
     test_controls: TestControls = .{},
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
@@ -259,7 +259,7 @@ pub const Store = struct {
             &self.durable_home.?,
             history_lock_file,
             lock_deadline_ms,
-            if (comptime builtin.is_test) self.test_controls.lock_ops else .{},
+            self.lock_ops,
         );
     }
 
@@ -421,10 +421,7 @@ pub const Store = struct {
         while (cursor > 0 and entries.items.len < limit) {
             const block_len_u64 = @min(
                 cursor,
-                @as(u64, @intCast(if (comptime builtin.is_test)
-                    self.test_controls.scan_block_bytes
-                else
-                    default_scan_block_bytes)),
+                @as(u64, @intCast(self.scan_block_bytes)),
             );
             const start = cursor - block_len_u64;
             const block_len: usize = @intCast(block_len_u64);
@@ -493,7 +490,7 @@ pub const Store = struct {
     }
 
     fn setScanBlockBytesForTest(self: *Store, bytes: usize) void {
-        self.test_controls.scan_block_bytes = @max(bytes, 1);
+        self.scan_block_bytes = @max(bytes, 1);
     }
 
     fn historyLengthForTest(self: *Store) !u64 {
@@ -535,10 +532,11 @@ pub const Store = struct {
     }
 
     pub fn setLockOpsForTest(self: *Store, ops: io_mod.LockOps) void {
-        self.test_controls.lock_ops = ops;
+        self.lock_ops = ops;
     }
 
     pub fn clearTestControls(self: *Store) void {
+        self.lock_ops = .{};
         self.test_controls = .{};
     }
 
