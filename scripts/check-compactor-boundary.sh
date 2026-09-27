@@ -21,7 +21,7 @@ fi
 
 # session/session.zig supplies shared conversation helpers until they move to
 # the shared basics.
-allowed='^\.\./(shared/(types|debug_trace|token_estimate|io)|config/(model_capabilities|model_provider)|session/session)\.zig$'
+allowed='^\.\./(shared/(types|debug_trace|token_estimate|text_utils|io)|config/(model_capabilities|model_provider)|session/session)\.zig$'
 reaching_out=""
 while IFS= read -r line; do
   target="${line#*@import(\"}"

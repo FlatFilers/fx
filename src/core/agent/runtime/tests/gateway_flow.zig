@@ -3034,6 +3034,10 @@ test "compaction writes the summary with the least reasoning each model accepts"
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.effort = effort("xhigh");
+    // Strict routing is the user's choice, so the fallback keeps it too.
+    const only_bedrock = [_][]const u8{"bedrock"};
+    config.provider_order = &only_bedrock;
+    config.provider_strict = true;
     var job = fixture.job();
     job.model = @constCast(model);
     job.history = &history;
@@ -3044,8 +3048,10 @@ test "compaction writes the summary with the least reasoning each model accepts"
     try std.testing.expectEqualStrings(model, gateway.request_models.items[0]);
     try expectBodyContains(&gateway, 0, "\"reasoning\":\"low\"");
     try expectBodyNotContains(&gateway, 0, "xhigh");
+    try expectBodyContains(&gateway, 0, "\"only\":[\"bedrock\"]");
     try std.testing.expectEqualStrings("openai/gpt-6-sol", gateway.request_models.items[1]);
     try expectBodyContains(&gateway, 1, "\"reasoning\":\"none\"");
+    try expectBodyContains(&gateway, 1, "\"only\":[\"bedrock\"]");
     // The conversation itself keeps its own effort.
     try std.testing.expectEqualStrings(model, gateway.request_models.items[2]);
     try expectBodyContains(&gateway, 2, "\"reasoning\":\"xhigh\"");

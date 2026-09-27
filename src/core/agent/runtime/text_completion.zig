@@ -201,7 +201,13 @@ pub const CompactorCaller = struct {
     fn send(context: *anyopaque, alloc: Allocator, call: compactor.Call) compactor.CallError!compactor.Reply {
         const self: *CompactorCaller = @ptrCast(@alignCast(context));
         const own = std.mem.eql(u8, call.model, self.model);
-        var options: model_capabilities.ResolvedProviderOptions = if (own) self.provider_options else .{};
+        // Another model keeps the user's provider routing but none of the
+        // options chosen for this one.
+        var options: model_capabilities.ResolvedProviderOptions = if (own) self.provider_options else .{
+            .prompt_caching = self.provider_options.prompt_caching,
+            .provider_order = self.provider_options.provider_order,
+            .provider_strict = self.provider_options.provider_strict,
+        };
         options.reasoning = call.reasoning;
         const outcome = try complete(alloc, .{
             .stream_provider = self.stream_provider,

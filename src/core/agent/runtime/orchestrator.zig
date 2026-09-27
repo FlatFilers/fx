@@ -6064,6 +6064,7 @@ pub fn compactContext(
     var compactor_request = request.compactor;
     compactor_request.progress = progress.interface();
     var result = try compactor.compact(alloc, compactor_request) orelse {
+        compactor.traceEvent(trace_ctx, .decision, "decision=no_op origin={s} reason=nothing_to_compact", .{@tagName(request.activity_origin)});
         if (progress.operation_id) |id| deps.compaction_activity.?.settle(deps.ctx, id, .{ .outcome = .no_op });
         return null;
     };
@@ -7113,7 +7114,7 @@ fn processQueuedPromptLoop(
                     wants_compaction,
                     step_ctx,
                     .decision,
-                    "decision={s} overflow={} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} prior_input_tokens={any} usable_tokens={any} compact_at_tokens={any} compact_at_percent={d} max_output_tokens={any}",
+                    "decision={s} overflow={} request_bytes={d} estimated_tokens={d} text_tokens={d} has_images={} image_baseline={} prior_input_tokens={any} usable_tokens={any} compact_at_tokens={any} compact_at_percent={d} max_output_tokens={any}",
                     .{
                         if (wants_compaction) "compact" else "no_op",
                         overflow_pending,
@@ -7121,6 +7122,7 @@ fn processQueuedPromptLoop(
                         request_cost.estimated_input_tokens,
                         request_cost.text_tokens,
                         request_cost.image_identity != null,
+                        request_cost.image_identity != null and applicable_calibration != null,
                         if (applicable_calibration) |calibration| calibration.exact_input_tokens else null,
                         usable_tokens,
                         compact_at_tokens,

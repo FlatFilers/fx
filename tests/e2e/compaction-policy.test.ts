@@ -8,7 +8,7 @@ const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-h
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const checkpointMarker = "fx-compactor-v1\n";
 
-for (const userHeavy of [false, true]) test(`automatic compaction keeps user messages exact and summarizes the assistant, userHeavy=${userHeavy}`, async () => {
+for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? "folds a turn too large to show into the summary" : "keeps user messages exact and summarizes the assistant"}`, async () => {
   const root = mkdtempSync(join(tmpdir(), "fx-policy-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
@@ -31,9 +31,13 @@ for (const userHeavy of [false, true]) test(`automatic compaction keeps user mes
       const sourceMessages = request.prompt.filter((message: { role: string }) => message.role === "user");
       expect(sourceMessages).toHaveLength(1);
       const source = sourceMessages[0].content[0].text;
-      // The raw conversation, unchanged, then the one request.
-      expect(source.startsWith(`[Turn 1]\n[User]\n${originalUser}\n\n[Assistant]\nVERIFIED_VALUE=73\n`)).toBe(true);
+      // The turn is larger than the model can read, so its long texts keep
+      // their start and end, and the whole turn stays saved as M1.
+      expect(source.startsWith("[Turn 1]\n[User]\nKeep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>")).toBe(true);
+      expect(source).toContain("\n[Assistant]\nVERIFIED_VALUE=73\n");
       expect(source).toContain("PENDING_CHECK=transport-resume");
+      expect(source).toContain("clipped for this summary; the whole text is saved in M1]");
+      if (userHeavy) expect(source).toContain("USER_REFERENCE_END");
       expect(source).not.toContain("Continue the saved task");
       expect(source.endsWith("Everything under an ID stays saved word for word.")).toBe(true);
       expect(request.maxOutputTokens).toBe(8192);

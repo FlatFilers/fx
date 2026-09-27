@@ -91,7 +91,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 }
 
 fn decodeSearch(alloc: Allocator, value: std.json.Value) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    const invalid = "read_tool_result field \"search\" must be 1 to 3 non-empty strings";
+    const invalid = std.fmt.comptimePrint("read_tool_result field \"search\" must be 1 to {d} non-empty strings", .{compactor.max_search_phrases});
     const items: []const std.json.Value = switch (value) {
         .string => (&value)[0..1],
         .array => |array| array.items,

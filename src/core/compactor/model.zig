@@ -76,11 +76,13 @@ fn lowestReasoningEffort(capabilities: model_capabilities.Capabilities) ?types.R
     return if (options.len > 0) options[0] else null;
 }
 
-/// The model the summary step calls, remembering whether it fell back.
+/// The model the summary step calls, remembering how many summaries it
+/// wrote and whether it fell back.
 pub const Summarizer = struct {
     caller: ModelCaller,
     cancel_flag: *std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
+    summaries: usize = 0,
     fallback_used: ?[]const u8 = null,
 
     pub fn model(self: *Summarizer) summarize.Model {
@@ -89,6 +91,7 @@ pub const Summarizer = struct {
 
     fn summarizeWith(context: *anyopaque, alloc: Allocator, prompt: summarize.Prompt) summarize.ModelError![]u8 {
         const self: *Summarizer = @ptrCast(@alignCast(context));
+        self.summaries += 1;
         var primary_error: ?summarize.ModelError = null;
         if (self.ask(alloc, prompt, prompt.model)) |text| {
             if (std.mem.trim(u8, text, " \t\r\n").len > 0) return text;

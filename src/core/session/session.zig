@@ -3696,6 +3696,7 @@ test "interrupted tool diagnostics remain complete for compaction" {
                 // Compaction saves this diagnostic as the tool's output; it must
                 // say the tool did not complete.
                 const result = messages.items[2];
+                try std.testing.expectEqual(.failure, result.tool_result_status.?);
                 try std.testing.expectEqualStrings("cancelled-call", result.tool_call_id.?);
                 try std.testing.expect(std.mem.startsWith(u8, result.content.?, aborted_tool_output));
                 try std.testing.expectEqual(@as(usize, if (index == 3) 1 else 0), std.mem.count(u8, result.content.?, replay_handle));

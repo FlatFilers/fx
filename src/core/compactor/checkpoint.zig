@@ -12,7 +12,7 @@
 //! the model reads.
 
 const std = @import("std");
-const debug_trace = @import("../shared/debug_trace.zig");
+const trace = @import("trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -121,7 +121,7 @@ pub fn parseLegacyState(arena: Allocator, ref: LegacyStateRef, bytes: []const u8
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     if (bytes.len != ref.bytes or !std.mem.eql(u8, &digest, &ref.sha256)) {
-        debug_trace.logf("context_compaction", "earlier state file does not match its checkpoint handle={s} bytes={d}", .{ ref.handle, bytes.len });
+        trace.log(true, "earlier state file does not match its checkpoint handle={s} bytes={d}", .{ ref.handle, bytes.len });
         return null;
     }
     const State = struct { summary: []const u8, users: []const []const u8 };
@@ -131,7 +131,7 @@ pub fn parseLegacyState(arena: Allocator, ref: LegacyStateRef, bytes: []const u8
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            debug_trace.logf("context_compaction", "earlier state file unreadable handle={s} err={s}", .{ ref.handle, @errorName(err) });
+            trace.log(true, "earlier state file unreadable handle={s} err={s}", .{ ref.handle, @errorName(err) });
             return null;
         },
     };
@@ -150,7 +150,7 @@ pub fn parse(arena: Allocator, summary: []const u8) Allocator.Error!?Payload {
     }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => {
-            debug_trace.logf("context_compaction", "checkpoint payload unreadable bytes={d} err={s}; using its raw text", .{ summary.len, @errorName(err) });
+            trace.log(true, "checkpoint payload unreadable bytes={d} err={s}; using its raw text", .{ summary.len, @errorName(err) });
             return null;
         },
     };

@@ -12,6 +12,7 @@ const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const types = @import("../core/shared/types.zig");
 const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
+const compactor = @import("../core/compactor/compactor.zig");
 const capability_retrieval = @import("../core/tooling/capability_retrieval.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
@@ -787,7 +788,7 @@ const read_tool_result_query_properties = [_]model_tool_schema.Property{
 const read_tool_result_search_properties = [_]model_tool_schema.Property{.{
     .name = "search",
     .json_type = .array,
-    .bounds = &.{ .min_items = 1, .max_items = 3 },
+    .bounds = &.{ .min_items = 1, .max_items = compactor.max_search_phrases },
     .shape = &.{ .array_values = .{ .json_type = .string } },
     .description = "One to three searches over turns and tool calls saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
 }};

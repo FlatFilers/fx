@@ -125,7 +125,6 @@ pub const Result = struct {
     /// Where the compacted part ends.
     cut: types.ContextHistoryCut,
     tool_count: usize,
-    fallback_model: ?[]const u8,
 
     pub fn deinit(self: *Result) void {
         const child = self.arena.child_allocator;
@@ -177,8 +176,7 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     const turns = try turnsFrom(out, chosen.older);
     if (turns.len == 0) return error.NothingToCompact;
     var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
-    var store: ?RecordSaver = if (request.records) |saved| .{ .alloc = out, .store = saved } else null;
-    trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, store != null });
+    trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, request.records != null });
     var summary = try summarize.compact(out, .{
         .model = caller.model,
         .earlier = earlier,
@@ -186,9 +184,10 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .last_turn_open = chosen.splitsLastTurn(),
         // The newest compacted turns get the same room as the kept turns.
         .exact_tokens = chosen.kept_tokens,
-    }, summarizer.model(), if (store) |*saved| saved.saver() else null);
+        .max_prompt_tokens = request.size.summaryRequestTokens(),
+    }, summarizer.model(), request.records);
     defer summary.deinit();
-    trace.info(trace_ctx, .provider_completed, "model={s} shown_turns={d} turns={d} tools={d} earlier_bytes={d} fallback={s}", .{ caller.model, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.earlier.len, summarizer.fallback_used orelse "none" });
+    trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} earlier_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.earlier.len, summarizer.fallback_used orelse "none" });
 
     return .{
         .arena = arena,
@@ -201,7 +200,6 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .retained_history = chosen.retained_history,
         .cut = chosen.cut,
         .tool_count = summary.compacted.tool_count,
-        .fallback_model = summarizer.fallback_used,
     };
 }
 
@@ -276,30 +274,30 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
             .call_id = message.tool_call_id orelse "",
             .name = message.tool_name orelse "",
             .output = content,
+            .saved_output = savedOutputHandle(message.tool_result_memory, content),
         } }),
     }
 }
 
-/// Saves the summary step's records in the caller's store.
-const RecordSaver = struct {
-    alloc: Allocator,
-    store: Store,
+/// The handle of a tool's whole output that fx saved separately, when the
+/// text the model saw was clipped and does not name it. A clipped
+/// `read_tool_result` page, for one, keeps its whole output only there.
+fn savedOutputHandle(memory: ?types.ToolResultMemory, content: []const u8) []const u8 {
+    const saved = memory orelse return "";
+    const handle = saved.output_handle orelse return "";
+    if (!saved.truncated or std.mem.find(u8, content, handle) != null) return "";
+    return handle;
+}
 
-    fn saver(self: *RecordSaver) summarize.Store {
-        return .{ .context = self, .save_fn = save };
-    }
-
-    fn save(context: *anyopaque, kind: records.Kind, number: usize, content: []const u8) summarize.StoreError!void {
-        const self: *RecordSaver = @ptrCast(@alignCast(context));
-        records.save(self.alloc, self.store, .{ .kind = kind, .number = number }, content) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                debug_trace.logf("context_compaction", "saving compacted {s} {d} failed err={s}", .{ @tagName(kind), number, @errorName(err) });
-                return error.StoreFailed;
-            },
-        };
-    }
-};
+test "a clipped result keeps the handle of its saved whole output" {
+    const handle = "result-read_tool_result-2.txt";
+    const clipped_page: types.ToolResultMemory = .{ .output_handle = handle, .truncated = true };
+    try std.testing.expectEqualStrings(handle, savedOutputHandle(clipped_page, "first page\n... [tool result truncated]"));
+    // The model saw the whole text, or the text names the handle already.
+    try std.testing.expectEqualStrings("", savedOutputHandle(.{ .output_handle = handle }, "whole text"));
+    try std.testing.expectEqualStrings("", savedOutputHandle(clipped_page, "preview; full result: " ++ handle));
+    try std.testing.expectEqualStrings("", savedOutputHandle(null, "no memory"));
+}
 
 test {
     _ = window;

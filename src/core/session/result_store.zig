@@ -6,7 +6,6 @@ const types = @import("../shared/types.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
 const compactor = @import("../compactor/compactor.zig");
-const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -774,7 +773,7 @@ fn compactorStoreError(operation: []const u8, name: []const u8, err: anyerror) c
         error.OutOfMemory => error.OutOfMemory,
         error.FileNotFound => error.FileNotFound,
         else => {
-            debug_trace.logf("context_compaction", "record store {s} failed name={s} err={s}", .{ operation, name, @errorName(err) });
+            compactor.traceLog(true, "record store {s} failed name={s} err={s}", .{ operation, name, @errorName(err) });
             return error.StoreFailed;
         },
     };

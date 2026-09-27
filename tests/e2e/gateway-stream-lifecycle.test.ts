@@ -6124,16 +6124,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         writeFileSync(join(root.workspace, "small.txt"), "small follow-up\n");
         let step = 0;
         let compactions = 0;
-        let snapshotHandle = "";
+        let sourceHandle = "";
         const gateway = startDynamicFakeGateway((body) => {
           const request = JSON.parse(body);
           if (request.tools.length === 0) {
             expect(body).not.toContain(replaySignature);
             compactions++;
-            snapshotHandle = body.match(/result-read_tool_result-[a-f0-9-]+\.txt/)?.[0] ?? "";
-            expect(snapshotHandle).not.toBe("");
+            // The compacted command keeps the handle of its whole output.
+            expect(sourceHandle).not.toBe("");
+            expect(body).toContain(sourceHandle);
             if (compactions === 1) return fakeGatewayFinalText("");
-            return fakeGatewayFinalText(`The command ran once. Read ${snapshotHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
+            return fakeGatewayFinalText(`The command ran once. Read ${sourceHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
           }
           switch (step++) {
             case 0:
@@ -6144,6 +6145,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               const source = JSON.parse(toolResultOutput(body, "retrieval-source"));
               expect(source.exit_code).toBe(0);
               expect(source.full_output_handle).toBeString();
+              sourceHandle = source.full_output_handle;
               return fakeGatewayToolCall("retrieval-page", "read_tool_result", {
                 request: { handle: source.full_output_handle, query: "RETRIEVAL_MATCH" },
               });
@@ -6169,9 +6171,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               return fakeGatewayFinalText("RETRIEVAL_TURN_COMPLETE");
             case 4:
               expect(body).toContain(replaySignature);
-              expect(body).toContain(snapshotHandle);
+              expect(body).toContain(sourceHandle);
               return fakeGatewayToolCall("retrieval-tail", "read_tool_result", {
-                request: { handle: snapshotHandle, start_byte: 65300, byte_count: 1024 },
+                request: { handle: sourceHandle, start_byte: 65300, byte_count: 1024 },
               });
             case 5:
               expect(toolResultOutput(body, "retrieval-tail")).toContain(tail);
@@ -6204,18 +6206,24 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(latest.code).toBe(0);
           const sessionId = JSON.parse(latest.stdout).id;
           const sessionDir = join(root.home, ".fx", "sessions", sessionId);
-          const snapshot = readFileSync(join(sessionDir, "tool-results", snapshotHandle), "utf8");
+          const toolResults = join(sessionDir, "tool-results");
+          // The clipped page keeps its whole copy on disk.
+          const snapshotHandle = readdirSync(toolResults).find((name) => /^result-read_tool_result-[a-f0-9-]+\.txt$/.test(name)) ?? "";
+          expect(snapshotHandle).not.toBe("");
+          const snapshot = readFileSync(join(toolResults, snapshotHandle), "utf8");
           expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
           expect(snapshot).toContain(token);
           expect(snapshot).toContain(tail);
           expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
+          // The compacted command is saved as T1 with the handle of its whole output.
+          expect(readFileSync(join(toolResults, "compacted-T1.txt"), "utf8")).toContain(sourceHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           expect(resumed.stderr).toBe("Reading tool result\n");
           expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
           expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
-          expect(readFileSync(tracePath, "utf8")).not.toContain("IncompleteCompactionResult");
+          expect(readFileSync(tracePath, "utf8")).not.toContain("event=transaction_failed");
         } finally {
           await tui?.kill();
           gateway.stop();

@@ -14,7 +14,8 @@
 //! that match best.
 
 const std = @import("std");
-const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
+const trace = @import("trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -86,7 +87,12 @@ pub const max_file_name_bytes = file_prefix.len + 1 + 20 + file_suffix.len;
 /// `compacted-T<number>.txt` or `compacted-M<number>.txt` in `buffer`.
 pub fn fileName(buffer: *[max_file_name_bytes]u8, id: Id) []const u8 {
     // The buffer holds any usize in decimal.
-    return std.fmt.bufPrint(buffer, file_prefix ++ "{c}{d}" ++ file_suffix, .{ id.kind.letter(), id.number }) catch unreachable;
+    const digits_start = file_prefix.len + 1;
+    buffer[0..file_prefix.len].* = file_prefix.*;
+    buffer[file_prefix.len] = id.kind.letter();
+    const end = digits_start + std.fmt.printInt(buffer[digits_start..], id.number, 10, .lower, .{});
+    buffer[end..][0..file_suffix.len].* = file_suffix.*;
+    return buffer[0 .. end + file_suffix.len];
 }
 
 /// Parses an ID the agent types: "T12", "M12", or lowercase. Zero is not an
@@ -136,7 +142,7 @@ pub fn readExact(arena: Allocator, store: Store, name: []const u8, bytes: usize)
         if (content.len == bytes) return content;
         break :problem "ResultSizeMismatch";
     };
-    debug_trace.logf("context_compaction", "earlier state file unavailable handle={s} err={s}", .{ name, problem });
+    trace.log(true, "earlier state file unavailable handle={s} err={s}", .{ name, problem });
     return null;
 }
 
@@ -430,7 +436,7 @@ fn excerpt(arena: Allocator, body: []const u8, query: Query, weights: []const f6
     while (tokens.next()) |token| {
         if (termIndex(query.terms, token)) |term| try hits.append(arena, .{ .at = token.ptr - body.ptr, .term = term });
     }
-    if (hits.items.len == 0) return body[0..utf8Floor(body, shown_bytes)];
+    if (hits.items.len == 0) return body[0..text_utils.utf8BackwardBoundary(body, shown_bytes)];
 
     // Slide over the hits, keeping room around the words for context.
     const span = shown_bytes * 3 / 4;
@@ -493,20 +499,16 @@ fn breakBefore(text: []const u8) ?usize {
     return null;
 }
 
-fn utf8Floor(text: []const u8, limit: usize) usize {
-    var end = @min(text.len, limit);
-    while (end > 0 and end < text.len and text[end] & 0xc0 == 0x80) end -= 1;
-    return end;
-}
-
 const testing = std.testing;
 
 /// Files kept in memory, standing in for a session's folder in tests.
-const MemoryStore = struct {
+pub const MemoryStore = struct {
     alloc: Allocator,
     files: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+    /// Every write fails, like a store that cannot be written.
+    fail: bool = false,
 
-    fn deinit(self: *MemoryStore) void {
+    pub fn deinit(self: *MemoryStore) void {
         for (self.files.keys(), self.files.values()) |name, content| {
             self.alloc.free(name);
             self.alloc.free(content);
@@ -514,12 +516,19 @@ const MemoryStore = struct {
         self.files.deinit(self.alloc);
     }
 
-    fn store(self: *MemoryStore) Store {
+    pub fn store(self: *MemoryStore) Store {
         return .{ .context = self, .vtable = &.{ .write = write, .list = list, .read = read } };
+    }
+
+    /// The saved record `number` of `kind`, or null.
+    pub fn find(self: *const MemoryStore, kind: Kind, number: usize) ?[]const u8 {
+        var buffer: [max_file_name_bytes]u8 = undefined;
+        return self.files.get(fileName(&buffer, .{ .kind = kind, .number = number }));
     }
 
     fn write(context: *anyopaque, _: Allocator, name: []const u8, content: []const u8) Store.Error!void {
         const self: *MemoryStore = @ptrCast(@alignCast(context));
+        if (self.fail) return error.StoreFailed;
         const copy = try self.alloc.dupe(u8, content);
         errdefer self.alloc.free(copy);
         const entry = try self.files.getOrPut(self.alloc, name);
