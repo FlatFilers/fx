@@ -55,6 +55,8 @@ const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
 const usage_report = @import("../session/usage_report.zig");
 const session_store = @import("../session/session_store.zig");
+const session_adapter = @import("../session/session_adapter.zig");
+const session_child_store = @import("../session/session_child_store.zig");
 const legacy_background_migration = @import("../session/legacy_background_migration.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -252,6 +254,8 @@ pub const Config = struct {
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    /// `fx --sessions-v2 ask`; resolved with FX_SESSIONS_V2 by the adapter.
+    sessions_v2: bool = false,
 };
 
 fn runAskChild(
@@ -360,6 +364,8 @@ const AskOptions = struct {
     no_save: bool = false,
     no_color: bool = false,
     continue_recovery: bool = false,
+    /// `fx ask --sessions-v2`: keep this run's session in the v2 store.
+    sessions_v2: bool = false,
 
     fn deinit(self: *AskOptions, alloc: Allocator) void {
         alloc.free(self.prompt);
@@ -598,6 +604,11 @@ const AskContext = struct {
     loaded_skills: app_runtime_setup.LoadedSkills = .{},
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
+    /// Sessions v2: set instead of `store` and `writable`, never both.
+    v2_store: ?session_adapter.Store = null,
+    v2: ?*session_adapter.Session = null,
+    /// A resumed v2 session's preferences; `model` borrows from here.
+    v2_preferences: ?session_codec.DurableSessionPreferences = null,
     session_write_mutex: std.Io.Mutex = .init,
     requested_resume: ?ResumeTarget = null,
     seed_model: []const u8 = "",
@@ -768,6 +779,17 @@ const AskContext = struct {
                 };
             }
         }
+        if (self.v2) |v2| {
+            if (self.session.usage.isDirty()) {
+                flushAskSessionUsageV2(self, v2) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "failed to flush ask session usage backend=v2 err={s}",
+                        .{@errorName(err)},
+                    );
+                };
+            }
+        }
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
@@ -776,6 +798,12 @@ const AskContext = struct {
         if (self.writable) |*writable| writable.deinit(self.alloc);
         self.writable = null;
         if (self.store) |*store| store.deinit(self.alloc);
+        if (self.v2) |v2| v2.close();
+        self.v2 = null;
+        if (self.v2_store) |*store| store.deinit(self.alloc);
+        self.v2_store = null;
+        if (self.v2_preferences) |*preferences| preferences.deinit(self.alloc);
+        self.v2_preferences = null;
         self.ephemeral_command_replay.deinit();
         self.permission_rules.deinit(self.alloc);
         self.session.deinit(self.alloc);
@@ -811,7 +839,7 @@ const AskContext = struct {
             .scope = .{
                 .kind = .ask,
                 .workspace_root = self.workspace_root,
-                .session_id = if (self.writable) |*writable| writable.active_id else null,
+                .session_id = self.activeSessionId(),
             },
             .outcome_allocator = self.alloc,
         };
@@ -838,9 +866,26 @@ const AskContext = struct {
         return false;
     }
 
+    /// The saved session's id, from whichever backend holds it.
+    fn activeSessionId(self: *const AskContext) ?[]const u8 {
+        if (self.v2) |v2| return v2.id();
+        return if (self.writable) |*writable| writable.active_id else null;
+    }
+
+    /// The saved session's side-file capability, if any.
+    fn sessionChildCapability(self: *AskContext) ?*session_child_store.SessionChildCapability {
+        if (self.v2) |v2| return v2.childCapability() catch |err| {
+            debug_trace.logf("session", "event=sessions_v2_side_files_unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
+            return null;
+        };
+        return if (self.writable) |*writable| writable.childCapability() catch null else null;
+    }
+
     fn imageSnapshotStorageDir(self: *AskContext) ![]u8 {
-        const sessions_dir = if (self.store) |*store| store.sessions_dir else null;
-        const session_id = if (self.writable) |*writable| writable.active_id else null;
+        const sessions_dir = if (self.v2) |v2|
+            std.fs.path.dirname(v2.filesPath())
+        else if (self.store) |*store| store.sessions_dir else null;
+        const session_id = self.activeSessionId();
         return session_store.imageSnapshotStorageDir(
             self.alloc,
             sessions_dir,
@@ -890,6 +935,7 @@ const AskContext = struct {
     }
 
     fn initializeSessionStores(self: *AskContext) !void {
+        if (session_adapter.enabled(self.cfg.sessions_v2)) return self.initializeV2Session();
         var store = session_store.Store.init(self.alloc, self.workspace_root) catch |err| {
             if (err == error.OutOfMemory or self.requested_resume != null) return err;
             debug_trace.logf(
@@ -1012,6 +1058,73 @@ const AskContext = struct {
         }
     }
 
+    /// Sessions v2: the same run, saved through the adapter. v1's store is
+    /// never opened in this process.
+    fn initializeV2Session(self: *AskContext) !void {
+        self.v2_store = session_adapter.Store.openFromEnv(self.alloc) catch |err| {
+            if (err == error.OutOfMemory or self.requested_resume != null) return err;
+            debug_trace.logf("session", "event=ask_session_store_unavailable backend=v2 error={s}", .{@errorName(err)});
+            try self.writeStderr("fx ask: warning: session persistence unavailable; error=");
+            try self.writeStderr(@errorName(err));
+            try self.writeStderr("; continuing without saving\n");
+            return;
+        };
+        errdefer {
+            self.v2_store.?.deinit(self.alloc);
+            self.v2_store = null;
+        }
+        const store = &self.v2_store.?;
+        const seed_preferences = session_codec.DurableSessionPreferences{
+            .provider = self.provider,
+            .model = @constCast(self.seed_model),
+            .effort = self.effort,
+            .fast_mode = self.fast_mode,
+        };
+        const v2 = if (self.requested_resume) |target|
+            try session_adapter.Session.resumeSession(self.alloc, store, switch (target) {
+                .last => .last,
+                .id => |id| .{ .id = id },
+            }, self.workspace_root, .ask)
+        else blk: {
+            var permission_state = try self.session.snapshotPermissionState(self.alloc);
+            defer permission_state.deinit(self.alloc);
+            break :blk try session_adapter.Session.create(self.alloc, store, self.workspace_root, .ask, .{
+                .preferences = seed_preferences,
+                .language = self.session.languageSnapshot(),
+                .permission_state = permission_state,
+            });
+        };
+        errdefer v2.close();
+
+        if (self.requested_resume != null) {
+            var restored = try v2.restore(self.alloc);
+            defer restored.deinit(self.alloc);
+            try self.session.restoreWithPermissionState(
+                self.alloc,
+                restored.language,
+                restored.history,
+                restored.permission_state orelse .{},
+            );
+            updateStaleShellHandles(self, restored.history);
+            if (restored.usage) |usage| {
+                try self.session.usage.restore(self.alloc, usage, restored.created_at_ms);
+            } else {
+                self.session.usage.restoreLegacyWallDuration(restored.created_at_ms);
+            }
+            if (restored.preferences) |preferences| {
+                self.v2_preferences = preferences;
+                restored.preferences = null;
+                self.provider = preferences.provider;
+                self.model = preferences.model;
+                self.effort = preferences.effort;
+                self.fast_mode = preferences.fast_mode;
+            }
+        }
+        self.session.configureWebFetchArtifacts(self.alloc, v2.filesPath());
+        self.v2 = v2;
+        debug_trace.logf("subagent", "ask subagent host unavailable root_id={s} reason=sessions_v2", .{v2.id()});
+    }
+
     fn toolContext(self: *AskContext) tool_runtime.Context {
         const provider_capabilities = self.cfg.provider_set.select(self.provider).capabilities;
         if (provider_capabilities.fx_search) {
@@ -1061,7 +1174,7 @@ const AskContext = struct {
             .permission_rules = self.permission_rules,
             .tool_registry = self.toolRegistry(),
             .subagent_host = self.subagent_host,
-            .subagent_caller_id = if (self.writable) |*writable| writable.active_id else null,
+            .subagent_caller_id = self.activeSessionId(),
             .auto_classifier = self.admissionAutoClassifier(),
             .worker = &self.worker,
             .cancel_flag = self.cancelFlag(),
@@ -1075,10 +1188,7 @@ const AskContext = struct {
             .on_output_chunk = onCommandOutputChunk,
             .mcp_progress_ctx = @ptrCast(self),
             .on_mcp_progress = onMcpProgress,
-            .session_child_capability = if (self.writable) |*writable|
-                writable.childCapability() catch null
-            else
-                null,
+            .session_child_capability = self.sessionChildCapability(),
             .ephemeral_command_replay = self.managed_executions.replayStore(),
             .terminal_client = &self.terminal_client,
             .managed_executions = &self.managed_executions,
@@ -1344,6 +1454,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     if (options.system_prompt_override) |sp| {
         effective_cfg.prompt_policy.system_prompt = sp;
     }
+    effective_cfg.sessions_v2 = cfg.sessions_v2 or options.sessions_v2;
 
     const output_mode = selectOutputMode(
         options.quiet,
@@ -1860,10 +1971,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             return failPromptRunResult(error.McpRequiredServerUnavailable);
         }
     }
-    const session_child_capability = if (ctx.writable) |*writable|
-        writable.childCapability() catch null
-    else
-        null;
+    const session_child_capability = ctx.sessionChildCapability();
     var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
@@ -2006,14 +2114,14 @@ fn maybeStartAskTitleTask(
     if (comptime @import("builtin").os.tag == .wasi) return null;
     if (!setting_enabled or !fresh_session) return null;
     if (ctx.session.agent.history.items.len != 0) return null;
-    const writable = if (ctx.writable) |*value| value else return null;
+    const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const title_model = bundle.title_model orelse return null;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
-        .session_id = writable.active_id,
+        .session_id = session_id,
         .model = title_model,
         .prompt_excerpt = excerpt,
         .api_key = if (ctx.api_key.len > 0) ctx.api_key else null,
@@ -2039,6 +2147,18 @@ fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) 
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    if (ctx.v2) |v2| {
+        if (!std.mem.eql(u8, v2.id(), task.session_id)) {
+            debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+            return;
+        }
+        const installed = v2.installGeneratedTitle(ctx.session.agent.history.items, title) catch |err| {
+            debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+            return;
+        };
+        if (installed) debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+        return;
+    }
     const writable = if (ctx.writable) |*value| value else return;
     if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
         debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
@@ -2075,6 +2195,9 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     errdefer if (resolved_provider.len > 0) alloc.free(resolved_provider);
     const session_id = if (ctx.writable) |writable|
         try alloc.dupe(u8, writable.active_id)
+    else if (ctx.v2) |v2|
+        // A v2 session exists once its first turn is written.
+        try alloc.dupe(u8, if (v2.saved()) v2.id() else "")
     else
         try alloc.dupe(u8, "");
     errdefer if (session_id.len > 0) alloc.free(session_id);
@@ -2095,6 +2218,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .error_code = ctx.typed_error_code,
         .auth_failure = ctx.auth_failure,
         .recovery = ctx.last_recovery_status,
+        // Sessions v2 keeps no recovery checkpoint yet.
         .recovery_durable = ctx.writable != null,
         .usage = ctx.session.agent.turn_usage,
     };
@@ -2157,7 +2281,7 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
 
 fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     ctx.session.usage.configureCheckpointSink(
-        if (ctx.writable != null)
+        if (ctx.writable != null or ctx.v2 != null)
             .{
                 .context = @ptrCast(ctx),
                 .allocator = ctx.alloc,
@@ -2199,6 +2323,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
             }
         else
             null,
+        .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
         .push_text = pushText,
@@ -2302,6 +2427,7 @@ fn persistUsageCheckpoint(
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    if (ctx.v2) |v2| return v2.persistUsage(snapshot);
     const writable = if (ctx.writable) |*value|
         value
     else
@@ -3123,6 +3249,18 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    if (ctx.v2) |v2| {
+        try v2.prepareTurn(&prepared);
+        v2.commitTurn(prepared, ctx.session.languageSnapshot()) catch |err| {
+            // A failed write may still have reached the log: keep its images.
+            if (err == error.Io) ctx.prompt_snapshot_committed = true;
+            return err;
+        };
+        ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+        prepared_owned = false;
+        ctx.prompt_snapshot_committed = true;
+        return;
+    }
     const writable = if (ctx.writable) |*value| value else {
         ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
         prepared_owned = false;
@@ -3158,7 +3296,10 @@ fn commitContextCompaction(
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(ctx.session.agent.history.items) });
     errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
-    if (ctx.writable) |*writable| {
+    if (ctx.v2) |v2| {
+        try v2.commitCompaction(summary, active_prefix != null, retained_from);
+        if (active_prefix != null) ctx.prompt_snapshot_committed = true;
+    } else if (ctx.writable) |*writable| {
         _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
             if (err == error.SessionPersistenceUncertain and active_prefix != null) ctx.prompt_snapshot_committed = true;
             return err;
@@ -3188,6 +3329,22 @@ fn setRecoveryCheckpoint(
     ctx.prompt_snapshot_committed = true;
 }
 
+/// Sessions v2: each completed piece is saved before the next request.
+/// A failed stream is traced and left to the commit, which writes every
+/// piece the stream missed or reports the failure itself.
+fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    v2.appendProgress(progress.user, progress.execution) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
+        return;
+    };
+    // The log now refers to this prompt's images.
+    ctx.prompt_snapshot_committed = true;
+}
+
 fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -3213,6 +3370,13 @@ fn flushAskSessionUsage(
         .{ .usage_checkpointed = .{ .usage = usage } },
         now_ms,
     );
+    ctx.session.usage.markClean(usage);
+}
+
+fn flushAskSessionUsageV2(ctx: *AskContext, v2: *session_adapter.Session) !void {
+    var usage = try ctx.session.usage.snapshot(ctx.alloc);
+    defer usage.deinit(ctx.alloc);
+    try v2.persistUsage(usage);
     ctx.session.usage.markClean(usage);
 }
 
@@ -3513,7 +3677,7 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
         (ctx.output_mode == .quiet and !terminal)) return;
     var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try pushSystemNotice(raw_ctx, status.label(&label_buf));
-    if (terminal and ctx.writable == null) {
+    if (terminal and ctx.writable == null and ctx.v2 == null) {
         try pushSystemNotice(
             raw_ctx,
             "This run was started with --no-save, so its recovery context cannot be resumed after exit.",
@@ -3987,6 +4151,8 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "--no-save")) {
             opts.no_save = true;
+        } else if (std.mem.eql(u8, arg, "--sessions-v2")) {
+            opts.sessions_v2 = true;
         } else if (std.mem.eql(u8, arg, "--no-color")) {
             opts.no_color = true;
         } else if (std.mem.eql(u8, arg, "--continue-recovery")) {

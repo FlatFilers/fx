@@ -471,7 +471,7 @@ fn openUsageRecoveryDir(
     return .{ .dir = dir };
 }
 
-fn validateUsageRecoveryMarker(
+pub fn validateUsageRecoveryMarker(
     recovery: *const io_mod.VerifiedDir,
     session_id: []const u8,
 ) !?i64 {

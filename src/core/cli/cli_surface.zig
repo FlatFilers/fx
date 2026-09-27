@@ -133,6 +133,8 @@ pub const LaunchModifiers = struct {
     fast_override: ?bool = null,
     provider_order_override: ?[][]const u8 = null,
     provider_strict_override: ?bool = null,
+    /// `--sessions-v2`: keep this process's sessions in the v2 store.
+    sessions_v2: bool = false,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -401,11 +403,14 @@ fn parseGlobalLaunchArgs(
     var provider_order_override: ?[][]const u8 = null;
     errdefer if (provider_order_override) |order| freeProviderOrderOverride(alloc, order);
     var provider_strict_override: ?bool = null;
+    var sessions_v2 = false;
 
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit")) {
+        if (std.mem.eql(u8, arg, "--sessions-v2")) {
+            sessions_v2 = true;
+        } else if (std.mem.eql(u8, arg, "--context-limit")) {
             index += 1;
             if (index >= args.len) return error.MissingContextLimitValue;
             try overrides.append(alloc, try config_runtime.context_limits.parseOverride(args[index]));
@@ -489,6 +494,7 @@ fn parseGlobalLaunchArgs(
             .fast_override = fast_override,
             .provider_order_override = provider_order_override,
             .provider_strict_override = provider_strict_override,
+            .sessions_v2 = sessions_v2,
         },
     };
 }
@@ -524,7 +530,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--fast") and
             !std.mem.eql(u8, arg, "--no-fast") and
             !std.mem.eql(u8, arg, "--provider-strict") and
-            !std.mem.eql(u8, arg, "--no-provider-strict"))
+            !std.mem.eql(u8, arg, "--no-provider-strict") and
+            !std.mem.eql(u8, arg, "--sessions-v2"))
         {
             return args[index..];
         }
@@ -3381,6 +3388,7 @@ fn workflowConfigWithLaunchModifiers(
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
+    result.sessions_v2 = modifiers.sessions_v2;
     return result;
 }
 

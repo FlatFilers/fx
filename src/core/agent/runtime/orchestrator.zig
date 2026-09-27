@@ -3872,7 +3872,7 @@ fn persistRecoveryCheckpoint(
     tool_evidence: model_response_recovery.ToolEvidence,
     trace_ctx: TraceContext,
 ) !void {
-    const effect = deps.recovery_checkpoint orelse return;
+    if (deps.recovery_checkpoint == null and deps.append_turn_piece == null) return;
     // Every sink copies or serializes the borrowed checkpoint synchronously.
     // Retaining these full-history reconstructions in the turn arena is quadratic.
     var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -3882,14 +3882,16 @@ fn persistRecoveryCheckpoint(
         arena,
         current_turn_messages,
     );
+    const projected = try finalization.compacted_execution.project(arena, execution);
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
+    // Every completed piece reaches the session before the next request.
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
+    const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
-        .user = .{
-            .text = @constCast(job.prompt),
-            .images = job.images,
-        },
+        .user = user,
         .assistant_source = @constCast(assistant_source),
-        .execution = try finalization.compacted_execution.project(arena, execution),
+        .execution = projected,
         .cause = checkpointCause(cause),
         .action = checkpointAction(strategy),
         .tool_state = checkpointToolState(tool_evidence),

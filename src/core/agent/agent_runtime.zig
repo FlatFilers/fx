@@ -24,6 +24,7 @@ pub const ToolExecutionRequest = runtime_tool_contracts.ToolExecutionRequest;
 pub const DiffEntryPayload = runtime_tool_contracts.DiffEntryPayload;
 pub const ToolCallValidationResult = runtime_tool_contracts.ToolCallValidationResult;
 pub const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
+pub const TurnProgress = runtime_deps.TurnProgress;
 pub const TextEmission = runtime_deps.TextEmission;
 pub const ParentTurnDeliveryAck = runtime_deps.ParentTurnDeliveryAck;
 pub const PreparedParentTurnContext = runtime_deps.PreparedParentTurnContext;

@@ -269,7 +269,7 @@ fn rejectInvalidConversationEvent(comptime rule: []const u8) ConversationTransit
     return error.InvalidConversationEvent;
 }
 
-fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
+pub fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
     switch (event) {
         .user => |value| {
             try validateConversationText(value.text);
@@ -573,7 +573,7 @@ fn interruptedCommandReplayBytes(
     };
 }
 
-fn appendExecutionConversationEvents(
+pub fn appendExecutionConversationEvents(
     alloc: Allocator,
     events: *std.ArrayList(ConversationEvent),
     execution: types.ExecutionMemory,
