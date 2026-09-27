@@ -177,7 +177,8 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
     if (turns.len == 0) return error.NothingToCompact;
     var summarizer: model.Summarizer = .{ .caller = caller, .cancel_flag = request.cancel_flag, .trace_ctx = trace_ctx };
     trace.info(trace_ctx, .provider_start, "model={s} turns={d} earlier={} store={}", .{ caller.model, turns.len, chosen.earlier != null, request.records != null });
-    var summary = try summarize.compact(out, .{
+    // Not `out`: an arena would keep every discarded summary request.
+    var summary = try summarize.compact(alloc, .{
         .model = caller.model,
         .earlier = earlier,
         .turns = turns,

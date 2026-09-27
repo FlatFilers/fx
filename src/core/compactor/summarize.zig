@@ -78,7 +78,7 @@ pub const Request = struct {
     exact_tokens: usize = std.math.maxInt(usize),
     /// Estimated tokens one summary request may use. When the turns need
     /// more, the oldest are summarized first, in as many requests as it
-    /// takes, each folding into the next.
+    /// takes, each passing its summary on to the next.
     max_prompt_tokens: usize = std.math.maxInt(usize),
 };
 
@@ -138,47 +138,75 @@ const open_heading = "Turn in progress";
 /// showed.
 pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compacted_records.Store) Error!Result {
     if (request.turns.len == 0) return error.NothingToCompact;
-    // Turns too large for one request are summarized oldest first, and each
-    // part folds into the earlier summary of the next. The turns that keep
-    // their exact user messages all stay in the last part, so none fold.
-    const exact_start = exactUsers(request).start;
-    var folded: ?Result = null;
-    defer if (folded) |*part| part.deinit();
+    // Decided once for the whole compaction, so splitting it into parts
+    // changes nothing that stays word for word.
+    const finals = try alloc.alloc(bool, request.turns.len);
+    defer alloc.free(finals);
+    const exact_start = exactTurns(request, finals);
+    // Turns too large for one request are summarized oldest first. Each part
+    // passes on its earlier summary and the turns it shows, unchanged.
+    var previous: ?Result = null;
+    defer if (previous) |*part| part.deinit();
     var earlier = request.earlier;
+    var shown: []const checkpoint.Turn = &.{};
     var start: usize = 0;
     while (true) {
         const end = partEnd(request, earlier, start);
         var part = request;
         part.earlier = earlier;
-        part.turns = request.turns[start..];
-        if (end == request.turns.len or start >= exact_start) return compactPart(alloc, part, model, store);
-        const part_end = @min(end, exact_start);
-        part.turns = request.turns[start..part_end];
-        part.last_turn_open = false;
-        part.exact_tokens = 0;
-        const next = try compactPart(alloc, part, model, store);
-        if (folded) |*previous| previous.deinit();
-        folded = next;
+        part.turns = request.turns[start..end];
+        part.last_turn_open = request.last_turn_open and end == request.turns.len;
+        const next = try compactPart(alloc, part, .{
+            .start = @min(@max(exact_start, start), end) - start,
+            .finals = finals[start..end],
+            .shown = shown,
+        }, model, store);
+        if (end == request.turns.len) return next;
+        if (previous) |*done| done.deinit();
+        previous = next;
         earlier = next.compacted;
-        start = part_end;
+        earlier.?.turns = &.{};
+        shown = next.compacted.turns;
+        start = end;
     }
 }
 
-/// The newest complete turns whose user messages stay exact start at
-/// `start`: as many as fit `exact_tokens`, newest first, using `tokens`.
-const ExactUsers = struct { start: usize, tokens: usize };
+/// Which turns of a part stay shown, decided for the whole compaction.
+const Selection = struct {
+    /// Complete turns from here on keep their exact user messages; older
+    /// ones fold into the earlier summary.
+    start: usize,
+    /// Per turn: its final reply stays word for word.
+    finals: []const bool,
+    /// Turns that earlier parts of this compaction show. They stay as they
+    /// are, ahead of this part's own.
+    shown: []const checkpoint.Turn = &.{},
+};
 
-fn exactUsers(request: Request) ExactUsers {
-    var exact: ExactUsers = .{ .start = request.turns.len - @intFromBool(request.last_turn_open), .tokens = 0 };
-    while (exact.start > 0) {
-        const index = exact.start - 1;
-        const continued = if (index == 0) (request.earlier orelse Compacted{}).open else null;
-        const cost = userTokens(request.turns[index], continued);
-        if (exact.tokens +| cost > request.exact_tokens) break;
-        exact.tokens += cost;
-        exact.start = index;
+/// Within `exact_tokens`, the newest complete turns keep their exact user
+/// messages first, then as many final replies as still fit, newest first.
+/// Marks those replies in `finals` and returns where the turns start.
+fn exactTurns(request: Request, finals: []bool) usize {
+    @memset(finals, false);
+    const complete_end = request.turns.len - @intFromBool(request.last_turn_open);
+    var start = complete_end;
+    var used: usize = 0;
+    while (start > 0) {
+        const continued = if (start == 1) (request.earlier orelse Compacted{}).open else null;
+        const cost = userTokens(request.turns[start - 1], continued);
+        if (used +| cost > request.exact_tokens) break;
+        used += cost;
+        start -= 1;
     }
-    return exact;
+    var newest = complete_end;
+    while (newest > start) {
+        newest -= 1;
+        const cost = tokens(&.{finalReply(request.turns[newest])});
+        if (used +| cost > request.exact_tokens) continue;
+        used += cost;
+        finals[newest] = true;
+    }
+    return start;
 }
 
 /// Estimated tokens of a complete turn's exact user messages, as `tokens`
@@ -274,7 +302,7 @@ fn earlierTokens(earlier: Compacted) usize {
 
 /// Compacts turns that fit one summary request, clipping only its longest
 /// texts when a single turn does not fit.
-fn compactPart(alloc: Allocator, request: Request, model: Model, store: ?compacted_records.Store) Error!Result {
+fn compactPart(alloc: Allocator, request: Request, selection: Selection, model: Model, store: ?compacted_records.Store) Error!Result {
     const earlier: Compacted = request.earlier orelse .{};
 
     const arena = try alloc.create(std.heap.ArenaAllocator);
@@ -302,20 +330,8 @@ fn compactPart(alloc: Allocator, request: Request, model: Model, store: ?compact
         }
     }
 
-    // Within the budget, the newest complete turns keep their exact user
-    // messages first, then as many final replies as still fit, newest first.
-    // Older turns fold into the earlier summary.
-    const exact = exactUsers(request);
-    const chunk_start = exact.start;
-    var used = exact.tokens;
-    var newest = complete_end;
-    while (newest > chunk_start) {
-        newest -= 1;
-        const cost = tokens(&.{turns[newest].final});
-        if (used +| cost > request.exact_tokens) continue;
-        used += cost;
-        turns[newest].show_final = true;
-    }
+    const chunk_start = selection.start;
+    for (turns, selection.finals) |*turn, show_final| turn.show_final = show_final;
     const plan: Plan = .{
         .earlier = earlier,
         .turns = turns,
@@ -341,8 +357,17 @@ fn compactPart(alloc: Allocator, request: Request, model: Model, store: ?compact
         sections = try parseSections(out, summary, plan);
     }
 
-    const shown = try out.alloc(checkpoint.Turn, complete_end - chunk_start);
-    for (shown, turns[chunk_start..complete_end], 0..) |*slot, turn, index| slot.* = .{
+    const kept = selection.shown.len;
+    const shown = try out.alloc(checkpoint.Turn, kept + complete_end - chunk_start);
+    for (shown[0..kept], selection.shown) |*slot, turn| slot.* = .{
+        .number = turn.number,
+        .users = try dupeAll(out, turn.users),
+        .work = try out.dupe(u8, turn.work),
+        .final = try out.dupe(u8, turn.final),
+        .first_tool = turn.first_tool,
+        .last_tool = turn.last_tool,
+    };
+    for (shown[kept..], turns[chunk_start..complete_end], 0..) |*slot, turn, index| slot.* = .{
         .number = turn.number,
         .users = try dupeAll(out, turn.users),
         .work = if (index < sections.turn_work.len) sections.turn_work[index] else "",
@@ -442,16 +467,8 @@ fn prepare(arena: Allocator, turn: Turn, continued: ?checkpoint.OpenTurn, is_ope
         else => {},
     };
 
-    // The final reply is the last assistant message with no tool call after
-    // it. A turn still in progress has none yet.
-    var final_index: ?usize = null;
-    if (!is_open) for (turn.items, 0..) |item, index| switch (item) {
-        .assistant => |text| {
-            if (text.len > 0) final_index = index;
-        },
-        .tool_call => final_index = null,
-        else => {},
-    };
+    // A turn still in progress has no final reply yet.
+    const final_index: ?usize = if (is_open) null else finalIndex(turn);
 
     var users: std.ArrayList([]const u8) = .empty;
     if (!is_open) try users.append(arena, turn.user);
@@ -498,6 +515,24 @@ fn prepare(arena: Allocator, turn: Turn, continued: ?checkpoint.OpenTurn, is_ope
         .continued = continued,
         .text = text.items,
     };
+}
+
+/// The final reply of a complete turn is its last assistant message with no
+/// tool call after it.
+fn finalIndex(turn: Turn) ?usize {
+    var final_index: ?usize = null;
+    for (turn.items, 0..) |item, index| switch (item) {
+        .assistant => |text| {
+            if (text.len > 0) final_index = index;
+        },
+        .tool_call => final_index = null,
+        else => {},
+    };
+    return final_index;
+}
+
+fn finalReply(turn: Turn) []const u8 {
+    return if (finalIndex(turn)) |index| turn.items[index].assistant else "";
 }
 
 fn hasCall(tools: []const PendingTool, number: usize) bool {
@@ -957,6 +992,8 @@ const FakeModel = struct {
     reply: []const u8 = "Turn 1:\nThe assistant ran the build (T1) and found the error.",
     fail: ?ModelError = null,
     calls: usize = 0,
+    /// Estimated tokens of the largest request.
+    largest: usize = 0,
     seen_model: []const u8 = "",
     seen_system: []const u8 = "",
     seen_user: std.ArrayList(u8) = .empty,
@@ -972,6 +1009,7 @@ const FakeModel = struct {
     fn summarize(context: *anyopaque, alloc: Allocator, prompt: Prompt) ModelError![]u8 {
         const self: *FakeModel = @ptrCast(@alignCast(context));
         self.calls += 1;
+        self.largest = @max(self.largest, tokens(&.{ prompt.system, prompt.user }));
         self.seen_model = prompt.model;
         self.seen_system = prompt.system;
         self.seen_user.clearRetainingCapacity();
@@ -1387,11 +1425,14 @@ test "compaction survives every allocation failure" {
             const earlier: Compacted = .{ .earlier = "e", .turns = &.{.{ .number = 1, .users = &.{"u"}, .final = "f" }}, .open = .{ .text = "t", .work = "w" }, .turn_count = 1 };
             var result = try compact(alloc, .{ .model = "m", .earlier = earlier, .turns = &sample }, model.model(), store.store());
             result.deinit();
-            // Split into parts, every text clipped down to its note.
-            var split_store = MemoryStore{ .alloc = testing.allocator };
-            defer split_store.deinit();
-            var split = try compact(alloc, .{ .model = "m", .earlier = earlier, .turns = &sample, .exact_tokens = userTokens(sample[1], null), .max_prompt_tokens = 1 }, model.model(), split_store.store());
-            split.deinit();
+            // Split into parts, every text clipped down to its note: once
+            // folding the first turn, once carrying it shown.
+            for ([_]usize{ userTokens(sample[1], null), std.math.maxInt(usize) }) |exact_tokens| {
+                var split_store = MemoryStore{ .alloc = testing.allocator };
+                defer split_store.deinit();
+                var split = try compact(alloc, .{ .model = "m", .earlier = earlier, .turns = &sample, .exact_tokens = exact_tokens, .max_prompt_tokens = 1 }, model.model(), split_store.store());
+                split.deinit();
+            }
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
@@ -1491,7 +1532,7 @@ test "a clipped tool result names its saved whole output in its record and in th
     try testing.expect(std.mem.find(u8, model.seen_user.items, "[Tool result T1: read_tool_result]\nfirst page\n... [tool result truncated]\n" ++ note ++ "\n") != null);
 }
 
-test "turns that keep their exact user messages are never split into earlier parts" {
+test "a split keeps every exact user message and final reply, and every request fits" {
     var model = FakeModel{ .reply = "Turn 1:\nRan make.\nTurn 2:\nRan make.\nTurn 3:\nRan make." };
     defer model.deinit();
     var store = MemoryStore{ .alloc = testing.allocator };
@@ -1503,14 +1544,20 @@ test "turns that keep their exact user messages are never split into earlier par
     var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = room }, model.model(), store.store());
     defer result.deinit();
 
-    try testing.expectEqual(@as(usize, 1), model.calls);
-    try testing.expect(tokens(&.{ system_prompt, model.seen_user.items }) <= room);
+    try testing.expectEqual(@as(usize, 3), model.calls);
+    try testing.expect(model.largest <= room);
+    // Each part summarized its turn from the whole text.
+    try testing.expect(std.mem.find(u8, model.seen_user.items, "[Tool result T3: shell]\n" ++ output ++ "\n") != null);
     try testing.expectEqual(@as(usize, 3), result.compacted.turns.len);
-    for (result.compacted.turns, [_][]const u8{ "first", "second", "third" }) |turn, user| {
+    for (result.compacted.turns, [_][]const u8{ "first", "second", "third" }, 1..) |turn, user, number| {
+        try testing.expectEqual(number, turn.number);
         try testing.expectEqualStrings(user, turn.users[0]);
+        try testing.expectEqualStrings("Ran make.", turn.work);
         try testing.expectEqualStrings("Done.", turn.final);
+        try testing.expectEqual(number, turn.first_tool);
     }
-    try testing.expect(std.mem.find(u8, store.find(.tool, 1).?, output) != null);
+    try testing.expectEqualStrings("", result.compacted.earlier);
+    try testing.expectEqual(@as(usize, 3), result.compacted.tool_count);
 }
 
 test "a request fits even when a turn has many texts too short to clip" {
@@ -1540,6 +1587,24 @@ test "a request fits even when a turn has many texts too short to clip" {
     // Texts shorter than their note stay whole.
     try testing.expect(std.mem.find(u8, seen, "[Tool call T300: shell]\n{\"command\":\"make\"}\n") != null);
     try testing.expect(std.mem.find(u8, store.find(.tool, 300).?, output) != null);
+}
+
+test "clipping the turns keeps the previous compaction whole when that is enough" {
+    const summary = "EARLIER_START " ++ ("older work " ** 1500) ++ "EARLIER_END";
+    const earlier: Compacted = .{ .earlier = summary, .turn_count = 2, .tool_count = 1, .saved = true };
+    const turns = [_]Turn{workedTurn("Run it again.", "call-1", "build output line " ** 3000)};
+    var model = FakeModel{ .reply = "Turn 3:\nRan make again." };
+    defer model.deinit();
+    var store = MemoryStore{ .alloc = testing.allocator };
+    defer store.deinit();
+    const room = 8000;
+    var result = try compact(testing.allocator, .{ .model = "m", .earlier = earlier, .turns = &turns, .max_prompt_tokens = room }, model.model(), store.store());
+    defer result.deinit();
+
+    const seen = model.seen_user.items;
+    try testing.expect(tokens(&.{ system_prompt, seen }) <= room);
+    try testing.expect(std.mem.startsWith(u8, seen, "[Earlier summary, kept as it is]\n" ++ summary ++ "\n"));
+    try testing.expect(std.mem.find(u8, seen, "clipped for this summary; the whole text is saved in T2]") != null);
 }
 
 test "the previous compaction is clipped only when the turns alone cannot make the request fit" {
