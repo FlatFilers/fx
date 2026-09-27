@@ -35,6 +35,7 @@
 //! shows no remaining legacy payloads in active session stores.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const result_store = @import("result_store.zig");
@@ -75,7 +76,7 @@ pub const Outcome = enum {
     no_inline_payloads,
 };
 
-pub const TestControls = struct {
+pub const TestControls = if (builtin.is_test) struct {
     context: ?*anyopaque = null,
     before_rename_fn: ?*const fn (?*anyopaque) anyerror!void = null,
     before_spill_fn: ?*const fn (?*anyopaque, usize) anyerror!void = null,
@@ -91,6 +92,14 @@ pub const TestControls = struct {
 
     fn syncDir(self: TestControls, dir: std.Io.Dir) !void {
         if (self.sync_dir_fn) |callback| return callback(self.context, dir);
+        return io_mod.syncVerifiedDir(dir);
+    }
+} else struct {
+    fn beforeRename(_: TestControls) !void {}
+
+    fn beforeSpill(_: TestControls, _: usize) !void {}
+
+    fn syncDir(_: TestControls, dir: std.Io.Dir) !void {
         return io_mod.syncVerifiedDir(dir);
     }
 };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -45,11 +46,7 @@ const LineRead = struct {
     next_offset: u64,
 };
 
-pub const Store = struct {
-    home_path: []u8,
-    display_path: []u8,
-    durable_home: ?io_mod.VerifiedDir = null,
-    indeterminate: bool = false,
+const TestControls = if (builtin.is_test) struct {
     scan_block_bytes: usize = default_scan_block_bytes,
     lock_ops: io_mod.LockOps = .{},
     fail_compaction_before_rename: bool = false,
@@ -57,6 +54,14 @@ pub const Store = struct {
     fail_layout_creation: bool = false,
     fail_private_mode: bool = false,
     fail_history_parent_sync: bool = false,
+} else struct {};
+
+pub const Store = struct {
+    home_path: []u8,
+    display_path: []u8,
+    durable_home: ?io_mod.VerifiedDir = null,
+    indeterminate: bool = false,
+    test_controls: TestControls = .{},
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
         const zio = io_mod.getIo();
@@ -190,8 +195,11 @@ pub const Store = struct {
         );
         defer alloc.free(replacement);
 
-        const ops = if (self.fail_clear_after_rename)
-            io_mod.DurableOps{ .sync_dir = failParentSync }
+        const ops = if (comptime builtin.is_test)
+            if (self.test_controls.fail_clear_after_rename)
+                io_mod.DurableOps{ .sync_dir = failParentSync }
+            else
+                io_mod.DurableOps{}
         else
             io_mod.DurableOps{};
         io_mod.durableReplaceVerifiedWithOps(
@@ -215,9 +223,13 @@ pub const Store = struct {
     }
 
     fn ensureWritable(self: *Store) !void {
-        if (self.fail_private_mode) return error.PrivateStatePermissionsUnsupported;
+        if (comptime builtin.is_test) {
+            if (self.test_controls.fail_private_mode) return error.PrivateStatePermissionsUnsupported;
+        }
         if (self.durable_home == null) {
-            if (self.fail_layout_creation) return error.DurableLayoutFailed;
+            if (comptime builtin.is_test) {
+                if (self.test_controls.fail_layout_creation) return error.DurableLayoutFailed;
+            }
             const zio = io_mod.getIo();
             var home = io_mod.VerifiedDir{
                 .dir = std.Io.Dir.openDirAbsolute(zio, self.home_path, .{
@@ -247,7 +259,7 @@ pub const Store = struct {
             &self.durable_home.?,
             history_lock_file,
             lock_deadline_ms,
-            self.lock_ops,
+            if (comptime builtin.is_test) self.test_controls.lock_ops else .{},
         );
     }
 
@@ -297,8 +309,10 @@ pub const Store = struct {
             return error.PrivateStatePermissionsUnsupported;
         }
         if (created) {
-            if (self.fail_history_parent_sync) {
-                return error.DurableLayoutFailed;
+            if (comptime builtin.is_test) {
+                if (self.test_controls.fail_history_parent_sync) {
+                    return error.DurableLayoutFailed;
+                }
             }
             io_mod.syncVerifiedDir(self.durable_home.?.dir) catch {
                 return error.DurableLayoutFailed;
@@ -328,8 +342,10 @@ pub const Store = struct {
     }
 
     fn compact(self: *Store, alloc: Allocator) !void {
-        if (self.fail_compaction_before_rename) {
-            return error.PromptHistoryCompactionStale;
+        if (comptime builtin.is_test) {
+            if (self.test_controls.fail_compaction_before_rename) {
+                return error.PromptHistoryCompactionStale;
+            }
         }
         var file = (try self.openHistory(false, false)) orelse return;
         defer file.close(io_mod.getIo());
@@ -405,7 +421,10 @@ pub const Store = struct {
         while (cursor > 0 and entries.items.len < limit) {
             const block_len_u64 = @min(
                 cursor,
-                @as(u64, @intCast(self.scan_block_bytes)),
+                @as(u64, @intCast(if (comptime builtin.is_test)
+                    self.test_controls.scan_block_bytes
+                else
+                    default_scan_block_bytes)),
             );
             const start = cursor - block_len_u64;
             const block_len: usize = @intCast(block_len_u64);
@@ -474,7 +493,7 @@ pub const Store = struct {
     }
 
     fn setScanBlockBytesForTest(self: *Store, bytes: usize) void {
-        self.scan_block_bytes = @max(bytes, 1);
+        self.test_controls.scan_block_bytes = @max(bytes, 1);
     }
 
     fn historyLengthForTest(self: *Store) !u64 {
@@ -516,24 +535,19 @@ pub const Store = struct {
     }
 
     pub fn setLockOpsForTest(self: *Store, ops: io_mod.LockOps) void {
-        self.lock_ops = ops;
+        self.test_controls.lock_ops = ops;
     }
 
     pub fn clearTestControls(self: *Store) void {
-        self.lock_ops = .{};
-        self.fail_compaction_before_rename = false;
-        self.fail_clear_after_rename = false;
-        self.fail_layout_creation = false;
-        self.fail_private_mode = false;
-        self.fail_history_parent_sync = false;
+        self.test_controls = .{};
     }
 
     fn failCompactionBeforeRenameForTest(self: *Store) void {
-        self.fail_compaction_before_rename = true;
+        self.test_controls.fail_compaction_before_rename = true;
     }
 
     fn failClearAfterRenameForTest(self: *Store) void {
-        self.fail_clear_after_rename = true;
+        self.test_controls.fail_clear_after_rename = true;
     }
 
     fn clearFailureControlsForTest(self: *Store) void {
@@ -541,17 +555,17 @@ pub const Store = struct {
     }
 
     fn failLayoutCreationForTest(self: *Store) void {
-        self.fail_layout_creation = true;
-        self.fail_private_mode = false;
+        self.test_controls.fail_layout_creation = true;
+        self.test_controls.fail_private_mode = false;
     }
 
     fn failPrivateModeForTest(self: *Store) void {
-        self.fail_layout_creation = false;
-        self.fail_private_mode = true;
+        self.test_controls.fail_layout_creation = false;
+        self.test_controls.fail_private_mode = true;
     }
 
     fn failHistoryParentSyncForTest(self: *Store) void {
-        self.fail_history_parent_sync = true;
+        self.test_controls.fail_history_parent_sync = true;
     }
 };
 

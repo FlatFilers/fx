@@ -3080,7 +3080,7 @@ pub const LockKind = enum {
     session,
 };
 
-pub const TestControls = struct {
+pub const TestControls = if (builtin.is_test) struct {
     context: ?*anyopaque = null,
     boundary_fn: ?*const fn (?*anyopaque, Boundary) anyerror!void = null,
     lock_fn: ?*const fn (?*anyopaque, LockKind) void = null,
@@ -3093,6 +3093,12 @@ pub const TestControls = struct {
     fn lock(self: TestControls, kind: LockKind) void {
         if (self.lock_fn) |callback| callback(self.context, kind);
     }
+} else struct {
+    compaction: session_compaction.TestControls = .{},
+
+    pub fn boundary(_: TestControls, _: Boundary) !void {}
+
+    fn lock(_: TestControls, _: LockKind) void {}
 };
 
 pub const Options = struct {
