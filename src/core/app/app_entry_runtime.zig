@@ -381,20 +381,30 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv = [_][]const u8{
-                request.executablePath(),
-                "resume",
-                handoff.session_id,
-                cli_surface.upgrade_relaunch_arg,
-                request.previousRevision() orelse "",
-            };
-            const argv_slice = if (request.previousRevision() == null) argv[0..4] else argv[0..5];
+            var argv: [6][]const u8 = undefined;
+            var argc: usize = 0;
+            argv[argc] = request.executablePath();
+            argc += 1;
+            // A v2 session resumes only with the flag that saved it.
+            if (handoff.sessions_v2) {
+                argv[argc] = cli_surface.sessions_v2_arg;
+                argc += 1;
+            }
+            for ([_][]const u8{ "resume", handoff.session_id, cli_surface.upgrade_relaunch_arg }) |arg| {
+                argv[argc] = arg;
+                argc += 1;
+            }
+            if (request.previousRevision()) |revision| {
+                argv[argc] = revision;
+                argc += 1;
+            }
+            const argv_slice = argv[0..argc];
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
                 .{ .argv = argv_slice },
             );
-            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
+            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id, handoff.sessions_v2);
         } else {
             writeStderr(
                 deps,
@@ -412,9 +422,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 &message_buffer,
                 handoff.session_id,
                 resume_handoff_columns,
+                handoff.sessions_v2,
             )
         else
-            formatResumeHandoff(&message_buffer, handoff.session_id)) catch return .returned;
+            formatResumeHandoff(&message_buffer, handoff.session_id, handoff.sessions_v2)) catch return .returned;
         deps.write_stdout(deps.stdout_ctx, message) catch {};
     }
     return .returned;
@@ -439,12 +450,13 @@ fn writeUpgradeRelaunchFailure(
     deps: RunDeps,
     err: std.process.ReplaceError,
     session_id: []const u8,
+    sessions_v2: bool,
 ) void {
     var buffer: [768]u8 = undefined;
     const message = std.fmt.bufPrint(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-        .{ @errorName(err), session_id },
+        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx {s}--resume {s}\n",
+        .{ @errorName(err), if (sessions_v2) "--sessions-v2 " else "", session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
 }
@@ -515,11 +527,11 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
-fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
+fn formatResumeHandoff(buffer: []u8, session_id: []const u8, sessions_v2: bool) ![]const u8 {
     return std.fmt.bufPrint(
         buffer,
-        "Continue session with: fx --resume {s}\n",
-        .{session_id},
+        "Continue session with: fx {s}--resume {s}\n",
+        .{ if (sessions_v2) "--sessions-v2 " else "", session_id },
     );
 }
 
@@ -665,6 +677,7 @@ const TestCapture = struct {
     record_stderr_event: bool = false,
     record_stdout_event: bool = false,
     resume_handoff_id: ?[]const u8 = null,
+    resume_handoff_sessions_v2: bool = false,
     shutdown_failure: ?anyerror = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
@@ -805,7 +818,7 @@ const TestApp = struct {
                 self.deinit();
                 return .{ .failure = error.OutOfMemory };
             };
-            break :blk .{ .session_id = session_id };
+            break :blk .{ .session_id = session_id, .sessions_v2 = active_capture.?.resume_handoff_sessions_v2 };
         } else null;
         if (active_capture.?.raise_sigint_during_deinit) {
             _ = std.c.raise(std.posix.SIG.INT);
@@ -1028,6 +1041,26 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
 
     _ = std.c.raise(std.posix.SIG.INT);
     try std.testing.expectEqual(@as(usize, 1), test_sigint_count.load(.seq_cst));
+}
+
+test "a v2 handoff relaunches and hints with --sessions-v2" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.resume_handoff_sessions_v2 = true;
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--sessions-v2", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx --sessions-v2 --resume session-123") != null);
 }
 
 test "app entry relaunches only after teardown with the validated handoff" {

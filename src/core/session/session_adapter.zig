@@ -124,6 +124,8 @@ pub const Target = union(enum) {
     id: []const u8,
     /// The newest updated root session in the workspace.
     last,
+    /// The session this host last opened in the workspace (`fx -c`).
+    last_opened,
 };
 
 /// What resume gives back. Owns everything; free with `deinit`.
@@ -133,14 +135,30 @@ pub const Restored = struct {
     preferences: ?session_codec.DurableSessionPreferences = null,
     permission_state: ?session_permission_state.State = null,
     usage: ?session_usage.Snapshot = null,
+    /// The stored title, generated or chosen by the user.
+    title: ?[]u8 = null,
     created_at_ms: i64,
+    updated_at_ms: i64 = 0,
 
     pub fn deinit(restored: *Restored, alloc: Allocator) void {
         types.freeHistoryTurnSlice(alloc, restored.history);
+        if (restored.title) |value| alloc.free(value);
         if (restored.preferences) |*value| value.deinit(alloc);
         if (restored.permission_state) |*value| value.deinit(alloc);
         if (restored.usage) |*value| value.deinit(alloc);
         restored.* = undefined;
+    }
+};
+
+/// A resumed session as v1's state. Owns everything; free with `deinit`.
+pub const Resumed = struct {
+    state: session_codec.DurableSessionState,
+    title: ?[]u8,
+
+    pub fn deinit(resumed: *Resumed, alloc: Allocator) void {
+        resumed.state.deinit(alloc);
+        if (resumed.title) |value| alloc.free(value);
+        resumed.* = undefined;
     }
 };
 
@@ -198,6 +216,7 @@ pub const Session = struct {
             .target = switch (target) {
                 .id => |session_id| .{ .id = session_id },
                 .last => .last,
+                .last_opened => .{ .last_opened = host },
             },
             .workspace = workspace,
             .host = host,
@@ -226,6 +245,17 @@ pub const Session = struct {
     /// The session is on disk: it has a turn, ended or open.
     pub fn saved(self: *const Session) bool {
         return self.last_turn > 0;
+    }
+
+    /// The session's folder under `~/.fx/sessions/v2`, for display. Caller owns it.
+    pub fn folderPath(self: *const Session, alloc: Allocator) ![]u8 {
+        return std.fs.path.join(alloc, &.{
+            self.store.home,
+            profile_paths.root_dir_name,
+            profile_paths.sessions_dir_name,
+            session_layout.sessions_v2_dir,
+            self.id(),
+        });
     }
 
     /// `~/.fx/session-files/{id}`: borrowed until `close`.
@@ -553,6 +583,17 @@ pub const Session = struct {
         _ = try self.handle.append(&.{.{ .set = .{ .key = .permissions, .value = value } }});
     }
 
+    /// A title the user chose. It differs from the derived one, so a
+    /// generated title never replaces it.
+    pub fn rename(self: *Session, title: []const u8) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const value = try jsonString(self.alloc, title);
+        defer self.alloc.free(value);
+        _ = try self.handle.append(&.{.{ .set = .{ .key = .title, .value = value } }});
+        self.titled = true;
+    }
+
     /// v1's rule: a generated title never replaces one the user chose, only
     /// none or the one derived from the first message.
     pub fn installGeneratedTitle(self: *Session, history: []const types.HistoryTurn, title: []const u8) !bool {
@@ -653,8 +694,10 @@ pub const Session = struct {
             .history = &.{},
             .language = language,
             .created_at_ms = std.math.cast(i64, state.created_ms) orelse 0,
+            .updated_at_ms = std.math.cast(i64, state.updated_ms) orelse 0,
         };
         errdefer restored.deinit(alloc);
+        if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
         if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
         if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
         if (state.usage) |raw| {
@@ -698,6 +741,45 @@ pub const Session = struct {
         try self.replay(alloc, sa, from, skip_offset, &history);
         restored.history = try history.toOwnedSlice(alloc);
         return restored;
+    }
+
+    /// The session as v1's `DurableSessionState`, for hosts that restore
+    /// through it, and its stored title. Caller owns both.
+    pub fn durableState(self: *Session, alloc: Allocator, workspace: []const u8) !Resumed {
+        var restored = try self.restore(alloc);
+        defer restored.deinit(alloc);
+        const id_copy = try alloc.dupe(u8, self.id());
+        errdefer alloc.free(id_copy);
+        const origin = try alloc.dupe(u8, workspace);
+        errdefer alloc.free(origin);
+        const workspace_copy = try alloc.dupe(u8, workspace);
+        errdefer alloc.free(workspace_copy);
+        // Every session starts with its preferences (`create`).
+        const preferences = restored.preferences orelse return error.InvalidSessionFormat;
+        restored.preferences = null;
+        const resumed: Resumed = .{
+            .state = .{
+                .id = id_copy,
+                .origin_workspace_root = origin,
+                .workspace_root = workspace_copy,
+                .created_at_ms = restored.created_at_ms,
+                .updated_at_ms = restored.updated_at_ms,
+                .conversation_language = restored.language,
+                .preferences = preferences,
+                .history = restored.history,
+                // v1 reloads its totals as zero as well.
+                .total_input_tokens = 0,
+                .total_output_tokens = 0,
+                .permission_state = restored.permission_state orelse .{},
+                .usage = restored.usage,
+            },
+            .title = restored.title,
+        };
+        restored.history = &.{};
+        restored.permission_state = null;
+        restored.usage = null;
+        restored.title = null;
+        return resumed;
     }
 
     /// The cursor of `turn`'s `turn_started`, reading back from `before`.
@@ -844,6 +926,68 @@ fn withoutCreatedAt(a: Allocator, bytes: []const u8) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Listing
+
+const list_page_size: usize = 256;
+
+/// Every saved root session, newest first, as v1's picker summaries, leaving
+/// out `active_id`. A saved session always has a turn (D2), so each one can
+/// be resumed. Stops with `error.Cancelled` once `cancel` is set. Caller
+/// owns the list and every summary; safe from any thread.
+pub fn listSummaries(
+    store: *Store,
+    alloc: Allocator,
+    active_id: ?[]const u8,
+    cancel: *const std.atomic.Value(bool),
+) !std.ArrayList(session_store.SessionSummary) {
+    var list: std.ArrayList(session_store.SessionSummary) = .empty;
+    errdefer {
+        for (list.items) |*summary| summary.deinit(alloc);
+        list.deinit(alloc);
+    }
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var cursor: ?sm.ListCursor = null;
+    while (true) {
+        if (cancel.load(.acquire)) return error.Cancelled;
+        var page = try store.manager.list(alloc, .all, cursor, list_page_size);
+        defer page.deinit();
+        for (page.items) |item| {
+            if (item.role != .root) continue;
+            if (active_id) |active| if (std.mem.eql(u8, active, item.id)) continue;
+            try list.append(alloc, try summaryOf(alloc, scratch.allocator(), item));
+        }
+        cursor = page.next orelse break;
+    }
+    return list;
+}
+
+fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_store.SessionSummary {
+    const id = try alloc.dupe(u8, item.id);
+    errdefer alloc.free(id);
+    const workspace = try alloc.dupe(u8, item.workspace);
+    errdefer alloc.free(workspace);
+    const origin = try alloc.dupe(u8, item.workspace);
+    errdefer alloc.free(origin);
+    const title: ?[]u8 = if (item.title) |raw|
+        try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, scratch, raw, .{}))
+    else
+        null;
+    errdefer if (title) |value| alloc.free(value);
+    return .{
+        .id = id,
+        .workspace_root = workspace,
+        .origin_workspace_root = origin,
+        .title = title,
+        .display_metadata_present = title != null,
+        .created_at_ms = std.math.cast(i64, item.created_ms) orelse 0,
+        .updated_at_ms = std.math.cast(i64, item.updated_ms) orelse 0,
+        .conversation_language = if (item.language) |raw| try decodeLanguage(scratch, raw) else types.ConversationLanguage.default(),
+        .history_len = @max(item.turns, 1),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Usage recovery: what the profile's readers need from v2 sessions
 
 /// A v2 session's usage-recovery marker and its newest usage checkpoint,
@@ -934,13 +1078,14 @@ fn newestUsage(store: *Store, alloc: Allocator, id: []const u8) !?UsageCheckpoin
 
 /// v1's error names for a failed resume, so every host reports the same
 /// error whichever backend is on.
-const ResumeError = error{ SessionNotFound, NoSavedSessions, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat } || sm.OpenError;
+const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat } || sm.OpenError;
 
 fn resumeError(err: sm.OpenError, target: Target) ResumeError {
     return switch (err) {
         error.NotFound => switch (target) {
             .id => error.SessionNotFound,
             .last => error.NoSavedSessions,
+            .last_opened => error.NoRememberedSession,
         },
         // A child is resumed only through its parent, as in v1.
         error.ChildSession => error.SessionNotFound,
@@ -1432,6 +1577,91 @@ test "a failed resume reports v1's error names" {
     try testing.expectEqual(error.InvalidSessionFormat, resumeError(error.Corrupt, .last));
     try testing.expectEqual(error.UnsupportedSessionFormat, resumeError(error.UnsupportedVersion, .last));
     try testing.expectEqual(error.Io, resumeError(error.Io, .last));
+}
+
+test "a resumed session gives v1's state and the title the user chose" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    try s.rename("Chosen title");
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
+    defer r.close();
+    var resumed = try r.durableState(testing.allocator, "/w");
+    defer resumed.deinit(testing.allocator);
+    try testing.expectEqualStrings(id, resumed.state.id);
+    try testing.expectEqualStrings("/w", resumed.state.workspace_root);
+    try testing.expectEqual(@as(usize, 1), resumed.state.history.len);
+    try testing.expectEqualStrings("m", resumed.state.preferences.model);
+    try testing.expectEqualStrings("Chosen title", resumed.title.?);
+    try testing.expect(resumed.state.created_at_ms > 0);
+    try testing.expect(resumed.state.updated_at_ms >= resumed.state.created_at_ms);
+    // A generated title does not replace the one the user chose.
+    try testing.expect(!try r.installGeneratedTitle(resumed.state.history, "Generated"));
+}
+
+test "the picker lists saved root sessions newest first, without the open one" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const first = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try first.commitTurn(assistantTurn("first", "a"), types.ConversationLanguage.default());
+    const first_id = try testing.allocator.dupe(u8, first.id());
+    defer testing.allocator.free(first_id);
+    first.close();
+    // A session with no turn is not saved, so it is never listed (D2).
+    const empty = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    empty.close();
+    io_mod.sleep(2 * std.time.ns_per_ms);
+    const second = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer second.close();
+    try second.commitTurn(assistantTurn("second", "b"), types.ConversationLanguage.default());
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var all = try listSummaries(&t.store, testing.allocator, null, &cancel);
+    defer {
+        for (all.items) |*summary| summary.deinit(testing.allocator);
+        all.deinit(testing.allocator);
+    }
+    try testing.expectEqual(@as(usize, 2), all.items.len);
+    try testing.expectEqualStrings(second.id(), all.items[0].id);
+    try testing.expectEqualStrings("/w", all.items[0].workspace_root.?);
+    try testing.expect(all.items[0].hasResumableContent());
+
+    var others = try listSummaries(&t.store, testing.allocator, second.id(), &cancel);
+    defer {
+        for (others.items) |*summary| summary.deinit(testing.allocator);
+        others.deinit(testing.allocator);
+    }
+    try testing.expectEqual(@as(usize, 1), others.items.len);
+    try testing.expectEqualStrings(first_id, others.items[0].id);
+
+    cancel.store(true, .release);
+    try testing.expectError(error.Cancelled, listSummaries(&t.store, testing.allocator, null, &cancel));
+}
+
+test "-c resumes the session this host last opened" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const again = try Session.resumeSession(testing.allocator, &t.store, .last_opened, "/w", .app);
+    defer again.close();
+    try testing.expectEqualStrings(id, again.id());
+    try testing.expectError(error.NoRememberedSession, Session.resumeSession(testing.allocator, &t.store, .last_opened, "/w", .acp));
 }
 
 test "side files live in a private session-files folder" {

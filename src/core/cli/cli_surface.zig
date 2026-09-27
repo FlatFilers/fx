@@ -94,6 +94,7 @@ const ResumeInvocation = struct {
 
 const resume_id_alias_prefix = "--resume-";
 pub const upgrade_relaunch_arg = "--upgrade-relaunch";
+pub const sessions_v2_arg = "--sessions-v2";
 
 pub const UpgradeRelaunch = struct {
     previous_revision: ?[]u8 = null,
@@ -408,7 +409,7 @@ fn parseGlobalLaunchArgs(
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--sessions-v2")) {
+        if (std.mem.eql(u8, arg, sessions_v2_arg)) {
             sessions_v2 = true;
         } else if (std.mem.eql(u8, arg, "--context-limit")) {
             index += 1;
@@ -531,7 +532,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--no-fast") and
             !std.mem.eql(u8, arg, "--provider-strict") and
             !std.mem.eql(u8, arg, "--no-provider-strict") and
-            !std.mem.eql(u8, arg, "--sessions-v2"))
+            !std.mem.eql(u8, arg, sessions_v2_arg))
         {
             return args[index..];
         }

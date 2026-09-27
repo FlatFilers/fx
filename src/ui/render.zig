@@ -790,9 +790,11 @@ pub fn formatResumeHandoff(
     buffer: []u8,
     session_id: []const u8,
     terminal_cols: u16,
+    sessions_v2: bool,
 ) ![]const u8 {
     const label = "Continue session with:";
-    const command = "fx --resume ";
+    // A v2 session resumes only with the flag that saved it.
+    const command = if (sessions_v2) "fx --sessions-v2 --resume " else "fx --resume ";
     const single_row_width = label.len + 1 + command.len + session_id.len;
     const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
     return std.fmt.bufPrint(
@@ -861,17 +863,24 @@ test "resume handoff uses one row only when the full instruction fits" {
 
     const single_row = "Continue session with: fx --resume session-123";
     var exact_buffer: [128]u8 = undefined;
-    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
+    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
         exact,
     );
 
     var narrow_buffer: [128]u8 = undefined;
-    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
+    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
         narrow,
+    );
+
+    var v2_buffer: [128]u8 = undefined;
+    const v2 = try formatResumeHandoff(&v2_buffer, "session-123", 80, true);
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;245mContinue session with: fx --sessions-v2 --resume session-123\x1b[0m\n",
+        v2,
     );
 }
 
@@ -880,7 +889,7 @@ test "resume handoff follows the active muted theme shade" {
     defer initTheme(false, null);
 
     var buffer: [128]u8 = undefined;
-    const message = try formatResumeHandoff(&buffer, "session-123", 80);
+    const message = try formatResumeHandoff(&buffer, "session-123", 80, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
         message,

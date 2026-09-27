@@ -385,6 +385,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Resume a session by exact ID",
     },
     .{
+        .usage = "--sessions-v2",
+        .description = "Use the experimental v2 session store, also set by FX_SESSIONS_V2=1",
+    },
+    .{
         .usage = "-h, --help",
         .description = "Display this help and exit",
     },

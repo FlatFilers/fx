@@ -1,5 +1,6 @@
 const std = @import("std");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const agent_runtime = @import("../agent/agent_runtime.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -46,6 +47,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const session_log = @import("../session/session_log.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
@@ -404,6 +406,8 @@ test "resume handoff policy requires requested durable non-pristine state" {
 /// Owns `session_id`; callers must release it with `deinit`.
 pub const ResumeHandoff = struct {
     session_id: []u8,
+    /// The session is in `v2`: resuming it needs `--sessions-v2`.
+    sessions_v2: bool = false,
 
     pub fn deinit(self: *ResumeHandoff, alloc: Allocator) void {
         alloc.free(self.session_id);
@@ -807,6 +811,19 @@ const SessionPickerLoad = struct {
         }
     };
 
+    /// Where a listing comes from: v1's store, or the v2 store (D26).
+    const Source = union(enum) {
+        v1: *const session_store.Store,
+        v2: struct { store: *session_adapter.Store, workspace_root: []const u8 },
+
+        fn workspaceRoot(source: Source) []const u8 {
+            return switch (source) {
+                .v1 => |store| store.workspace_root,
+                .v2 => |v2| v2.workspace_root,
+            };
+        }
+    };
+
     const Task = struct {
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -818,6 +835,8 @@ const SessionPickerLoad = struct {
         request: PageRequest,
         catalog: ?session_catalog_cache.ActionableSessionCatalog = null,
         cache_writer: ?session_catalog_cache.Writer = null,
+        /// Shared with the app, which joins this thread before freeing it.
+        v2_store: ?*session_adapter.Store = null,
         failure: ?anyerror = null,
 
         fn requestStop(self: *Task) void {
@@ -876,14 +895,14 @@ const SessionPickerLoad = struct {
 
     fn schedule(
         self: *SessionPickerLoad,
-        store: *const session_store.Store,
+        source: Source,
         request: PageRequest,
     ) !void {
         if (self.task != null) {
             self.replacePending(request);
             return;
         }
-        try self.start(store, request);
+        try self.start(source, request);
     }
 
     fn replacePending(self: *SessionPickerLoad, request: PageRequest) void {
@@ -947,28 +966,31 @@ const SessionPickerLoad = struct {
         return null;
     }
 
-    fn startPending(self: *SessionPickerLoad, store: *const session_store.Store) !?u64 {
+    fn startPending(self: *SessionPickerLoad, source: Source) !?u64 {
         const request = self.pending orelse return null;
         self.pending = null;
         const generation = request.generation;
-        try self.start(store, request);
+        try self.start(source, request);
         return generation;
     }
 
     fn start(
         self: *SessionPickerLoad,
-        store: *const session_store.Store,
+        source: Source,
         request: PageRequest,
     ) !void {
         std.debug.assert(self.task == null);
 
         const alloc = std.heap.c_allocator;
         var owned_request = request;
-        const home_dir = alloc.dupe(u8, store.home_dir) catch |err| {
+        const home_dir = alloc.dupe(u8, switch (source) {
+            .v1 => |store| store.home_dir,
+            .v2 => |v2| v2.store.home,
+        }) catch |err| {
             owned_request.deinit();
             return err;
         };
-        const workspace_root = alloc.dupe(u8, store.workspace_root) catch |err| {
+        const workspace_root = alloc.dupe(u8, source.workspaceRoot()) catch |err| {
             alloc.free(home_dir);
             owned_request.deinit();
             return err;
@@ -984,10 +1006,13 @@ const SessionPickerLoad = struct {
             .workspace_root = workspace_root,
             .request = owned_request,
         };
-        task.cache_writer = session_catalog_cache.Writer.init(store.*) catch |err| blk: {
-            debug_trace.logf("core", "session catalog cache writer unavailable err={s}", .{@errorName(err)});
-            break :blk null;
-        };
+        switch (source) {
+            .v1 => |store| task.cache_writer = session_catalog_cache.Writer.init(store.*) catch |err| blk: {
+                debug_trace.logf("core", "session catalog cache writer unavailable err={s}", .{@errorName(err)});
+                break :blk null;
+            },
+            .v2 => |v2| task.v2_store = v2.store,
+        }
         task.thread = std.Thread.spawn(.{}, threadMain, .{task}) catch |err| {
             if (task.cache_writer) |*writer| writer.deinit();
             task.request.deinit();
@@ -1009,6 +1034,21 @@ const SessionPickerLoad = struct {
     fn threadMain(task: *Task) void {
         defer task.done.store(true, .release);
         const started = io_mod.nanoTimestamp();
+        if (task.v2_store) |store| {
+            const summaries = session_adapter.listSummaries(
+                store,
+                std.heap.c_allocator,
+                task.request.active_id,
+                &task.cancel_requested,
+            ) catch |err| {
+                debug_trace.logf("core", "session picker catalog stopped backend=v2 err={s}", .{@errorName(err)});
+                task.failure = err;
+                return;
+            };
+            task.catalog = .{ .summaries = summaries };
+            debug_trace.logf("core", "session picker catalog loaded backend=v2 sessions={d} elapsed_us={d}", .{ summaries.items.len, @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us) });
+            return;
+        }
         var read_only = session_store.Store.initReadOnlyFromHome(
             std.heap.c_allocator,
             task.home_dir,
@@ -1262,12 +1302,17 @@ pub const Persistence = struct {
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
     pending_live_session_wait: ?LiveSessionWait = null,
     shutdown_failure: ?anyerror = null,
+    /// `--sessions-v2` for this process; with it (or FX_SESSIONS_V2=1) the
+    /// session lives in `v2` and `store` and `writable` stay null (D26).
+    sessions_v2: bool = false,
+    v2_store: ?session_adapter.Store = null,
+    v2: ?*session_adapter.Session = null,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 25) {
+            if (std.meta.fields(Persistence).len != 28) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1297,6 +1342,9 @@ pub const Persistence = struct {
         storage.pending_live_session_policy = null;
         storage.pending_live_session_wait = null;
         storage.shutdown_failure = null;
+        storage.sessions_v2 = false;
+        storage.v2_store = null;
+        storage.v2 = null;
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
@@ -1315,6 +1363,7 @@ pub const Persistence = struct {
         if (self.subagent_host) |host| host.deinit();
         if (self.writable) |*loaded| loaded.deinit(alloc);
         if (self.store) |*store| store.deinit(alloc);
+        if (self.v2) |v2| v2.close();
         if (self.workspace_preferences) |*preferences| preferences.deinit(alloc);
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.js_host_session) |*owner| owner.deinit(alloc);
@@ -1323,6 +1372,8 @@ pub const Persistence = struct {
         self.session_picker_load.deinit();
         self.session_picker_cache.deinit();
         self.title_generation.deinit();
+        // After the picker thread, which lists through it, has joined.
+        if (self.v2_store) |*store| store.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1388,14 +1439,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn imageSnapshotStorageDir(app: *App) ![]u8 {
-            const sessions_dir = if (app.session_persistence.store) |*store|
+            // A v2 session keeps its images with its side files.
+            const sessions_dir = if (app.session_persistence.v2) |v2|
+                std.fs.path.dirname(v2.filesPath())
+            else if (app.session_persistence.store) |*store|
                 store.sessions_dir
             else
                 null;
-            const session_id = if (app.session_persistence.writable) |*writable|
-                writable.active_id
-            else
-                null;
+            const session_id = activeSessionId(app);
             return session_store.imageSnapshotStorageDir(
                 app.alloc,
                 sessions_dir,
@@ -1459,6 +1510,14 @@ pub fn Runtime(comptime App: type) type {
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
+            // One backend per process (D26): with v2 on, v1's store stays closed.
+            if (session_adapter.enabled(app.session_persistence.sessions_v2)) {
+                app.session_persistence.v2_store = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
+                    if (required) return err;
+                    return;
+                };
+                return;
+            }
             var store = session_store.Store.init(
                 app.alloc,
                 app.workspace_root,
@@ -1473,6 +1532,14 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn enableSessionStores(app: *App) void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
+            if (app.session_persistence.v2) |v2| {
+                if (comptime @hasDecl(@TypeOf(app.session), "configureWebFetchArtifacts")) {
+                    app.session.configureWebFetchArtifacts(app.alloc, v2.filesPath());
+                }
+                // Subagents move to the parent log with their own PR (D22).
+                debug_trace.logf("subagent", "interactive subagent host unavailable session={s} reason=sessions_v2", .{v2.id()});
+                return;
+            }
             const loaded = if (app.session_persistence.writable) |*value| value else return;
             const capability = loaded.childCapability() catch |err| {
                 debug_trace.logf(
@@ -1520,6 +1587,7 @@ pub fn Runtime(comptime App: type) type {
                 try beginFreshJsHostSession(app);
             }
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
+            if (app.session_persistence.v2_store) |*v2_store| return beginFreshV2Session(app, v2_store);
             const store = app.session_persistence.store orelse return;
             const preferences = app.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
@@ -1539,6 +1607,32 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             app.session_persistence.remember_fresh_session = true;
+            app.session_persistence.degraded_warning_emitted = false;
+            app.total_input_tokens = 0;
+            app.total_output_tokens = 0;
+            app.total_web_search_requests = 0;
+        }
+
+        /// A v2 session starts in memory; its folder appears with the first
+        /// turn (D2), so a launch that never prompts leaves nothing behind.
+        fn beginFreshV2Session(app: *App, v2_store: *session_adapter.Store) !void {
+            const preferences = app.session_persistence.workspace_preferences orelse
+                return error.SessionPreferencesUnavailable;
+            try replacePreferences(
+                app.alloc,
+                &app.session_persistence.session_preferences,
+                preferences,
+            );
+            var permission_state = try app.session.snapshotPermissionState(app.alloc);
+            defer permission_state.deinit(app.alloc);
+            app.session_persistence.v2 = session_adapter.Session.create(app.alloc, v2_store, app.workspace_root, .app, .{
+                .preferences = preferences,
+                .language = app.session.languageSnapshot(),
+                .permission_state = permission_state,
+            }) catch |err| {
+                try warnNonDurable(app, "session creation failed", err);
+                return;
+            };
             app.session_persistence.degraded_warning_emitted = false;
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
@@ -1920,6 +2014,20 @@ pub fn Runtime(comptime App: type) type {
             app.requested_resume = null;
             defer target.deinit(app.alloc);
 
+            if (app.session_persistence.v2_store) |*v2_store| {
+                const v2_target: session_adapter.Target = switch (target) {
+                    .pick => return openSessionPicker(app),
+                    .last => .last,
+                    // The manager records the session each host last opened.
+                    .remembered => .last_opened,
+                    .id => |session_id| .{ .id = session_id },
+                };
+                const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, v2_target, app.workspace_root, .app);
+                try installResumedV2Session(app, v2, notice);
+                errdefer closeWritableSession(app);
+                try app.commitStartupResumeReplayAnchor();
+                return;
+            }
             var remembered: ?[]u8 = null;
             defer if (remembered) |id| app.alloc.free(id);
             const resume_target: session_store.ResumeTarget = switch (target) {
@@ -2105,6 +2213,17 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
+            if (app.session_persistence.v2_store) |*v2_store| {
+                const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app);
+                var v2_owned = true;
+                errdefer if (v2_owned) v2.close();
+                try app.prepareLiveSessionResume();
+                v2_owned = false;
+                try installResumedV2Session(app, v2, .session);
+                startResumedSessionReconciliation(app);
+                try app.finishLiveSessionResume();
+                return true;
+            }
             const log_options = session_log.Options{
                 .session_lock_deadline_ms = 0,
             };
@@ -2166,6 +2285,27 @@ pub fn Runtime(comptime App: type) type {
             const active = &app.session_persistence.writable.?;
             try hydrateResumedSession(app, active.state, &display, notice);
             active.releaseHydrationHistory(app.alloc);
+            enableSessionStores(app);
+        }
+
+        /// Makes `v2` the open session, taking ownership, and restores the app
+        /// from it through v1's state, as `installResumedSession` does.
+        fn installResumedV2Session(app: *App, v2: *session_adapter.Session, notice: ResumeNotice) !void {
+            var v2_owned = true;
+            errdefer if (v2_owned) v2.close();
+            var resumed = try v2.durableState(app.alloc, app.workspace_root);
+            defer resumed.deinit(app.alloc);
+            var display: session_display_metadata.DisplayMetadata = if (resumed.title) |title|
+                .{ .present = true, .title = try app.alloc.dupe(u8, title) }
+            else
+                try session_display_metadata.deriveFromHistory(app.alloc, resumed.state.history);
+            defer display.deinit(app.alloc);
+
+            closeWritableSession(app);
+            app.session_persistence.v2 = v2;
+            v2_owned = false;
+            errdefer closeWritableSession(app);
+            try hydrateResumedSession(app, resumed.state, &display, notice);
             enableSessionStores(app);
         }
 
@@ -2355,6 +2495,21 @@ pub fn Runtime(comptime App: type) type {
             return session_log.recoveryWasAsked(&loaded.log.dir);
         }
 
+        /// The picker lists from the backend this process runs on.
+        fn pickerSource(app: *App) ?SessionPickerLoad.Source {
+            if (app.session_persistence.v2_store) |*store| {
+                return .{ .v2 = .{ .store = store, .workspace_root = app.workspace_root } };
+            }
+            if (app.session_persistence.store) |*store| return .{ .v1 = store };
+            return null;
+        }
+
+        /// The open session, which the picker leaves out.
+        fn pickerActiveId(app: *App) ?[]const u8 {
+            if (app.session_persistence.v2) |v2| return v2.id();
+            return if (app.session_persistence.writable) |*loaded| loaded.active_id else null;
+        }
+
         pub fn openSessionPicker(app: *App) !void {
             return openSessionPickerWithScope(app, .current_workspace);
         }
@@ -2380,7 +2535,7 @@ pub fn Runtime(comptime App: type) type {
                 loader.allocateGeneration(),
                 active_id,
             ) catch return;
-            loader.schedule(store, request) catch |err| {
+            loader.schedule(.{ .v1 = store }, request) catch |err| {
                 debug_trace.logf(
                     "core",
                     "session catalog preload unavailable err={s}",
@@ -2410,18 +2565,13 @@ pub fn Runtime(comptime App: type) type {
             picker.load_state = .loading;
             picker.scope = scope;
             picker.setQuery(app.input_runtime.edit_state.input.items);
-            const store = if (app.session_persistence.store) |*value|
-                value
-            else {
+            const source = pickerSource(app) orelse {
                 picker.load_state = .failed;
                 try writeSessionPickerError(app, error.SessionStoreUnavailable);
                 app.shell.render_requests.request(.footer);
                 return;
             };
-            const active_id = if (app.session_persistence.writable) |*loaded|
-                loaded.active_id
-            else
-                null;
+            const active_id = pickerActiveId(app);
             const limit = if (comptime @hasField(App, "shell"))
                 resumePageLimitForRows(app.shell.layout.rows)
             else
@@ -2430,8 +2580,9 @@ pub fn Runtime(comptime App: type) type {
             const matching = loader.matchingInitialGeneration(active_id);
             if (matching != previous_generation) loader.cancelGeneration(previous_generation);
             const cache = &app.session_persistence.session_picker_cache;
-            if (!cache.matches(active_id)) {
-                installStaleDiskCatalog(store, cache, active_id) catch |err| {
+            // v2 keeps no catalog file: its listing is the index itself.
+            if (source == .v1 and !cache.matches(active_id)) {
+                installStaleDiskCatalog(source.v1, cache, active_id) catch |err| {
                     debug_trace.logf(
                         "core",
                         "session picker disk catalog unavailable err={s}",
@@ -2445,7 +2596,7 @@ pub fn Runtime(comptime App: type) type {
                     picker,
                     app.alloc,
                     cache,
-                    store.workspace_root,
+                    source.workspaceRoot(),
                     null,
                     limit,
                     false,
@@ -2470,7 +2621,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             picker.generation = request.generation;
-            loader.schedule(store, request) catch |err| {
+            loader.schedule(source, request) catch |err| {
                 if (!cache_visible) picker.load_state = .failed;
                 try writeSessionPickerError(app, err);
                 return;
@@ -2494,8 +2645,8 @@ pub fn Runtime(comptime App: type) type {
             var task_owned = true;
             defer if (task_owned) task.deinit();
 
-            const active_id = if (app.session_persistence.writable) |*loaded| loaded.active_id else null;
-            const valid = app.session_persistence.store != null and
+            const active_id = pickerActiveId(app);
+            const valid = pickerSource(app) != null and
                 !task.abandoned and optionalStringEql(task.request.active_id, active_id);
             var cache_installed = false;
             if (valid and task.failure == null) {
@@ -2532,7 +2683,7 @@ pub fn Runtime(comptime App: type) type {
                     picker,
                     app.alloc,
                     cache,
-                    app.session_persistence.store.?.workspace_root,
+                    pickerSource(app).?.workspaceRoot(),
                     null,
                     limit,
                     false,
@@ -2545,12 +2696,9 @@ pub fn Runtime(comptime App: type) type {
             task.deinit();
             task_owned = false;
 
-            const store = if (app.session_persistence.store) |*value|
-                value
-            else
-                return;
+            const source = pickerSource(app) orelse return;
             const pending_generation = loader.pendingGeneration();
-            _ = loader.startPending(store) catch |err| {
+            _ = loader.startPending(source) catch |err| {
                 if (pending_generation) |generation| {
                     if (picker.active and picker.generation == generation) {
                         if (picker.loading_more) {
@@ -2594,10 +2742,8 @@ pub fn Runtime(comptime App: type) type {
             const picker = &app.session_persistence.session_picker;
             const continuation = picker.continuation orelse
                 return error.SessionStoreUnavailable;
-            const active_id = if (app.session_persistence.writable) |*loaded|
-                loaded.active_id
-            else
-                null;
+            const source = pickerSource(app) orelse return error.SessionStoreUnavailable;
+            const active_id = pickerActiveId(app);
             const cache = &app.session_persistence.session_picker_cache;
             if (!cache.matches(active_id)) return error.SessionStoreUnavailable;
             const limit = if (comptime @hasField(App, "shell"))
@@ -2610,7 +2756,7 @@ pub fn Runtime(comptime App: type) type {
                 picker,
                 app.alloc,
                 cache,
-                app.session_persistence.store.?.workspace_root,
+                source.workspaceRoot(),
                 continuation.view(),
                 limit,
                 true,
@@ -2653,7 +2799,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn cancelSessionPickerToComposer(app: *App) void {
             cancelSessionPicker(app);
             if (comptime !@hasField(App, "session")) return;
-            if (app.session_persistence.writable != null) return;
+            if (app.session_persistence.writable != null or app.session_persistence.v2 != null) return;
             beginFreshPersistedSession(app) catch |err| {
                 debug_trace.logf(
                     "session",
@@ -2741,6 +2887,7 @@ pub fn Runtime(comptime App: type) type {
             }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.v2) |v2| return v2.persistUsage(snapshot);
             const store = if (app.session_persistence.store) |value|
                 value
             else
@@ -3130,6 +3277,19 @@ pub fn Runtime(comptime App: type) type {
             var remember_failure: ?RememberFailure = null;
             defer if (remember_failure) |failure| reportRememberFailure(app, failure, false);
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            if (app.session_persistence.v2) |v2| {
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (try commitV2HistoryTurn(app, v2, &prepared, mode)) |outcome| return outcome;
+                if (comptime @hasDecl(@TypeOf(app.session), "commitPreparedHistoryEntry")) {
+                    app.session.commitPreparedHistoryEntry(app.alloc, prepared);
+                    prepared_owned = false;
+                } else {
+                    try app.session.appendHistoryEntry(app.alloc, prepared);
+                }
+                if (snapshot_file_ownership) |ownership| ownership.transfer();
+                ensureCachedSessionTitle(app) catch {};
+                return .committed;
+            }
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else {
@@ -3222,6 +3382,51 @@ pub fn Runtime(comptime App: type) type {
             return .committed;
         }
 
+        /// Saves a finished turn to v2 with v1's failure modes. Null means the
+        /// caller commits the turn in memory: it was saved, or its failure
+        /// was recorded and shown.
+        fn commitV2HistoryTurn(
+            app: *App,
+            v2: *session_adapter.Session,
+            prepared: *types.HistoryTurn,
+            mode: AppendHistoryMode,
+        ) !?HistoryAppendOutcome {
+            const failure: anyerror = saved: {
+                v2.prepareTurn(prepared) catch |err| break :saved err;
+                v2.commitTurn(prepared.*, app.session.languageSnapshot()) catch |err| break :saved err;
+                return null;
+            };
+            switch (mode) {
+                .strict => return failure,
+                .visual_epoch => {
+                    debug_trace.logf("session", "visual epoch history not committed err={s}", .{@errorName(failure)});
+                    return .uncommitted;
+                },
+                .finished_prompt => {
+                    recordShutdownFailure(app, failure);
+                    if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        const body = try std.fmt.allocPrint(
+                            app.alloc,
+                            "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
+                            .{@errorName(failure)},
+                        );
+                        defer app.alloc.free(body);
+                        app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
+                    }
+                    return null;
+                },
+            }
+        }
+
+        /// `AgentRuntimeDeps.append_turn_piece` on v2: the pieces finished so
+        /// far reach the log before the next request (D12).
+        pub fn appendTurnPiece(app: *App, progress: agent_runtime.TurnProgress) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return;
+            try v2.appendProgress(progress.user, progress.execution);
+        }
+
         pub fn commitRuntimePreferences(
             app: *App,
             patch: SessionPreferencePatch,
@@ -3266,6 +3471,15 @@ pub fn Runtime(comptime App: type) type {
 
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.v2) |v2| {
+                if (result.session_error != null) return result;
+                const preferences = app.session_persistence.session_preferences orelse return result;
+                v2.setPreferences(preferences) catch |err| {
+                    result.session_error = err;
+                    warnDegraded(app, err) catch {};
+                };
+                return result;
+            }
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
@@ -3291,6 +3505,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn activeSessionId(app: *App) ?[]const u8 {
+            if (app.session_persistence.v2) |v2| return v2.id();
             if (app.session_persistence.writable) |*loaded| return loaded.active_id;
             if (app.session_persistence.js_host_session) |*owner| return owner.state.id;
             return null;
@@ -3464,7 +3679,20 @@ pub fn Runtime(comptime App: type) type {
             {
                 app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
                 defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-                if (app.session_persistence.writable) |*loaded| {
+                if (app.session_persistence.v2) |v2| {
+                    installed = v2.installGeneratedTitle(app.session.agent.history.items, title) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=title_generation_apply result=failed session={s} err={s}",
+                            .{ task.session_id, @errorName(err) },
+                        );
+                        app.session_persistence.title_generation.recordDropped(.install_failed, @errorName(err));
+                        return false;
+                    };
+                    if (!installed) {
+                        app.session_persistence.title_generation.recordDropped(.user_title_present, "");
+                    }
+                } else if (app.session_persistence.writable) |*loaded| {
                     installed = session_title_generation.installGeneratedTitle(
                         app.alloc,
                         loaded,
@@ -3522,12 +3750,17 @@ pub fn Runtime(comptime App: type) type {
         pub fn renameActiveSession(app: *App, raw: []const u8) !void {
             const title = try validateSessionTitle(raw);
             if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
-            if (app.session_persistence.writable == null) return error.NoActiveSession;
+            if (app.session_persistence.writable == null and app.session_persistence.v2 == null) return error.NoActiveSession;
 
             try setCachedSessionTitle(app, title);
 
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.v2) |v2| {
+                try v2.rename(title);
+                invalidateSessionPickerCaches(app);
+                return;
+            }
 
             const loaded = &app.session_persistence.writable.?;
             if (!try loaded.renameConversation(app.alloc, title)) {
@@ -3540,6 +3773,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             alloc: Allocator,
         ) !?[]u8 {
+            if (app.session_persistence.v2) |v2| return try v2.folderPath(alloc);
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
@@ -3553,11 +3787,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn childCapability(app: *App) ?*session_child_store.SessionChildCapability {
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return null;
-            return loaded.childCapability() catch null;
+            if (app.session_persistence.writable == null and app.session_persistence.v2 == null) return null;
+            return activeChildCapability(app) catch null;
+        }
+
+        /// The open session's side-file capability, from either backend.
+        fn activeChildCapability(app: *App) !*session_child_store.SessionChildCapability {
+            if (app.session_persistence.v2) |v2| return v2.childCapability();
+            const loaded = if (app.session_persistence.writable) |*value| value else return error.SessionPersistenceUnavailable;
+            return loaded.childCapability();
         }
 
         pub fn subagentHost(app: *App) ?*subagent_tool_host.Runtime {
@@ -3616,6 +3854,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn prepareResumeHandoff(app: *App) !void {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.v2) |v2| return settleV2Usage(app, v2);
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
@@ -4831,11 +5070,8 @@ pub fn Runtime(comptime App: type) type {
                     return false;
                 },
             };
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return false;
-            const capability = loaded.childCapability() catch |err| {
+            if (app.session_persistence.writable == null and app.session_persistence.v2 == null) return false;
+            const capability = activeChildCapability(app) catch |err| {
                 debug_trace.logf(
                     "session",
                     "resume command replay capability unavailable handle_bytes={d} err={s}",
@@ -5055,11 +5291,8 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
         ) !bool {
             const handle = result.output_handle orelse return false;
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return false;
-            const capability = loaded.childCapability() catch |err| {
+            if (app.session_persistence.writable == null and app.session_persistence.v2 == null) return false;
+            const capability = activeChildCapability(app) catch |err| {
                 debug_trace.logf(
                     "session",
                     "resume command replay could not open result handle={s} err={s}",
@@ -5265,6 +5498,7 @@ pub fn Runtime(comptime App: type) type {
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             app.session_persistence.remember_fresh_session = false;
             discardAnyPendingCancelledCommand(app, "writable_session_close");
+            if (app.session_persistence.v2) |v2| return closeV2Session(app, v2, handoff_intent);
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
@@ -5335,6 +5569,45 @@ pub fn Runtime(comptime App: type) type {
             loaded.deinit(app.alloc);
             app.session_persistence.writable = null;
             return handoff;
+        }
+
+        /// Settles usage and closes; the manager ends an open turn as
+        /// `closed`, and a session with no turn leaves nothing on disk (D2).
+        fn closeV2Session(app: *App, v2: *session_adapter.Session, handoff_intent: ResumeHandoffIntent) ?ResumeHandoff {
+            var settled = true;
+            settleV2Usage(app, v2) catch |err| {
+                settled = false;
+                recordShutdownFailure(app, err);
+                debug_trace.logf("session", "final persistence settlement failed session={s} err={s}", .{ v2.id(), @errorName(err) });
+            };
+            const create_handoff = settled and shouldCreateResumeHandoff(.{
+                .intent = handoff_intent,
+                .has_writable_session = true,
+                .is_pristine = !v2.saved(),
+            });
+            const handoff: ?ResumeHandoff = if (create_handoff) blk: {
+                const session_id = app.alloc.dupe(u8, v2.id()) catch |err| {
+                    debug_trace.logf("session", "resume handoff unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
+                    break :blk null;
+                };
+                break :blk .{ .session_id = session_id, .sessions_v2 = true };
+            } else null;
+            if (comptime @hasDecl(@TypeOf(app.session), "clearWebFetchArtifacts")) {
+                app.session.clearWebFetchArtifacts();
+            }
+            disableSubagentHost(app);
+            v2.close();
+            app.session_persistence.v2 = null;
+            return handoff;
+        }
+
+        fn settleV2Usage(app: *App, v2: *session_adapter.Session) !void {
+            if (comptime !@hasField(@TypeOf(app.session), "usage")) return;
+            if (!app.session.usage.isDirty()) return;
+            var usage = try app.session.usage.snapshot(app.alloc);
+            defer usage.deinit(app.alloc);
+            try v2.persistUsage(usage);
+            app.session.usage.markClean(usage);
         }
 
         /// A fresh interactive session that never received durable work has
@@ -5504,7 +5777,9 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "session_persistence")) {
                 app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
                 defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-                if (app.session_persistence.writable) |*loaded| {
+                if (app.session_persistence.v2) |v2| {
+                    try v2.commitCompaction(summary, active_prefix != null, retained_from);
+                } else if (app.session_persistence.writable) |*loaded| {
                     _ = try loaded.commitContextCompaction(
                         app.alloc,
                         summary,
@@ -5539,6 +5814,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.v2) |v2| return v2.setPermissions(permission_state);
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else

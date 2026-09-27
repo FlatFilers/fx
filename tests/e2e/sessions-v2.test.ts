@@ -22,6 +22,8 @@ import {
   fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
 } from "./tmux-helpers";
 
 // Sessions v2 behind FX_SESSIONS_V2 and --sessions-v2: every `fx ask` entry
@@ -595,3 +597,189 @@ test("a full disk fails the turn cleanly and the session resumes after", async (
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 3);
+
+// ---------------------------------------------------------------------------
+// The interactive app
+
+/// Answers the newest prompt in the request, in the order given: every
+/// request carries the earlier prompts, and a fresh session also asks for a
+/// title. A null answer holds that request open and calls `held`.
+function replyToLatest(pairs: [string, string | null][], held?: () => void) {
+  return startDynamicFakeGateway(async (body) => {
+    for (let index = pairs.length - 1; index >= 0; index -= 1) {
+      const [prompt, answer] = pairs[index]!;
+      if (!body.includes(prompt)) continue;
+      if (answer !== null) return fakeGatewayFinalText(answer);
+      held?.();
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  });
+}
+
+async function startApp(fixture: Fixture, gateway: any, args: string[], waitForComposer = true) {
+  const stderrPath = join(fixture.root, "stderr.log");
+  writeFileSync(stderrPath, "");
+  const session = await TmuxSession.create({
+    cmd: `${FX_BIN} --sessions-v2 ${args.join(" ")}`.trim(),
+    cwd: fixture.workspace,
+    env: { ...env(fixture, gateway, false), NO_COLOR: "1" },
+    stderrPath,
+  });
+  if (waitForComposer) await session.waitForComposer(TIMEOUT);
+  return { session, stderrPath };
+}
+
+async function quitApp(app: { session: TmuxSession; stderrPath: string }) {
+  await app.session.sendText("/quit");
+  expect(await app.session.waitForSessionEnd()).toBe(true);
+  await app.session.kill();
+  expect(readFileSync(app.stderrPath, "utf8")).toBe("");
+}
+
+function savedSessions(fixture: Fixture): string[] {
+  return readdirSync(v2Root(fixture)).filter((name) => !name.startsWith(".") && !name.startsWith("index"));
+}
+
+function onlySession(fixture: Fixture): string {
+  const ids = savedSessions(fixture);
+  expect(ids.length).toBe(1);
+  return ids[0]!;
+}
+
+async function scrollbackContains(session: TmuxSession, marker: string) {
+  const deadline = Date.now() + TIMEOUT;
+  let latest = "";
+  while (Date.now() < deadline) {
+    latest = await session.captureFullScrollback();
+    if (latest.includes(marker)) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(`scrollback never showed ${marker}`);
+}
+
+test.skipIf(!tmuxAvailable())("the interactive app saves to v2 and resumes with -c, --resume last and the id", async () => {
+  const fixture = createFixture("fx-v2-app-");
+  const gateway = replyToLatest([
+    ["First interactive question.", "APP_V2_FIRST"],
+    ["Continue with -c.", "APP_V2_CONTINUE"],
+    ["Continue with --resume last.", "APP_V2_LAST"],
+    ["Continue with the id.", "APP_V2_BY_ID"],
+  ]);
+  try {
+    const first = await startApp(fixture, gateway, []);
+    await first.session.sendText("First interactive question.");
+    await first.session.waitForText("APP_V2_FIRST", TIMEOUT);
+    await quitApp(first);
+    const id = onlySession(fixture);
+    expectNoV1Sessions(fixture);
+
+    const runs: [string[], string, string, string][] = [
+      [["-c"], "APP_V2_FIRST", "Continue with -c.", "APP_V2_CONTINUE"],
+      [["--resume", "last"], "APP_V2_CONTINUE", "Continue with --resume last.", "APP_V2_LAST"],
+      [["--resume", id], "APP_V2_LAST", "Continue with the id.", "APP_V2_BY_ID"],
+    ];
+    for (const [args, restored, prompt, answer] of runs) {
+      const app = await startApp(fixture, gateway, args);
+      expect(await scrollbackContains(app.session, restored)).toContain(restored);
+      await app.session.sendText(prompt);
+      await app.session.waitForText(answer, TIMEOUT);
+      await quitApp(app);
+      expect(onlySession(fixture)).toBe(id);
+    }
+    expect(gateway.requests.at(-1)!.body).toContain("First interactive question.");
+    const kinds = logLines(fixture, id).map((line) => line.kind);
+    expect(kinds.filter((kind) => kind === "turn_committed").length).toBe(4);
+    expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+test.skipIf(!tmuxAvailable())("a killed interactive turn comes back interrupted and -c continues it", async () => {
+  const fixture = createFixture("fx-v2-app-kill-");
+  let held: () => void = () => {};
+  const reachedHold = new Promise<void>((resolve) => (held = resolve));
+  const gateway = replyToLatest(
+    [
+      ["Before the interactive kill.", "APP_BEFORE_KILL"],
+      ["This interactive turn is killed.", null],
+      ["After the interactive kill.", "APP_AFTER_KILL"],
+    ],
+    () => held(),
+  );
+  try {
+    const app = await startApp(fixture, gateway, []);
+    await app.session.sendText("Before the interactive kill.");
+    await app.session.waitForText("APP_BEFORE_KILL", TIMEOUT);
+    await app.session.sendText("This interactive turn is killed.");
+    await reachedHold;
+    Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
+    await app.session.kill();
+    const id = onlySession(fixture);
+
+    const resumed = await startApp(fixture, gateway, ["-c"]);
+    expect(await scrollbackContains(resumed.session, "APP_BEFORE_KILL")).toContain("APP_BEFORE_KILL");
+    await resumed.session.sendText("After the interactive kill.");
+    await resumed.session.waitForText("APP_AFTER_KILL", TIMEOUT);
+    await quitApp(resumed);
+    expect(onlySession(fixture)).toBe(id);
+    // The killed prompt was saved before its request, and the model sees it.
+    expect(gateway.requests.at(-1)!.body).toContain("This interactive turn is killed.");
+    const lines = logLines(fixture, id);
+    expect(lines.filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+    expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("the picker lists v2 sessions, /rename sticks, and /new starts another", async () => {
+  const fixture = createFixture("fx-v2-app-picker-");
+  const gateway = replyToLatest([
+    ["Picker session one.", "PICK_ONE"],
+    ["Picker session two.", "PICK_TWO"],
+    ["Back in session one.", "PICK_BACK"],
+  ]);
+  try {
+    const app = await startApp(fixture, gateway, []);
+    await app.session.sendText("Picker session one.");
+    await app.session.waitForText("PICK_ONE", TIMEOUT);
+    await app.session.sendText("/rename Renamed picker session");
+    await app.session.waitForText('renamed to "Renamed picker session"', TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("/new");
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Picker session two.");
+    await app.session.waitForText("PICK_TWO", TIMEOUT);
+    await quitApp(app);
+    const ids = savedSessions(fixture);
+    expect(ids.length).toBe(2);
+
+    const picker = await startApp(fixture, gateway, ["-r"], false);
+    await picker.session.waitForPane((pane) => pane.includes("Renamed picker session") && pane.includes("enter resume"), TIMEOUT);
+    await picker.session.sendLiteralText("Renamed");
+    await picker.session.waitForPane((pane) => pane.includes("Renamed picker session"), TIMEOUT);
+    await picker.session.sendKeys("Enter");
+    await picker.session.waitForComposer(TIMEOUT);
+    expect(await scrollbackContains(picker.session, "PICK_ONE")).toContain("PICK_ONE");
+    await picker.session.sendText("Back in session one.");
+    await picker.session.waitForText("PICK_BACK", TIMEOUT);
+    await quitApp(picker);
+
+    // The resumed session is the renamed one: its log holds both of its turns.
+    const renamed = ids.find((id) => readFileSync(join(v2Root(fixture), id, "log.jsonl"), "utf8").includes("Renamed picker session"))!;
+    const log = readFileSync(join(v2Root(fixture), renamed, "log.jsonl"), "utf8");
+    expect(log).toContain("Back in session one.");
+    expect(log).not.toContain("Picker session two.");
+    for (const id of ids) expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
