@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const trace = @import("trace.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -150,7 +151,9 @@ pub fn parse(arena: Allocator, summary: []const u8) Allocator.Error!?Payload {
     }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => {
-            trace.log(true, "checkpoint payload unreadable bytes={d} err={s}; using its raw text", .{ summary.len, @errorName(err) });
+            // Every prompt parses the checkpoint, so this stays out of the
+            // bounded /trace ring.
+            debug_trace.logf("context_compaction", "checkpoint payload unreadable bytes={d} err={s}; using its raw text", .{ summary.len, @errorName(err) });
             return null;
         },
     };

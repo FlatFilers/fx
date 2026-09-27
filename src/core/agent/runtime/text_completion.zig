@@ -160,8 +160,9 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
 }
 
 /// A conversation's connection to its model, offered to fx-compactor. Its own
-/// options and output limit apply to its own model; another model gets only
-/// the reasoning asked for and its own output limit.
+/// options and output limit apply to its own model; another model keeps the
+/// provider routing and prompt caching but gets only the reasoning asked for
+/// and its own output limit.
 pub const CompactorCaller = struct {
     stream_provider: agent_stream_provider.Provider,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,

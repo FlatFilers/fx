@@ -65,7 +65,7 @@ Key rules:
 
 * `src/core/` owns contracts, runtimes, config, sessions, permissions, MCP, skills.
 
-* `src/core/compactor/` owns context compaction. Outside code imports only its front door, `compactor.zig`, and the compactor imports only shared basics; its caller hands in the model caller and record store. `scripts/check-compactor-boundary.sh` enforces this in CI.
+* `src/core/compactor/` owns context compaction. Outside code imports only its front door, `compactor.zig`, and the compactor imports only shared basics, model configuration, and the conversation helpers in `src/core/session/session.zig`; its caller hands in the model caller and record store. `scripts/check-compactor-boundary.sh` enforces this in CI.
 
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 

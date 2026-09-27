@@ -139,7 +139,9 @@ const open_heading = "Turn in progress";
 pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compacted_records.Store) Error!Result {
     if (request.turns.len == 0) return error.NothingToCompact;
     // Turns too large for one request are summarized oldest first, and each
-    // part folds into the earlier summary of the next.
+    // part folds into the earlier summary of the next. The turns that keep
+    // their exact user messages all stay in the last part, so none fold.
+    const exact_start = exactUsers(request).start;
     var folded: ?Result = null;
     defer if (folded) |*part| part.deinit();
     var earlier = request.earlier;
@@ -148,16 +150,56 @@ pub fn compact(alloc: Allocator, request: Request, model: Model, store: ?compact
         const end = partEnd(request, earlier, start);
         var part = request;
         part.earlier = earlier;
-        part.turns = request.turns[start..end];
-        if (end == request.turns.len) return compactPart(alloc, part, model, store);
+        part.turns = request.turns[start..];
+        if (end == request.turns.len or start >= exact_start) return compactPart(alloc, part, model, store);
+        const part_end = @min(end, exact_start);
+        part.turns = request.turns[start..part_end];
         part.last_turn_open = false;
         part.exact_tokens = 0;
         const next = try compactPart(alloc, part, model, store);
         if (folded) |*previous| previous.deinit();
         folded = next;
         earlier = next.compacted;
-        start = end;
+        start = part_end;
     }
+}
+
+/// The newest complete turns whose user messages stay exact start at
+/// `start`: as many as fit `exact_tokens`, newest first, using `tokens`.
+const ExactUsers = struct { start: usize, tokens: usize };
+
+fn exactUsers(request: Request) ExactUsers {
+    var exact: ExactUsers = .{ .start = request.turns.len - @intFromBool(request.last_turn_open), .tokens = 0 };
+    while (exact.start > 0) {
+        const index = exact.start - 1;
+        const continued = if (index == 0) (request.earlier orelse Compacted{}).open else null;
+        const cost = userTokens(request.turns[index], continued);
+        if (exact.tokens +| cost > request.exact_tokens) break;
+        exact.tokens += cost;
+        exact.start = index;
+    }
+    return exact;
+}
+
+/// Estimated tokens of a complete turn's exact user messages, as `tokens`
+/// counts them: its first message, the ones added before the previous
+/// compaction, then the ones added since.
+fn userTokens(turn: Turn, continued: ?checkpoint.OpenTurn) usize {
+    var estimator: token_estimate.StreamingEstimator = .{};
+    estimator.consume(turn.user);
+    estimator.consume(" ");
+    if (continued) |earlier| for (earlier.users) |user| {
+        estimator.consume(user);
+        estimator.consume(" ");
+    };
+    for (turn.items) |item| switch (item) {
+        .user => |user| {
+            estimator.consume(user);
+            estimator.consume(" ");
+        },
+        else => {},
+    };
+    return std.math.cast(usize, estimator.estimate()) orelse std.math.maxInt(usize);
 }
 
 /// Estimated tokens of a summary request besides the turns: the
@@ -263,14 +305,9 @@ fn compactPart(alloc: Allocator, request: Request, model: Model, store: ?compact
     // Within the budget, the newest complete turns keep their exact user
     // messages first, then as many final replies as still fit, newest first.
     // Older turns fold into the earlier summary.
-    var chunk_start = complete_end;
-    var used: usize = 0;
-    while (chunk_start > 0) {
-        const cost = tokens(turns[chunk_start - 1].users);
-        if (used +| cost > request.exact_tokens) break;
-        used += cost;
-        chunk_start -= 1;
-    }
+    const exact = exactUsers(request);
+    const chunk_start = exact.start;
+    var used = exact.tokens;
     var newest = complete_end;
     while (newest > chunk_start) {
         newest -= 1;
@@ -297,7 +334,7 @@ fn compactPart(alloc: Allocator, request: Request, model: Model, store: ?compact
         const written = try model.summarize_fn(model.context, out, .{
             .model = request.model,
             .system = system_prompt,
-            .user = try fittingTranscript(scratch, plan, request.max_prompt_tokens),
+            .user = try fittingTranscript(alloc, scratch, plan, request.max_prompt_tokens),
         });
         const summary = std.mem.trim(u8, written, " \t\r\n");
         if (summary.len == 0) return error.EmptySummary;
@@ -612,21 +649,51 @@ fn savedOutputNote(alloc: Allocator, handle: []const u8) Allocator.Error![]const
     return std.fmt.allocPrint(alloc, "The whole result is saved as {s}; open it with read_tool_result.", .{handle});
 }
 
-/// Texts are clipped no shorter than this.
-const min_clip_bytes = 1024;
+/// Texts are clipped no shorter than this, or else only their note stays.
+const min_clip_bytes = 256;
 
-/// The request for `plan` within `max_tokens` when it can be: while it is
-/// too large, the longest texts of the turns are clipped shorter. The saved
-/// turns and tool calls keep them whole.
-fn fittingTranscript(alloc: Allocator, plan: Plan, max_tokens: usize) Allocator.Error![]u8 {
+/// The request for `plan` within `max_tokens`, allocated with `out`. While
+/// it is too large, the longest texts of the turns are clipped shorter, down
+/// to only their notes; the saved turns and tool calls keep them whole. Only
+/// then are the texts of the previous compaction clipped too. Each attempt
+/// is freed with `alloc`.
+fn fittingTranscript(alloc: Allocator, out: Allocator, plan: Plan, max_tokens: usize) Allocator.Error![]u8 {
     var clip: usize = std.math.maxInt(usize);
+    var earlier_clip: usize = std.math.maxInt(usize);
     while (true) {
-        const text = try renderTranscript(alloc, plan, clip);
-        if (tokens(&.{ system_prompt, text }) <= max_tokens) return text;
-        const next = @min(clip, longestText(plan)) / 2;
-        if (next < min_clip_bytes) return text;
-        clip = next;
+        var attempt: std.heap.ArenaAllocator = .init(alloc);
+        defer attempt.deinit();
+        const text = try renderTranscript(attempt.allocator(), plan, clip, earlier_clip);
+        const used = tokens(&.{ system_prompt, text });
+        if (used <= max_tokens or earlier_clip == 0) {
+            if (used > max_tokens) trace.log(true, "summary request over its limit after clipping tokens={d} limit={d}", .{ used, max_tokens });
+            return out.dupe(u8, text);
+        }
+        if (clip > 0) {
+            clip = shorterClip(clip, longestText(plan));
+        } else {
+            earlier_clip = shorterClip(earlier_clip, longestEarlierText(plan));
+        }
     }
+}
+
+/// Half the longest text still whole, or zero once that is too short.
+fn shorterClip(clip: usize, longest: usize) usize {
+    const next = @min(clip, longest) / 2;
+    return if (next < min_clip_bytes) 0 else next;
+}
+
+fn longestEarlierText(plan: Plan) usize {
+    var longest = plan.earlier.earlier.len;
+    for (plan.earlier.turns) |turn| {
+        for (turn.users) |user| longest = @max(longest, user.len);
+        longest = @max(longest, @max(turn.work.len, turn.final.len));
+    }
+    if (plan.turns.len > 0) if (plan.turns[0].continued) |part| {
+        for (part.users) |user| longest = @max(longest, user.len);
+        longest = @max(longest, part.work.len);
+    };
+    return longest;
 }
 
 fn longestText(plan: Plan) usize {
@@ -644,7 +711,7 @@ fn longestText(plan: Plan) usize {
 
 /// `text` whole when it fits `limit` bytes, otherwise its start and its end,
 /// where conclusions and errors usually are, around a note saying where the
-/// whole text is.
+/// whole text is. Never longer than `text`.
 fn clipped(alloc: Allocator, text: []const u8, limit: usize, saved_in: []const u8) Allocator.Error![]const u8 {
     if (text.len <= limit) return text;
     const head = text_utils.utf8BackwardBoundary(text, limit / 2);
@@ -653,29 +720,32 @@ fn clipped(alloc: Allocator, text: []const u8, limit: usize, saved_in: []const u
         try std.fmt.allocPrint(alloc, "[{d} bytes clipped for this summary]", .{tail - head})
     else
         try std.fmt.allocPrint(alloc, "[{d} bytes clipped for this summary; the whole text is saved in {s}]", .{ tail - head, saved_in });
+    if (note.len + 2 >= tail - head) return text;
     return std.mem.concat(alloc, u8, &.{ text[0..head], "\n", note, "\n", text[tail..] });
 }
 
 /// Everything the model reads, followed by the one request. Texts of the
-/// turns longer than `clip` bytes are clipped.
-fn renderTranscript(alloc: Allocator, plan: Plan, clip: usize) Allocator.Error![]u8 {
+/// turns longer than `clip` bytes are clipped, and texts of the previous
+/// compaction longer than `earlier_clip` bytes.
+fn renderTranscript(alloc: Allocator, plan: Plan, clip: usize, earlier_clip: usize) Allocator.Error![]u8 {
     var text: std.ArrayList(u8) = .empty;
     const earlier = plan.earlier;
     if (earlier.earlier.len > 0) {
         const label = if (plan.foldsEarlier()) "[Earlier summary]" else "[Earlier summary, kept as it is]";
-        try text.print(alloc, "{s}\n{s}\n\n", .{ label, earlier.earlier });
+        try text.print(alloc, "{s}\n{s}\n\n", .{ label, try clipped(alloc, earlier.earlier, earlier_clip, "") });
     }
     for (earlier.turns) |turn| {
         if (turn.number == 0) {
-            for (turn.users) |user| try text.print(alloc, "[Earlier user message]\n{s}\n\n", .{user});
+            for (turn.users) |user| try text.print(alloc, "[Earlier user message]\n{s}\n\n", .{try clipped(alloc, user, earlier_clip, "")});
             continue;
         }
+        const turn_id = if (plan.saved) try std.fmt.allocPrint(alloc, "M{d}", .{turn.number}) else "";
         try text.print(alloc, "[Turn {d}, from the previous compaction]\n", .{turn.number});
         for (turn.users, 0..) |user, index| {
-            try text.print(alloc, "[{s}]\n{s}\n\n", .{ if (index == 0) "User" else "User, added while the assistant worked", user });
+            try text.print(alloc, "[{s}]\n{s}\n\n", .{ if (index == 0) "User" else "User, added while the assistant worked", try clipped(alloc, user, earlier_clip, turn_id) });
         }
-        if (turn.work.len > 0) try text.print(alloc, "[Assistant's work, summarized]\n{s}\n\n", .{turn.work});
-        if (turn.final.len > 0) try text.print(alloc, "[Assistant's final reply]\n{s}\n\n", .{turn.final});
+        if (turn.work.len > 0) try text.print(alloc, "[Assistant's work, summarized]\n{s}\n\n", .{try clipped(alloc, turn.work, earlier_clip, "")});
+        if (turn.final.len > 0) try text.print(alloc, "[Assistant's final reply]\n{s}\n\n", .{try clipped(alloc, turn.final, earlier_clip, turn_id)});
         if (turn.first_tool > 0) try text.print(alloc, "[Tools T{d} to T{d}]\n\n", .{ turn.first_tool, turn.last_tool });
     }
     for (plan.turns) |turn| {
@@ -687,8 +757,8 @@ fn renderTranscript(alloc: Allocator, plan: Plan, clip: usize) Allocator.Error![
             try text.print(alloc, "[Turn in progress]\n[User, this message stays in the conversation after the summary]\n{s}\n\n", .{first_user});
         }
         if (turn.continued) |part| {
-            if (part.work.len > 0) try text.print(alloc, "[Earlier part of this turn, summarized]\n{s}\n\n", .{part.work});
-            for (part.users) |user| try text.print(alloc, "[User, added while the assistant worked]\n{s}\n\n", .{user});
+            if (part.work.len > 0) try text.print(alloc, "[Earlier part of this turn, summarized]\n{s}\n\n", .{try clipped(alloc, part.work, earlier_clip, "")});
+            for (part.users) |user| try text.print(alloc, "[User, added while the assistant worked]\n{s}\n\n", .{try clipped(alloc, user, earlier_clip, turn_id)});
             if (part.first_tool > 0) try text.print(alloc, "[Its tools so far: T{d} to T{d}]\n\n", .{ part.first_tool, part.last_tool });
         }
         for (turn.source.items, turn.tool_numbers) |item, number| {
@@ -1317,6 +1387,11 @@ test "compaction survives every allocation failure" {
             const earlier: Compacted = .{ .earlier = "e", .turns = &.{.{ .number = 1, .users = &.{"u"}, .final = "f" }}, .open = .{ .text = "t", .work = "w" }, .turn_count = 1 };
             var result = try compact(alloc, .{ .model = "m", .earlier = earlier, .turns = &sample }, model.model(), store.store());
             result.deinit();
+            // Split into parts, every text clipped down to its note.
+            var split_store = MemoryStore{ .alloc = testing.allocator };
+            defer split_store.deinit();
+            var split = try compact(alloc, .{ .model = "m", .earlier = earlier, .turns = &sample, .exact_tokens = userTokens(sample[1], null), .max_prompt_tokens = 1 }, model.model(), split_store.store());
+            split.deinit();
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
@@ -1349,10 +1424,11 @@ test "turns too large for one request are summarized oldest first, each part fol
     defer store.deinit();
     const output = "build output line " ** 400;
     const turns = [_]Turn{ workedTurn("first", "call-1", output), workedTurn("second", "call-2", output), workedTurn("third", "call-3", output) };
-    // Room for one turn per request.
+    // Room for one turn per request, and only the newest keeps its user
+    // message exact.
     const one = turnTokens(turns[0]);
     const room = request_overhead_tokens + tokens(&.{system_prompt}) + one + one / 2;
-    var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = room }, model.model(), store.store());
+    var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .exact_tokens = userTokens(turns[2], null), .max_prompt_tokens = room }, model.model(), store.store());
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 3), model.calls);
@@ -1413,4 +1489,77 @@ test "a clipped tool result names its saved whole output in its record and in th
     const note = "The whole result is saved as result-read_tool_result-2.txt; open it with read_tool_result.";
     try testing.expect(std.mem.find(u8, store.find(.tool, 1).?, note) != null);
     try testing.expect(std.mem.find(u8, model.seen_user.items, "[Tool result T1: read_tool_result]\nfirst page\n... [tool result truncated]\n" ++ note ++ "\n") != null);
+}
+
+test "turns that keep their exact user messages are never split into earlier parts" {
+    var model = FakeModel{ .reply = "Turn 1:\nRan make.\nTurn 2:\nRan make.\nTurn 3:\nRan make." };
+    defer model.deinit();
+    var store = MemoryStore{ .alloc = testing.allocator };
+    defer store.deinit();
+    const output = "build output line " ** 400;
+    const turns = [_]Turn{ workedTurn("first", "call-1", output), workedTurn("second", "call-2", output), workedTurn("third", "call-3", output) };
+    const one = turnTokens(turns[0]);
+    const room = request_overhead_tokens + tokens(&.{system_prompt}) + one + one / 2;
+    var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = room }, model.model(), store.store());
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), model.calls);
+    try testing.expect(tokens(&.{ system_prompt, model.seen_user.items }) <= room);
+    try testing.expectEqual(@as(usize, 3), result.compacted.turns.len);
+    for (result.compacted.turns, [_][]const u8{ "first", "second", "third" }) |turn, user| {
+        try testing.expectEqualStrings(user, turn.users[0]);
+        try testing.expectEqualStrings("Done.", turn.final);
+    }
+    try testing.expect(std.mem.find(u8, store.find(.tool, 1).?, output) != null);
+}
+
+test "a request fits even when a turn has many texts too short to clip" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const output = "one short line of build output " ** 48;
+    var items: std.ArrayList(Item) = .empty;
+    for (0..300) |index| {
+        const id = try std.fmt.allocPrint(arena, "call-{d}", .{index});
+        try items.append(arena, .{ .tool_call = .{ .id = id, .name = "shell", .arguments = "{\"command\":\"make\"}" } });
+        try items.append(arena, .{ .tool_result = .{ .call_id = id, .name = "shell", .output = output } });
+    }
+    try items.append(arena, .{ .assistant = "Done." });
+    const turns = [_]Turn{.{ .user = "Build every target.", .items = items.items }};
+    var model = FakeModel{};
+    defer model.deinit();
+    var store = MemoryStore{ .alloc = testing.allocator };
+    defer store.deinit();
+    const room = 20_000;
+    var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns, .max_prompt_tokens = room }, model.model(), store.store());
+    defer result.deinit();
+
+    const seen = model.seen_user.items;
+    try testing.expect(tokens(&.{ system_prompt, seen }) <= room);
+    try testing.expect(std.mem.find(u8, seen, "[Tool result T300: shell]\n\n[1488 bytes clipped for this summary; the whole text is saved in T300]\n") != null);
+    // Texts shorter than their note stay whole.
+    try testing.expect(std.mem.find(u8, seen, "[Tool call T300: shell]\n{\"command\":\"make\"}\n") != null);
+    try testing.expect(std.mem.find(u8, store.find(.tool, 300).?, output) != null);
+}
+
+test "the previous compaction is clipped only when the turns alone cannot make the request fit" {
+    const summary = "EARLIER_START " ++ ("older work " ** 8000) ++ "EARLIER_END";
+    const earlier: Compacted = .{ .earlier = summary, .turn_count = 2, .tool_count = 1, .saved = true };
+    const turns = [_]Turn{workedTurn("Run it again.", "call-1", "ok")};
+    var model = FakeModel{ .reply = "Turn 3:\nRan make again." };
+    defer model.deinit();
+    var store = MemoryStore{ .alloc = testing.allocator };
+    defer store.deinit();
+    const room = 8000;
+    var result = try compact(testing.allocator, .{ .model = "m", .earlier = earlier, .turns = &turns, .max_prompt_tokens = room }, model.model(), store.store());
+    defer result.deinit();
+
+    const seen = model.seen_user.items;
+    try testing.expect(tokens(&.{ system_prompt, seen }) <= room);
+    try testing.expect(std.mem.startsWith(u8, seen, "[Earlier summary, kept as it is]\nEARLIER_START "));
+    try testing.expect(std.mem.find(u8, seen, " bytes clipped for this summary]\n") != null);
+    try testing.expect(std.mem.find(u8, seen, "EARLIER_END\n") != null);
+    try testing.expect(std.mem.find(u8, seen, "[Tool result T2: shell]\nok\n") != null);
+    // The request was clipped; the kept summary was not.
+    try testing.expectEqualStrings(summary, result.compacted.earlier);
 }
