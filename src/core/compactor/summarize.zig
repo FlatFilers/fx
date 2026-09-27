@@ -350,7 +350,7 @@ fn compactPart(alloc: Allocator, request: Request, selection: Selection, model: 
         const written = try model.summarize_fn(model.context, out, .{
             .model = request.model,
             .system = system_prompt,
-            .user = try fittingTranscript(scratch, plan, request.max_prompt_tokens),
+            .user = try fittingTranscript(alloc, scratch, plan, request.max_prompt_tokens),
         });
         const summary = std.mem.trim(u8, written, " \t\r\n");
         if (summary.len == 0) return error.EmptySummary;
@@ -687,19 +687,22 @@ fn savedOutputNote(alloc: Allocator, handle: []const u8) Allocator.Error![]const
 /// Texts are clipped no shorter than this, or else only their note stays.
 const min_clip_bytes = 256;
 
-/// The request for `plan` within `max_tokens`. While it is too large, the
-/// longest texts of the turns are clipped shorter, down to only their notes;
-/// the saved turns and tool calls keep them whole. Only then are the texts
-/// of the previous compaction clipped too. `alloc` should be an arena.
-fn fittingTranscript(alloc: Allocator, plan: Plan, max_tokens: usize) Allocator.Error![]u8 {
+/// The request for `plan` within `max_tokens`, allocated with `out`. While
+/// it is too large, the longest texts of the turns are clipped shorter, down
+/// to only their notes; the saved turns and tool calls keep them whole. Only
+/// then are the texts of the previous compaction clipped too. Each attempt
+/// is freed with `alloc`.
+fn fittingTranscript(alloc: Allocator, out: Allocator, plan: Plan, max_tokens: usize) Allocator.Error![]u8 {
     var clip: usize = std.math.maxInt(usize);
     var earlier_clip: usize = std.math.maxInt(usize);
     while (true) {
-        const text = try renderTranscript(alloc, plan, clip, earlier_clip);
+        var attempt: std.heap.ArenaAllocator = .init(alloc);
+        defer attempt.deinit();
+        const text = try renderTranscript(attempt.allocator(), plan, clip, earlier_clip);
         const used = tokens(&.{ system_prompt, text });
         if (used <= max_tokens or earlier_clip == 0) {
             if (used > max_tokens) trace.log(true, "summary request over its limit after clipping tokens={d} limit={d}", .{ used, max_tokens });
-            return text;
+            return out.dupe(u8, text);
         }
         if (clip > 0) {
             clip = shorterClip(clip, longestText(plan));
