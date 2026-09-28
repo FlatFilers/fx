@@ -183,14 +183,12 @@ inline fn eraseTraceArgs(comptime fmt: []const u8, args: anytype) [countTraceArg
             result[index] = .{ .floating = @floatCast(value) };
         } else if (comptime std.mem.eql(u8, spec, "?d")) {
             result[index] = traceOptionalNumber(value);
-        } else if (comptime std.mem.eql(u8, spec, "any") or std.mem.eql(u8, spec, "f")) {
+        } else {
             const T = @TypeOf(value);
             result[index] = .{ .custom = .{
                 .value = @ptrCast(&args.*[index]),
                 .write = traceCustomWriter(T, spec),
             } };
-        } else {
-            @compileError("unsupported trace format specifier: " ++ spec);
         }
     }
     return result;
@@ -266,13 +264,7 @@ fn traceCustomWriter(comptime T: type, comptime spec: []const u8) TraceArg.Custo
     return struct {
         fn write(value: *const anyopaque, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             const typed: *const T = @ptrCast(@alignCast(value));
-            if (comptime std.mem.eql(u8, spec, "any")) {
-                try writer.print("{any}", .{typed.*});
-            } else if (comptime std.mem.eql(u8, spec, "f")) {
-                try writer.print("{f}", .{typed.*});
-            } else {
-                unreachable;
-            }
+            try writer.print("{" ++ spec ++ "}", .{typed.*});
         }
     }.write;
 }
