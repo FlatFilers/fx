@@ -717,6 +717,39 @@ test.skipIf(!tmuxAvailable())("the interactive app saves to v2 and resumes with 
   }
 }, TIMEOUT * 6);
 
+test.skipIf(!tmuxAvailable())("the interactive app resumes a session with a shell result and takes the next prompt", async () => {
+  const fixture = createFixture("fx-v2-app-shell-resume-");
+  const gateway = startFakeGateway([
+    fakeShellRun("app-shell-1", "printf 'APP_SHELL_OUTPUT_4417\\n'"),
+    fakeGatewayFinalText("APP_SHELL_DONE"),
+    fakeGatewayFinalText("APP_AFTER_SHELL_RESUME"),
+  ]);
+  try {
+    const first = await startApp(fixture, gateway, []);
+    await first.session.sendText("Run the shell command.");
+    await scrollbackContains(first.session, "APP_SHELL_DONE");
+    await first.session.waitForComposer(TIMEOUT);
+    await quitApp(first);
+    const id = onlySession(fixture);
+
+    // Drawing the saved shell row reads its command replay from the side
+    // folder while the history is being visited.
+    const resumed = await startApp(fixture, gateway, ["-c"]);
+    const shown = await scrollbackContains(resumed.session, "APP_SHELL_DONE");
+    expect(shown).toContain("printf 'APP_SHELL_OUTPUT_4417");
+    await resumed.session.sendText("Continue after the shell turn.");
+    await resumed.session.waitForText("APP_AFTER_SHELL_RESUME", TIMEOUT);
+    await quitApp(resumed);
+    expect(onlySession(fixture)).toBe(id);
+    expect(gateway.requests.at(-1)!.body).toContain("APP_SHELL_OUTPUT_4417");
+    expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
 test.skipIf(!tmuxAvailable())("a killed interactive turn comes back interrupted and -c continues it", async () => {
   const fixture = createFixture("fx-v2-app-kill-");
   let held: () => void = () => {};

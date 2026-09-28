@@ -841,10 +841,11 @@ pub const Session = struct {
     /// conversation reader does: a compaction hides no turn from the
     /// transcript. Each turn is freed after its call, and pages are freed as
     /// they are read, so memory stays bounded by one page and one turn.
-    /// Leaves the state resume keeps untouched.
+    /// Leaves the state resume keeps untouched. It reads only through the
+    /// manager's thread-safe handle and changes no adapter state, so it
+    /// takes no lock: a visitor may call back into this session, as the app
+    /// does to read a command replay's side file while it draws a turn.
     pub fn visitHistory(self: *Session, alloc: Allocator, visitor: anytype) !void {
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
         const Sink = struct {
             alloc: Allocator,
             visitor: @TypeOf(visitor),
@@ -1778,6 +1779,24 @@ test "the history visit shows every turn, even those a compaction summarized" {
     defer failing.deinit();
     try testing.expectError(error.ConsumerFailed, s.visitHistory(testing.allocator, &failing));
     try testing.expectEqual(@as(usize, 1), failing.prompts.items.len);
+
+    // A visitor may call back into the session, as the app does to read a
+    // command replay's side file while it draws a turn.
+    const Reentrant = struct {
+        session: *Session,
+        visits: usize = 0,
+
+        pub fn append(self: *@This(), _: types.HistoryTurn) !void {
+            // Fails rather than hangs if the visit holds the adapter's lock.
+            if (!self.session.mutex.tryLock()) return error.VisitHeldSessionLock;
+            self.session.mutex.unlock(io_mod.getIo());
+            _ = try self.session.childCapability();
+            self.visits += 1;
+        }
+    };
+    var reentrant: Reentrant = .{ .session = s };
+    try s.visitHistory(testing.allocator, &reentrant);
+    try testing.expectEqual(@as(usize, 3), reentrant.visits);
 
     // Resume still starts from the summary.
     var restored = try s.restore(testing.allocator);
