@@ -69,10 +69,20 @@ function fakeShellStop(callId: string, sessionId: string): Response {
   });
 }
 
+/// Set when this run exercises sessions v2, whose sessions are folders
+/// under `sessions/v2` holding `log.jsonl`.
+const SESSIONS_V2 = process.env.FX_SESSIONS_V2 === "1";
+
+/// The command fx prints to continue a session; v2 keeps its flag.
+const RESUME_COMMAND = SESSIONS_V2 ? "fx --sessions-v2 --resume" : "fx --resume";
+
+function sessionsRoot(home: string): string {
+  return SESSIONS_V2 ? join(home, ".fx", "sessions", "v2") : join(home, ".fx", "sessions");
+}
+
 function sessionIdFromHome(home: string): string {
-  const sessions = join(home, ".fx", "sessions");
-  const ids = readdirSync(sessions, { withFileTypes: true })
-    .filter((entry) => entry.name !== "latest" && entry.isDirectory())
+  const ids = readdirSync(sessionsRoot(home), { withFileTypes: true })
+    .filter((entry) => entry.name !== "latest" && entry.name !== "v2" && !entry.name.startsWith(".") && entry.isDirectory())
     .map((entry) => entry.name);
   expect(ids).toHaveLength(1);
   return ids[0]!;
@@ -233,13 +243,13 @@ async function waitForPersistedSessionMarker(
   marker: string,
   timeout = TIMEOUT,
 ): Promise<void> {
-  const sessionsDir = join(home, ".fx", "sessions");
+  const sessionsDir = sessionsRoot(home);
   await waitForCondition(() => {
     if (!existsSync(sessionsDir)) return false;
     return readdirSync(sessionsDir, { withFileTypes: true })
       .filter((entry) => entry.name !== "latest" && entry.isDirectory())
       .some((entry) => {
-        const eventsPath = join(sessionsDir, entry.name, "events.jsonl");
+        const eventsPath = join(sessionsDir, entry.name, SESSIONS_V2 ? "log.jsonl" : "events.jsonl");
         return existsSync(eventsPath) &&
           readFileSync(eventsPath, "utf8").includes(marker);
       });
@@ -5055,7 +5065,7 @@ test.skipIf(!tmuxAvailable())(
       expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       const scrollback = stripAnsi(await active.captureFullScrollback());
       const ansiScrollback = await active.captureFullScrollbackEscapes();
-      const expected = `Continue session with: fx --resume ${sessionId}`;
+      const expected = `Continue session with: ${RESUME_COMMAND} ${sessionId}`;
       expect(scrollback).toContain(expected);
       expect(scrollback).not.toContain("To continue this session, run:");
       expect(ansiScrollback).toContain(`\x1b[38;5;245m${expected}\x1b[39m`);
@@ -5069,7 +5079,7 @@ test.skipIf(!tmuxAvailable())(
         .map((line) => line.trim())
         .find((line) => line === expected);
       const printedCommand = handoffLine?.slice("Continue session with: ".length);
-      expect(printedCommand).toBe(`fx --resume ${sessionId}`);
+      expect(printedCommand).toBe(`${RESUME_COMMAND} ${sessionId}`);
 
       await active.kill();
       active = await TmuxSession.create({
@@ -5159,7 +5169,7 @@ test.skipIf(!tmuxAvailable())(
         "the rapid Ctrl-C exit pane to stop",
       );
       const scrollback = stripAnsi(await active.captureFullScrollback());
-      const expected = `Continue session with: fx --resume ${sessionId}`;
+      const expected = `Continue session with: ${RESUME_COMMAND} ${sessionId}`;
       expect(countOccurrences(scrollback, expected)).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await active.kill();
@@ -5729,9 +5739,10 @@ test.skipIf(!tmuxAvailable())(
       expect(resumed).not.toMatch(/[*✓!✗⊘i] session: resumed:/);
 
       const argvLines = readFileSync(argvLogPath, "utf8").trim().split("\n");
+      // A v2 relaunch keeps its switch, so it reopens the same store.
       expect(argvLines).toEqual([
         installedFx,
-        `${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`,
+        `${installedFx}${SESSIONS_V2 ? "\t--sessions-v2" : ""}\tresume\t${sessionId}\t--upgrade-relaunch`,
       ]);
 
       await active.sendText("Continue after upgrade handoff.");
