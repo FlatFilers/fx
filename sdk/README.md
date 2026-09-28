@@ -50,35 +50,35 @@ const agent = await createFxAgent({
 });
 ```
 
-For a custom OpenAI Chat Completions endpoint, provide a connection instead of
-`apiKey`. The host supplies its credential explicitly; libfx neither reads
+For a custom Chat Completions-compatible endpoint, provide a connection instead
+of `apiKey`. The host supplies its credential explicitly; libfx neither reads
 `~/.fx` nor sends a request through AI Gateway for this connection:
 
 ```js
 const agent = await createFxAgent({
-  model: { id: "openai/gpt-4.1" },
+  model: { id: "provider/model" },
   provider: {
-    id: "openrouter",
+    id: "custom",
     protocol: "openai-chat-completions",
-    baseUrl: "https://openrouter.ai/api/v1",
-    auth: { type: "bearer", token: process.env.OPENROUTER_API_KEY },
+    baseUrl: "https://api.example.com/v1",
+    auth: { type: "bearer", token: process.env.PROVIDER_API_KEY },
     modelMetadata: {
-      "openai/gpt-4.1": { supportsToolUse: true },
+      "provider/model": { supportsToolUse: true },
     },
   },
 });
 ```
 
-Use the model ID accepted by that endpoint, not a placeholder such as
-`local-model`. `provider.id` names the connection and must be unique to its
-endpoint and credential authority. Local endpoints can use
+Replace `provider/model` and `https://api.example.com/v1` with the model ID and
+base URL accepted by your endpoint. Keep the metadata key in sync with the model
+ID. `provider.id` names the connection and must be unique to its endpoint and
+credential authority. Local endpoints can use
 `auth: { type: "none" }` and loopback HTTP; remote endpoints require HTTPS.
 `toolChoiceMode: "omit" | "send"` and per-model `maxOutputTokens` and
 `supportsVision` metadata are optional. The metadata is host-supplied, so
-verify it against the chosen model. Only the OpenAI Chat Completions protocol
-is supported for custom connections; proprietary provider protocols need
-separate adapters. The host must not take `baseUrl` from an untrusted chat
-message. Custom requests use the supplied `fetch`, disable redirects, and
+verify it against the chosen model. This is the only protocol supported for
+custom connections; proprietary provider protocols need separate adapters.
+The host must not take `baseUrl` from an untrusted chat message. Custom requests use the supplied `fetch`, disable redirects, and
 reject unexpected endpoints.
 
 A custom connection requires an explicit `model` and cannot be mixed with
