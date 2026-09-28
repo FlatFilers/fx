@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
@@ -297,6 +298,142 @@ test("the flag works before and after ask, and --no-save writes nothing", async 
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 3);
+
+test("fx ask keeps the conversation language when a resumed turn has no language of its own", async () => {
+  const fixture = createFixture("fx-v2-language-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("こんにちは。"),
+    fakeGatewayFinalText("完了しました。"),
+  ]);
+  try {
+    const seeded = await ask(fixture, gateway, ["こんにちは。日本語で返答してください。"]);
+    expect(seeded.code).toBe(0);
+    const id = JSON.parse(seeded.stdout).session_id;
+    const languages = () =>
+      (logLines(fixture, id) as any[]).filter((line) => line.kind === "set" && line.key === "language").map((line) => line.value);
+    const seededLanguages = languages();
+    expect(seededLanguages.at(-1)).toBe("ja");
+
+    const resumed = await ask(fixture, gateway, ["--resume-id", id, "👍"]);
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).toBe("");
+    // The language is written only when it changes, so the resumed turn
+    // adds none, and the session still reads as Japanese.
+    expect(languages()).toEqual(seededLanguages);
+    expect(gateway.requests).toHaveLength(2);
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+/// The path of a file named `name` anywhere under `dir`.
+function findFile(dir: string, name: string): string | undefined {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const found = findFile(path, name);
+      if (found) return found;
+    } else if (entry.name === name) {
+      return path;
+    }
+  }
+  return undefined;
+}
+
+const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+for (const userHeavy of [false, true]) {
+  test(`fx ask compacts on its own, keeps what it summarized as side files, and resumes from the summary, userHeavy=${userHeavy}`, async () => {
+    const fixture = createFixture("fx-v2-compaction-");
+    const model = "fixture/compaction";
+    const originalUser = "Keep café and the original constraint unchanged." +
+      (userHeavy ? "\n" + "user_reference_abcdefghijklmnop ".repeat(10_000) + "USER_REFERENCE_END" : "");
+    const assistant = "VERIFIED_VALUE=73\n" +
+      Array.from({ length: 14_000 }, (_, n) => `Assistant reference ${n}: group ${n % 19}, historical data, not new completed work.\n`).join("") +
+      "PENDING_CHECK=transport-resume\n";
+    let phase: "seed" | "continue" = "seed";
+    let summaryCalls = 0;
+    const bodies: string[] = [];
+    const gateway = startDynamicFakeGateway((body: string) => {
+      const request = JSON.parse(body);
+      bodies.push(body);
+      if (request.tools?.length === 0 && request.toolChoice?.type === "none") {
+        summaryCalls += 1;
+        const source = JSON.stringify(request.prompt);
+        const facts = [];
+        if (source.includes("VERIFIED_VALUE=73")) facts.push("The verified value is73.");
+        if (source.includes("PENDING_CHECK=transport-resume")) facts.push("The pending check is transport-resume.");
+        if (source.includes("Keep café")) facts.push("Preserve café and the original constraint.");
+        return fakeGatewayFinalText(facts.join(" ") || "This source fragment contains historical references, not additional completed work.");
+      }
+      return fakeGatewayFinalText(phase === "seed" ? assistant : "CONTINUED_FROM_COMMITTED_MEMORY");
+    }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: userHeavy ? 256_000 : 128_000, max_tokens: 8192 }] });
+    const compactEnv = { ...env(fixture, gateway), FX_MODEL: model, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
+    const run = (args: string[], stdin?: string) =>
+      runFx(["ask", "--json", ...args], { cwd: fixture.workspace, env: compactEnv, stdin, timeoutMs: TIMEOUT });
+    try {
+      const seed = await run([], originalUser);
+      expect(seed.code).toBe(0);
+      expect(seed.stderr).toBe("");
+      expect(summaryCalls).toBe(0);
+      const id = JSON.parse(seed.stdout).session_id;
+      const logPath = join(v2Root(fixture), id, "log.jsonl");
+      const before = readFileSync(logPath);
+
+      phase = "continue";
+      const continued = await run(["--resume-id", id, "Continue the saved task without losing its pending check."]);
+      expect(continued.code).toBe(0);
+      expect(continued.stderr).toBe("");
+      expect(JSON.parse(continued.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
+      expect(summaryCalls).toBeGreaterThan(0);
+
+      // One compaction line; its summary names the state file by handle,
+      // size and digest, and every original it summarized is a side file.
+      const compactions = (logLines(fixture, id) as any[]).filter((line) => line.kind === "compacted");
+      expect(compactions).toHaveLength(1);
+      const data = typeof compactions[0].data === "string" ? JSON.parse(compactions[0].data) : compactions[0].data;
+      const match = /> fx-compaction-state-v1 (\S+) (\d+) ([a-f0-9]{64})\n/.exec(data.summary);
+      expect(match).not.toBeNull();
+      const files = join(fixture.home, ".fx", "session-files", id);
+      const statePath = findFile(files, match![1]);
+      expect(statePath).toBeDefined();
+      const bytes = readFileSync(statePath!);
+      expect(bytes.length).toBe(Number(match![2]));
+      expect(sha256(bytes)).toBe(match![3]);
+      const state = JSON.parse(bytes.toString());
+      expect(state.users.includes(originalUser)).toBe(!userHeavy);
+      expect(state.summary).toContain("verified value is73");
+      expect(state.summary).toContain("transport-resume");
+      expect(state.archives.length).toBeGreaterThan(0);
+      for (const archive of state.archives) {
+        const original = readFileSync(findFile(files, archive.handle)!);
+        expect(original.length).toBe(archive.bytes);
+        expect(sha256(original)).toBe(archive.sha256);
+      }
+      expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
+      const summaryCallsBeforeReopen = summaryCalls;
+
+      // A fresh process resumes from the summary: it sends the summary, not
+      // the turns it replaced, and has nothing left to summarize.
+      const reopened = await run(["--resume-id", id, "Continue after this fresh process restart."]);
+      expect(reopened.code).toBe(0);
+      expect(reopened.stderr).toBe("");
+      expect(JSON.parse(reopened.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
+      expect(bodies.at(-1)).toContain("verified value is73");
+      expect(bodies.at(-1)).not.toContain("Assistant reference 7000:");
+      expect(summaryCalls).toBe(summaryCallsBeforeReopen);
+      expect((logLines(fixture, id) as any[]).filter((line) => line.kind === "compacted")).toHaveLength(1);
+      expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
+      expectWholeLog(fixture, id);
+      expectNoV1Sessions(fixture);
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 90_000);
+}
 
 test("a tool turn keeps its result as a side file and v1 ignores the v2 root", async () => {
   const fixture = createFixture("fx-v2-tool-");
