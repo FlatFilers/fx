@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("io.zig");
 const profile_paths = @import("profile_paths.zig");
 
@@ -14,6 +15,7 @@ const State = struct {
 
 const default_log_max_bytes: u64 = 2 * 1024 * 1024;
 const max_trace_line_bytes: usize = 64 * 1024;
+const use_compact_formatter = builtin.cpu.arch == .aarch64;
 
 pub const Options = struct {
     file_path: ?[]const u8 = null,
@@ -77,8 +79,12 @@ pub fn nextSubagentId() u64 {
 pub fn logf(scope: []const u8, comptime fmt: []const u8, args: anytype) void {
     var line: TraceLine = undefined;
     if (!line.begin(scope)) return;
-    const erased = eraseTraceArgs(fmt, &args);
-    line.printErased(fmt, &erased);
+    if (comptime use_compact_formatter) {
+        const erased = eraseTraceArgs(fmt, &args);
+        line.printErased(fmt, &erased);
+    } else {
+        line.print(fmt, args);
+    }
     line.end();
 }
 
@@ -86,8 +92,12 @@ pub fn eventf(scope: []const u8, event: []const u8, ctx: TraceContext, comptime 
     var line: TraceLine = undefined;
     if (!line.beginEvent(scope, event, ctx, fmt.len != 0)) return;
     if (fmt.len != 0) {
-        const erased = eraseTraceArgs(fmt, &args);
-        line.printErased(fmt, &erased);
+        if (comptime use_compact_formatter) {
+            const erased = eraseTraceArgs(fmt, &args);
+            line.printErased(fmt, &erased);
+        } else {
+            line.print(fmt, args);
+        }
     }
     line.end();
 }
@@ -304,6 +314,13 @@ const TraceLine = struct {
     noinline fn printErased(line: *TraceLine, fmt: []const u8, args: []const TraceArg) void {
         if (line.failed) return;
         writeErasedFormat(&line.out.writer, fmt, args) catch {
+            line.failed = true;
+        };
+    }
+
+    fn print(line: *TraceLine, comptime fmt: []const u8, args: anytype) void {
+        if (line.failed) return;
+        line.out.writer.print(fmt, args) catch {
             line.failed = true;
         };
     }
