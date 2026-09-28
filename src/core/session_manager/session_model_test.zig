@@ -72,7 +72,7 @@ fn testEnv(tmp: *testing.TmpDir, fault: *Fault, options: session_mod.Options) se
 // TurnLifecycle
 
 fn runTurnTrace(case: []const u8, planted: trace.Planted) !void {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(gpa, io, 1);
     defer fault.deinit();
@@ -240,7 +240,7 @@ const KillAt = struct {
 };
 
 fn runLifecycleTrace(case: []const u8, planted: trace.Planted, power_loss: bool) !void {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(gpa, io, 5);
     defer fault.deinit();
@@ -358,7 +358,7 @@ const SnapTracer = struct {
 };
 
 fn runSnapshotTrace(case: []const u8, planted: trace.Planted) !void {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(gpa, io, 1);
     defer fault.deinit();
@@ -561,7 +561,7 @@ fn writeFromTwoThreads(s: *Session, value: []const u8) !void {
 }
 
 fn runLockTrace(case: []const u8, planted: trace.Planted) !void {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault1 = Fault.init(gpa, io, 1);
     defer fault1.deinit();
@@ -827,7 +827,7 @@ const ForkTracer = struct {
 };
 
 fn runForkTrace(case: []const u8, planted: trace.Planted) !void {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(gpa, io, 1);
     defer fault.deinit();
@@ -1053,7 +1053,7 @@ const SubTracer = struct {
 };
 
 fn runSubagentsTrace(case: []const u8, planted: trace.Planted, finish_first: bool) !void {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(gpa, io, 1);
     defer fault.deinit();
@@ -1104,7 +1104,7 @@ test "Subagents trace: planted bug, repair finishes a child twice" {
 }
 
 test "Subagents trace: a named child fails, works again, is cancelled; a crash interrupts another" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(gpa, io, 1);
     defer fault.deinit();

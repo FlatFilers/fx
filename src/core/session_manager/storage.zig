@@ -37,6 +37,8 @@ pub const Error = error{
     Canceled,
 };
 
+/// A folder opened for listing (`openDir`, `openRoot`). Linux opens any
+/// other folder with `O_PATH`, which `syncDir` cannot sync (EBADF).
 pub const Dir = struct { handle: Io.Dir };
 pub const File = struct { handle: Io.File };
 
@@ -370,7 +372,7 @@ fn testRoot(tmp: *testing.TmpDir) Dir {
 }
 
 test "folders are 0700 and files are 0600" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const s: Storage = .{ .io = testing.io };
     const root = testRoot(&tmp);
@@ -384,7 +386,7 @@ test "folders are 0700 and files are 0600" {
 }
 
 test "openRoot creates the root 0700 and refuses a symlinked root" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = testing.io;
     const s: Storage = .{ .io = io };
@@ -413,7 +415,7 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
 }
 
 test "symlinks under the root are refused" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = testing.io;
     const s: Storage = .{ .io = io };
@@ -435,7 +437,7 @@ test "symlinks under the root are refused" {
 }
 
 test "a second exclusive lock on the same file is refused" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const s: Storage = .{ .io = testing.io };
     const root = testRoot(&tmp);
@@ -450,7 +452,7 @@ test "a second exclusive lock on the same file is refused" {
 }
 
 test "write, read, cut, rename and link round trip" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const s: Storage = .{ .io = testing.io };
     const root = testRoot(&tmp);
@@ -477,7 +479,7 @@ test "write, read, cut, rename and link round trip" {
 }
 
 test "a folder rename never replaces a non-empty folder" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const s: Storage = .{ .io = testing.io };
     const root = testRoot(&tmp);

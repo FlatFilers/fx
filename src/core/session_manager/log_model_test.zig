@@ -36,7 +36,7 @@ const Harness = struct {
     planted: trace.Planted = .none,
 
     fn init(seed: u64) Harness {
-        return .{ .tmp = testing.tmpDir(.{}), .fault = .init(gpa, io, seed) };
+        return .{ .tmp = testing.tmpDir(.{ .iterate = true }), .fault = .init(gpa, io, seed) };
     }
 
     fn deinit(h: *Harness) void {

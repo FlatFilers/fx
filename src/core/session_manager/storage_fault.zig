@@ -349,7 +349,7 @@ test "a power loss never loses a synced byte" {
     const io = testing.io;
     var seed: u64 = 0;
     while (seed < 200) : (seed += 1) {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault = Fault.init(testing.allocator, io, seed);
         defer fault.deinit();
@@ -391,7 +391,7 @@ test "a power loss never loses a synced byte" {
 }
 
 test "an injected short write keeps only the planned bytes, then fails" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(testing.allocator, testing.io, 1);
     defer fault.deinit();
@@ -407,7 +407,7 @@ test "an injected short write keeps only the planned bytes, then fails" {
 }
 
 test "a killed process does no more I/O until restart" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(testing.allocator, testing.io, 2);
     defer fault.deinit();
@@ -424,7 +424,7 @@ test "a killed process does no more I/O until restart" {
 }
 
 test "a failed sync is reported and changes nothing on disk" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(testing.allocator, testing.io, 3);
     defer fault.deinit();
@@ -444,7 +444,7 @@ test "names are undone by a power loss only until their folder is synced" {
     var undone_unsynced = false;
     var seed: u64 = 0;
     while (seed < 64) : (seed += 1) {
-        var tmp = testing.tmpDir(.{});
+        var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var fault = Fault.init(testing.allocator, io, seed);
         defer fault.deinit();
@@ -468,7 +468,7 @@ test "names are undone by a power loss only until their folder is synced" {
 }
 
 test "a written file closed without a sync is counted" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fault = Fault.init(testing.allocator, testing.io, 4);
     defer fault.deinit();
@@ -485,7 +485,7 @@ test "a written file closed without a sync is counted" {
 }
 
 test "flipBit changes exactly one bit" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = testing.io;
     try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "AB" });

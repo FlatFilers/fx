@@ -167,7 +167,7 @@ fn readDisk(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8) !Disk
 }
 
 test "the disk abstraction counts a torn tail and parses seqs" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = std.testing.io;
     try tmp.dir.writeFile(io, .{

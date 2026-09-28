@@ -756,7 +756,7 @@ const TestLog = struct {
 
     fn init(seed: u64) TestLog {
         return .{
-            .tmp = testing.tmpDir(.{}),
+            .tmp = testing.tmpDir(.{ .iterate = true }),
             .fault = if (hooks) .init(testing.allocator, testing.io, seed) else {},
         };
     }

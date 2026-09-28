@@ -42,7 +42,7 @@ const Fixture = struct {
     }
 
     fn initWith(f: *Fixture, index_compact_bytes: u64) !void {
-        f.tmp = testing.tmpDir(.{});
+        f.tmp = testing.tmpDir(.{ .iterate = true });
         const base = try f.tmp.dir.realPathFileAlloc(io, ".", gpa);
         defer gpa.free(base);
         f.root = try std.fs.path.join(gpa, &.{ base, "sessions", "v2" });

@@ -23,6 +23,7 @@ const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_event = @import("session_event.zig");
+const result_store = @import("result_store.zig");
 const session_log = @import("session_log.zig");
 const session_codec = @import("session_codec.zig");
 const session_usage = @import("session_usage.zig");
@@ -42,6 +43,12 @@ pub const files_dir_name = "session-files";
 /// Folder of the usage-recovery markers of v2 sessions, under `~/.fx`;
 /// v1's readers load only v1 sessions, so v2 markers live apart.
 pub const usage_markers_dir_name = "usage-recovery-v2";
+/// The profile's home folder, opened for listing: creating `~/.fx` in it
+/// syncs it, and Linux cannot sync a folder opened any other way (`O_PATH`).
+fn openHome(home: []const u8) !io_mod.VerifiedDir {
+    return .{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true, .follow_symlinks = false }) };
+}
+
 /// Pieces larger than this go to a blob; the line keeps a reference.
 const max_inline_piece_bytes: usize = 256 * 1024;
 /// Lines per page when replaying history.
@@ -150,6 +157,8 @@ pub const Session = struct {
     mutex: std.Io.Mutex = .init,
     /// Encodings of the open turn's pieces already appended, in order.
     streamed: std.ArrayList([]u8) = .empty,
+    /// Result files the open turn's stream wrote, by call id; both owned.
+    stored_results: std.StringHashMapUnmanaged([]u8) = .empty,
     turn_open: bool = false,
     /// Highest turn number started; the manager numbers turns the same way.
     last_turn: u64 = 0,
@@ -239,6 +248,7 @@ pub const Session = struct {
         if (self.files_dir) |*dir| dir.close();
         self.clearStreamed();
         self.streamed.deinit(alloc);
+        self.stored_results.deinit(alloc);
         self.turn_numbers.deinit(alloc);
         if (self.language) |value| alloc.free(value);
         alloc.free(self.files_path);
@@ -248,6 +258,12 @@ pub const Session = struct {
     fn clearStreamed(self: *Session) void {
         for (self.streamed.items) |bytes| self.alloc.free(bytes);
         self.streamed.clearRetainingCapacity();
+        var stored = self.stored_results.iterator();
+        while (stored.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.stored_results.clearRetainingCapacity();
     }
 
     // -- side files ----------------------------------------------------------
@@ -257,6 +273,10 @@ pub const Session = struct {
     pub fn childCapability(self: *Session) !*session_child_store.SessionChildCapability {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        return self.capabilityLocked();
+    }
+
+    fn capabilityLocked(self: *Session) !*session_child_store.SessionChildCapability {
         if (self.capability) |*capability| return capability;
         const dir = try self.openFilesDir();
         self.capability = try session_child_store.SessionChildCapability.init(self.alloc, dir.dir, self.files_path, .writable);
@@ -265,7 +285,7 @@ pub const Session = struct {
 
     fn openFilesDir(self: *Session) !*io_mod.VerifiedDir {
         if (self.files_dir) |*dir| return dir;
-        var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), self.store.home, .{ .follow_symlinks = false }) };
+        var home = try openHome(self.store.home);
         defer home.close();
         var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
         defer fx.close();
@@ -334,7 +354,8 @@ pub const Session = struct {
 
     /// Streams the turn so far (`AgentRuntimeDeps.append_turn_piece`): the
     /// first call starts the turn, later calls append only the pieces
-    /// completed since. A tool result whose side file does not exist yet
+    /// completed since. A tool result gets the side file the commit would
+    /// write for it (`withResultFiles`); a tool image without its handle
     /// waits for the commit, which is authoritative.
     pub fn appendProgress(self: *Session, user: types.UserTurn, execution: types.ExecutionMemory) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -345,7 +366,7 @@ pub const Session = struct {
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
         // On a missing handle the list keeps the pieces before it.
-        session_event.appendExecutionConversationEvents(a, &events, execution) catch |err| switch (err) {
+        session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
             error.ConversationArtifactRequired => {},
             else => return err,
         };
@@ -356,6 +377,35 @@ pub const Session = struct {
         try self.writePieces(a, events.items[start..], encoded[start..], &.{});
         try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
         for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
+    }
+
+    /// A copy of `execution` in which each tool result without a result file
+    /// has the one the commit gives it (`session_log.externalizeConversationTurnResults`):
+    /// the same handle, size and preview, so its streamed piece is the
+    /// committed one. A result backed only by its command replay has no file
+    /// before then. Each file is written once a turn.
+    fn withResultFiles(self: *Session, a: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
+        var copy = execution;
+        copy.tool_steps = try a.dupe(types.ToolExecutionStep, execution.tool_steps);
+        for (copy.tool_steps) |*step| {
+            step.tool_results = try a.dupe(types.PersistedToolResult, step.tool_results);
+            for (step.tool_results) |*result| {
+                if (result.output_handle != null) continue;
+                const handle = self.stored_results.get(result.tool_call_id) orelse blk: {
+                    const stored = try result_store.storeLargeResultManaged(self.alloc, try self.capabilityLocked(), result.tool_call_id, result.tool_name, result.output);
+                    errdefer self.alloc.free(stored);
+                    const key = try self.alloc.dupe(u8, result.tool_call_id);
+                    errdefer self.alloc.free(key);
+                    try self.stored_results.put(self.alloc, key, stored);
+                    break :blk stored;
+                };
+                // Copied: a superseded turn frees the cache before its pieces are written.
+                result.output_handle = try a.dupe(u8, handle);
+                result.stored_output_bytes = result.output.len;
+                if (result.preview == null) result.preview = try result_store.previewText(a, result.output, result_store.preview_bytes);
+            }
+        }
+        return copy;
     }
 
     /// Appends `events` (already encoded) as items, then `tail`, starting
@@ -550,7 +600,7 @@ pub const Session = struct {
     }
 
     fn openUsageMarkers(self: *Session) !io_mod.VerifiedDir {
-        var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), self.store.home, .{ .follow_symlinks = false }) };
+        var home = try openHome(self.store.home);
         defer home.close();
         var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
         defer fx.close();
@@ -1146,6 +1196,43 @@ test "streamed pieces are written once, and the commit adds only the rest" {
     defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("streamed answer", restored.history[0].assistant.assistant);
+}
+
+test "a tool result backed only by its command replay streams as it commits" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const user: types.UserTurn = .{ .text = @constCast("run it") };
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "shell", .arguments_json = "{}" }};
+    // As a shell result arrives with `.required` command replay: no result file yet.
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("REPLAY_ONLY_OUTPUT"),
+        .output_bytes = 18,
+        .stored_output_bytes = 18,
+        .command_output_replay = .{ .available = .{ .handle = "fx-command-replay-0-0.bin", .framed_bytes = 27 } },
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    try s.appendProgress(user, execution);
+    try s.appendProgress(user, execution);
+    // The commit gets the agent's own turn, still without a result file;
+    // preparing it fills in the handle and preview.
+    try testing.expectEqual(@as(?[]u8, null), results[0].output_handle);
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer testing.allocator.free(results[0].output_handle.?);
+    defer testing.allocator.free(results[0].preview.?);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    try testing.expectEqual(@as(usize, 0), try countItems(t.store.manager, id, superseded_type));
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, "tool_result"));
 }
 
 test "a tool result's rebuild time alone does not supersede its stream" {
