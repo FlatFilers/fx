@@ -94,6 +94,10 @@ pub const NewOptions = struct {
     role: Role = .root,
     /// Required for a child session.
     parent: ?[]const u8 = null,
+    /// A child's id, already named in its parent's `child_spawned` (D34); a
+    /// root always gets a fresh one. A taken id fails the first turn's
+    /// append and leaves the existing session as it was.
+    id: ?[]const u8 = null,
 };
 
 pub const ResumeTarget = union(enum) {
@@ -237,11 +241,16 @@ pub const Manager = struct {
     pub fn openNew(m: *Manager, options: NewOptions) OpenError!Session {
         try checkText(options.workspace);
         try checkRoleParent(options.role, options.parent);
+        if (options.id) |id| {
+            if (options.role != .child) return error.InvalidArgument;
+            try checkId(id);
+        }
         const inner = try session_mod.openNew(&m.env, .{
             .workspace = options.workspace,
             .host = options.host,
             .role = options.role,
             .parent = options.parent,
+            .id = options.id,
         });
         return .{ .manager = m, .inner = inner };
     }

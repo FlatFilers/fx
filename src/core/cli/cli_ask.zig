@@ -66,6 +66,7 @@ const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const test_builtin_gateway = if (std_builtin.is_test)
@@ -607,6 +608,8 @@ const AskContext = struct {
     /// Sessions v2: set instead of `store` and `writable`, never both.
     v2_store: ?session_adapter.Store = null,
     v2: ?*session_adapter.Session = null,
+    /// The v2 parent's children (D22), borrowed by `subagent_host`.
+    v2_children: ?*subagent_child_state.V2Children = null,
     /// A resumed v2 session's preferences; `model` borrows from here.
     v2_preferences: ?session_codec.DurableSessionPreferences = null,
     session_write_mutex: std.Io.Mutex = .init,
@@ -760,6 +763,11 @@ const AskContext = struct {
     fn deinit(self: *AskContext) void {
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
+        if (self.v2_children) |children| {
+            children.deinit();
+            self.alloc.destroy(children);
+        }
+        self.v2_children = null;
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
@@ -1122,7 +1130,29 @@ const AskContext = struct {
         }
         self.session.configureWebFetchArtifacts(self.alloc, v2.filesPath());
         self.v2 = v2;
-        debug_trace.logf("subagent", "ask subagent host unavailable root_id={s} reason=sessions_v2", .{v2.id()});
+        try self.startV2SubagentHost(v2);
+    }
+
+    /// Subagents on v2 keep their state in the parent's log (D22). A host
+    /// that cannot start leaves them off and says why in the trace, as v1.
+    fn startV2SubagentHost(self: *AskContext, v2: *session_adapter.Session) !void {
+        const children = try self.alloc.create(subagent_child_state.V2Children);
+        errdefer self.alloc.destroy(children);
+        children.* = subagent_child_state.V2Children.init(self.alloc, v2, self.workspace_root);
+        errdefer children.deinit();
+        self.subagent_host = subagent_tool_host.Runtime.createV2(
+            self.alloc,
+            children,
+            .{ .context = self, .resolve_fn = resolveAskSubagentAuthority },
+            .{ .context = self, .run_fn = runAskChild },
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("subagent", "ask subagent host unavailable root_id={s} err={s}", .{ v2.id(), @errorName(err) });
+            children.deinit();
+            self.alloc.destroy(children);
+            return;
+        };
+        self.v2_children = children;
     }
 
     fn toolContext(self: *AskContext) tool_runtime.Context {
@@ -4001,8 +4031,13 @@ fn resolveAskSubagentAuthority(
     root_id: []const u8,
 ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
-    const writable = if (ctx.writable) |*value| value else return error.HostAuthorityUnavailable;
-    if (!std.mem.eql(u8, writable.active_id, root_id)) {
+    const active_id = if (ctx.writable) |*value|
+        value.active_id
+    else if (ctx.v2) |v2|
+        v2.id()
+    else
+        return error.HostAuthorityUnavailable;
+    if (!std.mem.eql(u8, active_id, root_id)) {
         return error.HostAuthorityUnavailable;
     }
     if (ctx.mcp != null) {

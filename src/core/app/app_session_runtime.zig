@@ -52,6 +52,7 @@ const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
@@ -1282,6 +1283,8 @@ pub const Persistence = struct {
     writable: ?session_store.LoadedWritableSession = null,
     remember_fresh_session: bool = false,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// The v2 session's children (D22), borrowed by `subagent_host`.
+    v2_children: ?*subagent_child_state.V2Children = null,
     workspace_preferences: ?session_codec.DurableSessionPreferences = null,
     session_preferences: ?session_codec.DurableSessionPreferences = null,
     fast_mode_model_bound: bool = false,
@@ -1312,7 +1315,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 28) {
+            if (std.meta.fields(Persistence).len != 29) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1322,6 +1325,7 @@ pub const Persistence = struct {
         storage.writable = null;
         storage.remember_fresh_session = false;
         storage.subagent_host = null;
+        storage.v2_children = null;
         storage.workspace_preferences = null;
         storage.session_preferences = null;
         storage.fast_mode_model_bound = false;
@@ -1361,6 +1365,10 @@ pub const Persistence = struct {
             alloc.free(path);
         }
         if (self.subagent_host) |host| host.deinit();
+        if (self.v2_children) |children| {
+            children.deinit();
+            alloc.destroy(children);
+        }
         if (self.writable) |*loaded| loaded.deinit(alloc);
         if (self.store) |*store| store.deinit(alloc);
         if (self.v2) |v2| v2.close();
@@ -1536,8 +1544,7 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasDecl(@TypeOf(app.session), "configureWebFetchArtifacts")) {
                     app.session.configureWebFetchArtifacts(app.alloc, v2.filesPath());
                 }
-                // Subagents move to the parent log with their own PR (D22).
-                debug_trace.logf("subagent", "interactive subagent host unavailable session={s} reason=sessions_v2", .{v2.id()});
+                enableSubagentHostV2(app, v2);
                 return;
             }
             const loaded = if (app.session_persistence.writable) |*value| value else return;
@@ -3807,14 +3814,26 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn rebindSubagentHost(app: *App) void {
             const host = app.session_persistence.subagent_host orelse return;
+            if (app.session_persistence.v2_children != null) {
+                host.rebindHost(app, subagentAuthorityResolver(app));
+                return;
+            }
             const store = if (app.session_persistence.store) |*value| value else return;
             host.rebind(store, app, subagentAuthorityResolver(app));
         }
 
+        /// Stops the subagent host, joining its child threads, before the
+        /// session they append to can close (`tla/Wiring.tla`
+        /// ParentOutlivesChildren).
         pub fn disableSubagentHost(app: *App) void {
             if (app.session_persistence.subagent_host) |host| {
                 host.deinit();
                 app.session_persistence.subagent_host = null;
+            }
+            if (app.session_persistence.v2_children) |children| {
+                children.deinit();
+                app.alloc.destroy(children);
+                app.session_persistence.v2_children = null;
             }
         }
 
@@ -5704,6 +5723,32 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        /// Subagents on v2 keep their state in the session's log (D22). A
+        /// host that cannot start leaves them off and says why, as on v1.
+        fn enableSubagentHostV2(app: *App, v2: *session_adapter.Session) void {
+            disableSubagentHost(app);
+            const children = app.alloc.create(subagent_child_state.V2Children) catch |err| {
+                debug_trace.logf("session", "interactive subagent host unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
+                return;
+            };
+            children.* = subagent_child_state.V2Children.init(app.alloc, v2, app.workspace_root);
+            app.session_persistence.subagent_host = subagent_tool_host.Runtime.createV2(
+                app.alloc,
+                children,
+                subagentAuthorityResolver(app),
+                if (comptime @hasDecl(App, "runSubagentChild"))
+                    .{ .context = app, .run_fn = App.runSubagentChild }
+                else
+                    .{},
+            ) catch |err| {
+                debug_trace.logf("session", "interactive subagent host unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
+                children.deinit();
+                app.alloc.destroy(children);
+                return;
+            };
+            app.session_persistence.v2_children = children;
+        }
+
         fn subagentAuthorityResolver(app: *App) subagent_authority.HostResolver {
             return .{ .context = app, .resolve_fn = resolveSubagentAuthority };
         }
@@ -5720,8 +5765,13 @@ pub fn Runtime(comptime App: type) type {
             defer if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
                 app.permission_state.authority_mutex.unlock(io_mod.getIo());
             };
-            const writable = if (app.session_persistence.writable) |*value| value else return error.HostAuthorityUnavailable;
-            if (!std.mem.eql(u8, writable.active_id, root_id)) {
+            const active_id = if (app.session_persistence.writable) |*value|
+                value.active_id
+            else if (app.session_persistence.v2) |v2|
+                v2.id()
+            else
+                return error.HostAuthorityUnavailable;
+            if (!std.mem.eql(u8, active_id, root_id)) {
                 return error.HostAuthorityUnavailable;
             }
             const integrations = if (comptime @hasDecl(App, "snapshotMcpToolNames"))
@@ -9439,7 +9489,6 @@ test "canceling a startup session picker starts a writable fresh session" {
 }
 
 test "subagent host publication requires successful registry recovery" {
-    const subagent_child_state = @import("../subagent/child_state.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9456,7 +9505,7 @@ test "subagent host publication requires successful registry recovery" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const parent_id = app.session_persistence.writable.?.active_id;
-    const state_store = subagent_child_state.Store{ .sessions = &app.session_persistence.store.?, .parent_id = parent_id };
+    const state_store = subagent_child_state.Store{ .backend = .{ .v1 = &app.session_persistence.store.? }, .parent_id = parent_id };
     var registry = try subagent_child_state.Registry.init(alloc, parent_id);
     defer registry.deinit(alloc);
     var active = subagent_child_state.ActiveWork{

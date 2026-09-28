@@ -419,9 +419,14 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .recovery_checkpoint = .{
-            .set = setRecoveryCheckpoint,
-            .clear = clearRecoveryCheckpoint,
+        // v2 keeps no paused-response checkpoint (D31), so a v2 child, like
+        // a v2 root, offers the orchestrator no place to save one.
+        .recovery_checkpoint = switch (context.turn.loaded) {
+            .v1 => .{
+                .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
+            },
+            .v2 => null,
         },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,

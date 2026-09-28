@@ -34,6 +34,7 @@ const session_title_generation = @import("../core/session/session_title_generati
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
+const subagent_child_state = @import("../core/subagent/child_state.zig");
 const subagent_authority = @import("../core/subagent/authority.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
@@ -299,6 +300,8 @@ pub const ServerState = struct {
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     subagent_store: ?session_store.Store = null,
+    /// A v2 session's children (D22), borrowed by `subagent_host`.
+    subagent_v2_children: ?*subagent_child_state.V2Children = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     /// Open for the whole connection when sessions are on v2.
     sessions_v2: ?session_adapter.Store = null,
@@ -687,10 +690,7 @@ fn destroyActiveSession(state: *ServerState) void {
 pub fn enableSubagentHost(state: *ServerState) void {
     disableSubagentHost(state);
     const active = if (state.active_session) |*session| session else return;
-    if (active.v2 != null) {
-        debug_trace.logf("acp", "event=sessions_v2_subagents_off session={s}", .{active.session_id});
-        return;
-    }
+    if (active.v2) |v2| return enableSubagentHostV2(state, active, v2);
     if (active.writable == null) return;
     state.subagent_store = session_store.Store.init(state.alloc, state.workspace_root) catch |err| {
         debug_trace.logf("acp", "subagent host store unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
@@ -708,6 +708,28 @@ pub fn enableSubagentHost(state: *ServerState) void {
         state.subagent_store = null;
         return;
     };
+}
+
+/// Subagents on v2 keep their state in the session's log (D22). A host that
+/// cannot start leaves them off and says why, as on v1.
+fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *session_adapter.Session) void {
+    const children = state.alloc.create(subagent_child_state.V2Children) catch |err| {
+        debug_trace.logf("acp", "subagent host unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
+        return;
+    };
+    children.* = subagent_child_state.V2Children.init(state.alloc, v2, active.workspace_root);
+    state.subagent_host = subagent_tool_host.Runtime.createV2(
+        state.alloc,
+        children,
+        .{ .context = state, .resolve_fn = resolveSubagentAuthority },
+        .{ .context = state, .run_fn = prompt_handler.runSubagentChild },
+    ) catch |err| {
+        debug_trace.logf("acp", "subagent host unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
+        children.deinit();
+        state.alloc.destroy(children);
+        return;
+    };
+    state.subagent_v2_children = children;
 }
 
 fn resolveSubagentAuthority(
@@ -767,10 +789,17 @@ fn resolveSubagentAuthority(
     );
 }
 
+/// Joins the child threads before the session they append to can close
+/// (`tla/Wiring.tla` ParentOutlivesChildren).
 pub fn disableSubagentHost(state: *ServerState) void {
     if (state.subagent_host) |host| {
         host.deinit();
         state.subagent_host = null;
+    }
+    if (state.subagent_v2_children) |children| {
+        children.deinit();
+        state.alloc.destroy(children);
+        state.subagent_v2_children = null;
     }
     if (state.subagent_store) |*store| {
         store.deinit(state.alloc);

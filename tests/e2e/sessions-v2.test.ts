@@ -20,6 +20,7 @@ import {
   FAKE_GATEWAY_MODEL,
   type FakeGatewayOptions,
   fakeGatewayFinalText,
+  fakeGatewayToolCall,
   fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
@@ -636,13 +637,13 @@ function replyToLatest(pairs: [string, string | null][], held?: () => void, opti
   }, options);
 }
 
-async function startApp(fixture: Fixture, gateway: any, args: string[], waitForComposer = true) {
+async function startApp(fixture: Fixture, gateway: any, args: string[], waitForComposer = true, extraEnv: Record<string, string> = {}) {
   const stderrPath = join(fixture.root, "stderr.log");
   writeFileSync(stderrPath, "");
   const session = await TmuxSession.create({
     cmd: `${FX_BIN} --sessions-v2 ${args.join(" ")}`.trim(),
     cwd: fixture.workspace,
-    env: { ...env(fixture, gateway, false), NO_COLOR: "1" },
+    env: { ...env(fixture, gateway, false), NO_COLOR: "1", ...extraEnv },
     stderrPath,
   });
   if (waitForComposer) await session.waitForComposer(TIMEOUT);
@@ -1458,3 +1459,240 @@ test.skipIf(!tmuxAvailable())("ACP load after a compaction shows every earlier t
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 4);
+
+/// The parent's lines about its children, with fx's data parsed.
+function childLines(fixture: Fixture, id: string): any[] {
+  return (logLines(fixture, id) as any[])
+    .filter((line) => line.kind === "child_spawned" || line.kind === "child_finished")
+    .map((line) => ({ ...line, data: typeof line.data === "string" ? JSON.parse(line.data) : line.data }));
+}
+
+/// A child's requests never offer the subagent tool, so they tell apart.
+const isChildRequest = (body: string) => !body.includes('"name":"subagent"');
+
+test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in the parent's log", async () => {
+  const fixture = createFixture("fx-v2-subagent-run-");
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_ANSWER_5521");
+    if (body.includes("CHILD_ANSWER_5521")) return fakeGatewayFinalText("PARENT_DONE");
+    return fakeGatewayToolCall("delegate-run", "subagent", { request: { action: "run", task: "Report the child marker." } });
+  }, { classifierDecision: "clear" });
+  try {
+    // A subagent run prints its progress on stderr.
+    const result = await ask(fixture, gateway, ["Delegate the marker report."]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    const output = JSON.parse(result.stdout);
+    expect(output.output).toBe("PARENT_DONE");
+    const id = output.session_id;
+    const lines = childLines(fixture, id);
+    expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([["child_spawned", null], ["child_finished", "ok"]]);
+    const childId = lines[0].child;
+    expect(lines[1].child).toBe(childId);
+    expect(lines[1].work_id).toBe(lines[0].work_id);
+    expect(lines[0].data.agent ?? null).toBe(null);
+    expect(lines[0].data.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+
+    // The child's own log names its parent and holds its answer.
+    const child = logLines(fixture, childId) as any[];
+    expect(child[0].kind).toBe("session_created");
+    expect(child[0].role).toBe("child");
+    expect(child[0].parent).toBe(id);
+    expect(JSON.stringify(child)).toContain("CHILD_ANSWER_5521");
+    expectWholeLog(fixture, id);
+    expectWholeLog(fixture, childId);
+    // No v1 subagent files: the parent's log is the record (D22).
+    expectNoV1Sessions(fixture);
+    expect(existsSync(join(fixture.home, ".fx", "session-files", id, "subagent"))).toBe(false);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("a named subagent keeps its id, history and instructions across fx ask runs", async () => {
+  const fixture = createFixture("fx-v2-subagent-named-");
+  const childBodies: string[] = [];
+  let parentRequests = 0;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) {
+      childBodies.push(body);
+      return fakeGatewayFinalText(childBodies.length === 1 ? "REVIEW_ONE" : "REVIEW_TWO");
+    }
+    parentRequests += 1;
+    switch (parentRequests) {
+      case 1:
+        return fakeGatewayToolCall("delegate-one", "subagent", { request: { action: "message", agent: "reviewer", message: "Review round one.", instructions: "Follow REVIEWER_RULES." } });
+      case 3:
+        return fakeGatewayToolCall("delegate-two", "subagent", { request: { action: "message", agent: "reviewer", message: "Review round two." } });
+      default:
+        return fakeGatewayFinalText(parentRequests === 2 ? "FIRST_DONE" : "SECOND_DONE");
+    }
+  }, { classifierDecision: "clear" });
+  try {
+    const first = await ask(fixture, gateway, ["First review."]);
+    expect(first.code).toBe(0);
+    expect(JSON.parse(first.stdout).output).toBe("FIRST_DONE");
+    const id = JSON.parse(first.stdout).session_id;
+    const second = await ask(fixture, gateway, ["--resume-id", id, "Second review."]);
+    expect(second.code).toBe(0);
+    expect(second.stderr).not.toContain("panic");
+    expect(JSON.parse(second.stdout).output).toBe("SECOND_DONE");
+
+    const lines = childLines(fixture, id);
+    expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
+      ["child_spawned", null], ["child_finished", "ok"], ["child_spawned", null], ["child_finished", "ok"],
+    ]);
+    expect(new Set(lines.map((line) => line.child)).size).toBe(1);
+    expect(lines[0].data.agent).toBe("reviewer");
+    expect(lines[2].data.agent).toBe("reviewer");
+    expect(lines[2].work_id).not.toBe(lines[0].work_id);
+
+    // The second round continues the same child: its first turn and its
+    // instructions, kept in the child's own prefs (D34), reach the model.
+    expect(childBodies).toHaveLength(2);
+    expect(childBodies[0]).toContain("REVIEWER_RULES");
+    expect(childBodies[1]).toContain("REVIEWER_RULES");
+    expect(childBodies[1]).toContain("Review round one.");
+    expect(childBodies[1]).toContain("REVIEW_ONE");
+    const childId = lines[0].child;
+    const child = logLines(fixture, childId);
+    expect(shape(child).filter((kind) => kind === "turn_committed").length).toBe(2);
+    expectWholeLog(fixture, id);
+    expectWholeLog(fixture, childId);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a crash while a named subagent works records it lost, and its next message starts it fresh under its id (D33)", async () => {
+  const fixture = createFixture("fx-v2-subagent-lost-");
+  let held: () => void = () => {};
+  const childHeld = new Promise<void>((resolve) => (held = resolve));
+  let phase: "crash" | "again" = "crash";
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (isChildRequest(body)) {
+      if (phase === "crash") {
+        held();
+        return new Promise<Response>(() => {});
+      }
+      return fakeGatewayFinalText("FRESH_CHILD_ANSWER");
+    }
+    if (body.includes("FRESH_CHILD_ANSWER")) return fakeGatewayFinalText("AFTER_LOST_DONE");
+    return fakeGatewayToolCall(phase === "crash" ? "delegate-lost" : "delegate-again", "subagent", {
+      request: { action: "message", agent: "worker", message: phase === "crash" ? "Start the long job." : "Start it again." },
+    });
+  }, { classifierDecision: "clear" });
+  try {
+    const { child, exited } = spawnAsk(fixture, gateway, ["Delegate the long job."]);
+    await childHeld;
+    const id = onlySession(fixture);
+    await waitForLog(fixture, id, "child_spawned");
+    child.kill("SIGKILL");
+    await exited;
+
+    phase = "again";
+    const resumed = await ask(fixture, gateway, ["--resume-id", id, "Try the job again."]);
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).not.toContain("panic");
+    expect(JSON.parse(resumed.stdout).output).toBe("AFTER_LOST_DONE");
+
+    // The reopen recorded the unstarted work as lost; the next message is
+    // new work for the same child, whose first turn creates its log.
+    const lines = childLines(fixture, id);
+    expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
+      ["child_spawned", null], ["child_finished", "lost"], ["child_spawned", null], ["child_finished", "ok"],
+    ]);
+    expect(new Set(lines.map((line) => line.child)).size).toBe(1);
+    expect(lines[2].work_id).not.toBe(lines[0].work_id);
+    const childId = lines[0].child;
+    const childLog = JSON.stringify(logLines(fixture, childId));
+    expect(childLog).toContain("Start it again.");
+    expect(childLog).not.toContain("Start the long job.");
+    expectWholeLog(fixture, id);
+    expectWholeLog(fixture, childId);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+/// Saved root sessions: a child's folder sits beside its parent's.
+function rootSessions(fixture: Fixture): string[] {
+  return savedSessions(fixture).filter((id) => (logLines(fixture, id)[0] as any).role !== "child");
+}
+
+test.skipIf(!tmuxAvailable())("the interactive app runs a subagent on v2 and records it in the session's log", async () => {
+  const fixture = createFixture("fx-v2-app-subagent-");
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText("APP_CHILD_ANSWER");
+    if (body.includes("APP_CHILD_ANSWER")) return fakeGatewayFinalText("APP_PARENT_DONE");
+    return fakeGatewayToolCall("app-delegate", "subagent", { request: { action: "run", task: "Report from the app child." } });
+  }, { classifierDecision: "clear" });
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
+    await app.session.sendText("Delegate from the app.");
+    await scrollbackContains(app.session, "APP_PARENT_DONE");
+    await app.session.waitForComposer(TIMEOUT);
+    await quitApp(app);
+
+    const roots = rootSessions(fixture);
+    expect(roots).toHaveLength(1);
+    const id = roots[0]!;
+    const lines = childLines(fixture, id);
+    expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([["child_spawned", null], ["child_finished", "ok"]]);
+    const childId = lines[0].child;
+    const child = logLines(fixture, childId) as any[];
+    expect(child[0].role).toBe("child");
+    expect(child[0].parent).toBe(id);
+    expect(JSON.stringify(child)).toContain("APP_CHILD_ANSWER");
+    expectWholeLog(fixture, id);
+    expectWholeLog(fixture, childId);
+    expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP runs a subagent on v2, and load replays the delegation", async () => {
+  const fixture = createFixture("fx-v2-acp-subagent-");
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) return fakeGatewayFinalText("ACP_CHILD_ANSWER");
+    if (body.includes("ACP_CHILD_ANSWER")) return fakeGatewayFinalText("ACP_PARENT_DONE");
+    return fakeGatewayToolCall("acp-delegate", "subagent", { request: { action: "run", task: "Report from the ACP child." } });
+  }, { classifierDecision: "clear" });
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    const prompted = await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Delegate over ACP.") });
+    expect(prompted.stopReason).toBe("end_turn");
+    expect(client.texts("agent_message_chunk")).toContain("ACP_PARENT_DONE");
+    expect(await client.close()).toBe(0);
+
+    const lines = childLines(fixture, id);
+    expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([["child_spawned", null], ["child_finished", "ok"]]);
+    const childId = lines[0].child;
+    expect((logLines(fixture, childId)[0] as any).parent).toBe(id);
+    expect(rootSessions(fixture)).toEqual([id]);
+
+    client = await AcpRpc.start(fixture, gateway);
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    const replay = JSON.stringify(client.updates);
+    expect(replay).toContain("ACP_CHILD_ANSWER");
+    expect(client.texts("agent_message_chunk")).toEqual(["ACP_PARENT_DONE"]);
+    // Children stay out of the list.
+    const listed = await client.ok("session/list", { cwd: fixture.workspace });
+    expect(listed.sessions.map((s: any) => s.sessionId)).toEqual([id]);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectWholeLog(fixture, id);
+    expectWholeLog(fixture, childId);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);

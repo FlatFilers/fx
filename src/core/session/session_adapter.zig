@@ -63,6 +63,39 @@ pub fn enabled(flag: bool) bool {
 }
 
 pub const Host = sm.Host;
+pub const ChildOutcome = sm.Outcome;
+
+/// One child as its parent's log folds it (D22). Owns its strings.
+pub const Child = struct {
+    id: []u8,
+    /// The child's newest work item.
+    work_id: []u8,
+    /// That work item is spawned and not finished.
+    open: bool,
+    /// How the newest finished work item ended; null before the first.
+    outcome: ?ChildOutcome,
+    /// fx's data on the newest `child_spawned` and `child_finished`.
+    spawn_data: ?[]u8,
+    finish_data: ?[]u8,
+    /// Seq of the newest line about this child.
+    seq: u64,
+};
+
+pub fn freeChildren(alloc: Allocator, children: []Child) void {
+    for (children) |child| {
+        alloc.free(child.id);
+        alloc.free(child.work_id);
+        if (child.spawn_data) |data| alloc.free(data);
+        if (child.finish_data) |data| alloc.free(data);
+    }
+    alloc.free(children);
+}
+
+/// A line about a child, appended through its parent.
+pub const ChildLine = union(enum) {
+    spawned: struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null },
+    finished: struct { child: []const u8, work_id: []const u8, outcome: ChildOutcome, data: ?[]const u8 = null },
+};
 
 // ---------------------------------------------------------------------------
 // Store: one per process
@@ -106,6 +139,42 @@ pub const Store = struct {
         alloc.free(store.home);
         store.* = undefined;
     }
+
+    /// A child's whole history, read without its lock: every turn, oldest
+    /// first. Free with `types.freeHistoryTurnSlice`.
+    pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
+        var history: std.ArrayList(types.HistoryTurn) = .empty;
+        errdefer {
+            for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
+            history.deinit(alloc);
+        }
+        const Sink = struct {
+            alloc: Allocator,
+            history: *std.ArrayList(types.HistoryTurn),
+
+            fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
+                errdefer types.freeHistoryTurn(sink.alloc, value);
+                try sink.history.append(sink.alloc, value);
+            }
+        };
+        var sink: Sink = .{ .alloc = alloc, .history = &history };
+        try replay(.{ .store = store, .id = child_id }, alloc, alloc, .start, null, &sink);
+        return history.toOwnedSlice(alloc);
+    }
+
+    /// A child's newest preferences, read without its lock. Caller owns.
+    pub fn childPreferences(store: *Store, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
+        var from: sm.From = .end;
+        while (true) {
+            var page = try store.manager.read(alloc, child_id, from, .backward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                if (body == .set and body.set.key == .prefs) return decodePreferences(alloc, body.set.value);
+            }
+            from = .{ .at = page.next orelse return error.InvalidSessionFormat };
+        }
+    }
 };
 
 /// Every repair or drop the manager makes reaches the trace log.
@@ -123,6 +192,9 @@ pub const Seed = struct {
     preferences: session_codec.DurableSessionPreferences,
     language: types.ConversationLanguage,
     permission_state: session_permission_state.State,
+    /// A child's instructions, kept in its own `prefs` (D34); roots leave
+    /// it empty.
+    instructions: []const u8 = "",
 };
 
 pub const Target = union(enum) {
@@ -200,6 +272,9 @@ pub const Session = struct {
     usage_marked: bool = false,
     /// Time of the newest usage checkpoint; each new one is later.
     usage_at_ms: i64 = 0,
+    /// A child's instructions as its `prefs` hold them (D34), owned; null
+    /// for a root and for a child without any.
+    instructions: ?[]u8 = null,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -210,16 +285,80 @@ pub const Session = struct {
         errdefer handle.release();
         const self = try init(alloc, store, handle, true);
         errdefer self.destroyInner();
-        var arena = std.heap.ArenaAllocator.init(alloc);
+        try self.appendSeed(seed);
+        return self;
+    }
+
+    /// The settings a new session holds until its first turn.
+    fn appendSeed(self: *Session, seed: Seed) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         _ = try self.handle.append(&.{
-            .{ .set = .{ .key = .prefs, .value = try encodePreferences(a, seed.preferences) } },
+            .{ .set = .{ .key = .prefs, .value = try encodePreferences(a, seed.preferences, self.instructions) } },
             .{ .set = .{ .key = .permissions, .value = try session_codec.encodePermissionState(a, seed.permission_state) } },
             .{ .set = .{ .key = .language, .value = try jsonString(a, seed.language.view()) } },
         });
-        self.language = try alloc.dupe(u8, seed.language.view());
+        self.language = try self.alloc.dupe(u8, seed.language.view());
+    }
+
+    /// Opens a child of `parent_id` for one work item (D22, D34): its log
+    /// when it has one, or a new child under `child_id`, the id the parent's
+    /// `child_spawned` already names, holding `seed` until its first turn.
+    /// Instructions in `seed` replace the stored ones; empty keeps them.
+    pub fn openChild(alloc: Allocator, store: *Store, parent_id: []const u8, child_id: []const u8, workspace: []const u8, seed: Seed) !*Session {
+        io_mod.e2eFailIfDurableMutationAttempted();
+        if (store.manager.openResume(.{ .target = .{ .id = child_id }, .workspace = workspace, .host = .child, .parent = parent_id })) |handle| {
+            errdefer handle.release();
+            const self = try init(alloc, store, handle, false);
+            errdefer self.destroyInner();
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const state = try handle.state(scratch.allocator());
+            self.last_turn = state.last_turn;
+            // Every child starts with its preferences (`appendSeed`).
+            const raw = state.prefs orelse return error.InvalidSessionFormat;
+            self.instructions = try decodeInstructions(alloc, raw);
+            if (seed.instructions.len > 0 and !std.mem.eql(u8, seed.instructions, self.childInstructions())) {
+                var preferences = try decodePreferences(alloc, raw);
+                defer preferences.deinit(alloc);
+                try self.replaceInstructions(preferences, seed.instructions);
+            }
+            return self;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+        const handle = try store.manager.openNew(.{ .workspace = workspace, .host = .child, .role = .child, .parent = parent_id, .id = child_id });
+        errdefer handle.release();
+        const self = try init(alloc, store, handle, false);
+        errdefer self.destroyInner();
+        if (seed.instructions.len > 0) self.instructions = try alloc.dupe(u8, seed.instructions);
+        try self.appendSeed(seed);
         return self;
+    }
+
+    /// The session's current preferences. Caller owns.
+    pub fn currentPreferences(self: *Session, alloc: Allocator) !session_codec.DurableSessionPreferences {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const state = try self.handle.state(scratch.allocator());
+        return decodePreferences(alloc, state.prefs orelse return error.InvalidSessionFormat);
+    }
+
+    /// A child's instructions (D34), or empty. Borrowed until `close`.
+    pub fn childInstructions(self: *const Session) []const u8 {
+        return self.instructions orelse "";
+    }
+
+    fn replaceInstructions(self: *Session, preferences: session_codec.DurableSessionPreferences, text: []const u8) !void {
+        const owned = try self.alloc.dupe(u8, text);
+        errdefer self.alloc.free(owned);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        _ = try self.handle.append(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, owned) } }});
+        if (self.instructions) |old| self.alloc.free(old);
+        self.instructions = owned;
     }
 
     pub fn resumeSession(alloc: Allocator, store: *Store, target: Target, workspace: []const u8, host: Host) !*Session {
@@ -306,6 +445,7 @@ pub const Session = struct {
         self.running.deinit(alloc);
         self.turn_numbers.deinit(alloc);
         if (self.language) |value| alloc.free(value);
+        if (self.instructions) |value| alloc.free(value);
         alloc.free(self.files_path);
         alloc.destroy(self);
     }
@@ -646,7 +786,52 @@ pub const Session = struct {
     pub fn setPreferences(self: *Session, preferences: session_codec.DurableSessionPreferences) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        _ = try self.handle.append(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences) } }});
+        _ = try self.handle.append(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
+    }
+
+    // -- children (D22) ------------------------------------------------------
+
+    /// Every child of this session as its log folds them, in first-spawn
+    /// order. Free with `freeChildren`.
+    pub fn children(self: *Session, alloc: Allocator) ![]Child {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const state = try self.handle.state(scratch.allocator());
+        const out = try alloc.alloc(Child, state.children.items.len);
+        var built: usize = 0;
+        errdefer freeChildren(alloc, out[0..built]);
+        for (state.children.items) |child| {
+            const id_copy = try alloc.dupe(u8, child.id);
+            errdefer alloc.free(id_copy);
+            const work_copy = try alloc.dupe(u8, child.work_id);
+            errdefer alloc.free(work_copy);
+            const spawn_copy = if (child.spawn_data) |data| try alloc.dupe(u8, data) else null;
+            errdefer if (spawn_copy) |data| alloc.free(data);
+            out[built] = .{
+                .id = id_copy,
+                .work_id = work_copy,
+                .open = child.open,
+                .outcome = child.outcome,
+                .spawn_data = spawn_copy,
+                .finish_data = if (child.finish_data) |data| try alloc.dupe(u8, data) else null,
+                .seq = child.seq,
+            };
+            built += 1;
+        }
+        return out;
+    }
+
+    /// Appends child lines as one durable batch. The manager refuses a spawn
+    /// while that child has unfinished work, and a finish for other work.
+    pub fn appendChildLines(self: *Session, lines: []const ChildLine) !void {
+        if (lines.len == 0) return;
+        const events = try self.alloc.alloc(sm.Event, lines.len);
+        defer self.alloc.free(events);
+        for (lines, events) |line, *event| event.* = switch (line) {
+            .spawned => |spawned| .{ .child_spawned = .{ .child = spawned.child, .work_id = spawned.work_id, .data = spawned.data } },
+            .finished => |finished| .{ .child_finished = .{ .child = finished.child, .work_id = finished.work_id, .outcome = finished.outcome, .data = finished.data } },
+        };
+        _ = try self.handle.append(events);
     }
 
     pub fn setPermissions(self: *Session, state: session_permission_state.State) !void {
@@ -817,7 +1002,7 @@ pub const Session = struct {
             if (compacted.keep_from_turn) |turn| from = .{ .at = try self.findTurnStart(sa, cursor, turn) };
         }
         var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers_alloc = self.alloc, .numbers = &self.turn_numbers };
-        try self.replay(alloc, sa, from, skip_offset, &sink);
+        try replay(self.source(), alloc, sa, from, skip_offset, &sink);
         restored.history = try history.toOwnedSlice(alloc);
         return restored;
     }
@@ -856,7 +1041,7 @@ pub const Session = struct {
             }
         };
         var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
-        try self.replay(alloc, alloc, .start, null, &sink);
+        try replay(self.source(), alloc, alloc, .start, null, &sink);
     }
 
     /// The session as v1's `DurableSessionState`, for hosts that restore
@@ -929,134 +1114,150 @@ pub const Session = struct {
         }
     }
 
-    fn replay(
-        self: *Session,
-        alloc: Allocator,
-        sa: Allocator,
-        start: sm.From,
-        skip_offset: ?u64,
-        /// Takes each finished turn, even when it fails: `turn(value, number)`.
-        sink: anytype,
-    ) !void {
-        var builder = session_log.ConversationTurnBuilder.init(alloc);
-        defer builder.deinit();
-        var interrupted_item = false;
-        var superseded = false;
-        var piece_arena = std.heap.ArenaAllocator.init(alloc);
-        defer piece_arena.deinit();
-        // The open turn's calls saved as running, and the call ids its pieces
-        // already answer or hold (D28).
-        var turn_arena = std.heap.ArenaAllocator.init(alloc);
-        defer turn_arena.deinit();
-        var running: std.ArrayList(session_event.ConversationToolCall) = .empty;
-        var represented: std.ArrayList([]const u8) = .empty;
-        var from = start;
-        while (true) {
-            var page = try self.handle.read(sa, from, .forward, replay_page_lines);
-            defer page.deinit();
-            if (page.damaged) debug_trace.logf("session", "event=sessions_v2_replay_damaged session={s} dropped=lines_after_damage", .{self.id()});
-            for (page.entries) |entry| {
-                _ = piece_arena.reset(.retain_capacity);
-                const pa = piece_arena.allocator();
-                if (skip_offset) |offset| if (entry.offset == offset) continue;
-                const body = entry.body orelse continue;
-                switch (body) {
-                    .turn_started => {
-                        interrupted_item = false;
-                        superseded = false;
-                        _ = turn_arena.reset(.retain_capacity);
-                        running = .empty;
-                        represented = .empty;
-                    },
-                    .item => |piece| {
-                        if (std.mem.eql(u8, piece.type, superseded_type)) {
-                            superseded = true;
-                            continue;
-                        }
-                        const ta = turn_arena.allocator();
-                        if (std.mem.eql(u8, piece.type, running_type)) {
-                            // Kept for the whole turn: copies, not views of the page.
-                            const call = try decodePiece(ta, .tool_call, try self.pieceData(ta, piece), .alloc_always);
-                            try running.append(ta, call.tool_call);
-                            continue;
-                        }
-                        const kind = pieceKind(piece.type) orelse {
-                            debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ self.id(), piece.type });
-                            continue;
-                        };
-                        const data = try self.pieceData(pa, piece);
-                        // The builder copies what it keeps, as it does for v1's
-                        // reader, so strings may point into the page.
-                        switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
-                            .user => |value| try builder.begin(value),
-                            .assistant => |value| try builder.appendAssistant(value),
-                            .tool_call => |value| {
-                                try builder.appendToolCall(value);
-                                try represented.append(ta, try ta.dupe(u8, value.call_id));
-                            },
-                            .tool_result => |value| {
-                                try builder.appendToolResult(value);
-                                try represented.append(ta, try ta.dupe(u8, value.call_id));
-                            },
-                            .steering => |value| try builder.appendSteering(value.text),
-                            .turn_completed => |value| try sink.turn(try builder.finishAssistant(value), self.lastStarted(entry)),
-                            .interrupted => |value| {
-                                interrupted_item = true;
-                                try sink.turn(try builder.finishInterrupted(value), self.lastStarted(entry));
-                            },
-                            .context_checkpoint => return error.InvalidConversationFrame,
-                        }
-                    },
-                    .turn_interrupted => |ended| {
-                        if (superseded) {
-                            debug_trace.logf("session", "event=sessions_v2_replay_superseded session={s} turn={d} dropped=stale_turn", .{ self.id(), ended.turn });
-                            builder.deinit();
-                            builder = session_log.ConversationTurnBuilder.init(alloc);
-                            superseded = false;
-                            continue;
-                        }
-                        if (interrupted_item or builder.isIdle()) continue;
-                        var turn = try builder.finishInterrupted(.{ .reason = switch (ended.reason) {
-                            .cancel, .closed => .cancelled,
-                            .failed, .crash => .failed,
-                        } });
-                        const answered = answerRunning(alloc, &turn.interrupted, running.items, represented.items) catch |err| {
-                            types.freeHistoryTurn(alloc, turn);
-                            return err;
-                        };
-                        if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ self.id(), ended.turn, answered });
-                        try sink.turn(turn, ended.turn);
-                    },
-                    .session_created, .compacted, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
-                }
-            }
-            from = .{ .at = page.next orelse break };
-        }
-        if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{self.id()});
+    fn source(self: *Session) Source {
+        return .{ .store = self.store, .id = self.id(), .handle = self.handle };
     }
+};
 
-    fn lastStarted(self: *const Session, entry: sm.Entry) ?u64 {
-        _ = self;
-        return switch (entry.body.?) {
-            .item => |piece| piece.turn,
-            else => null,
-        };
+/// Where replay reads a log: an open session's own handle, or the store by
+/// id without a lock, as for a finished child's result.
+const Source = struct {
+    store: *Store,
+    id: []const u8,
+    handle: ?sm.Session = null,
+
+    fn read(src: Source, sa: Allocator, from: sm.From, limit: usize) !sm.Page {
+        if (src.handle) |handle| return handle.read(sa, from, .forward, limit);
+        return src.store.manager.read(sa, src.id, from, .forward, limit);
     }
 
     /// A piece's bytes, from its blob when the line holds a reference.
-    fn pieceData(self: *Session, pa: Allocator, piece: sm.Body.Piece) ![]const u8 {
+    fn pieceData(src: Source, pa: Allocator, piece: sm.Body.Piece) ![]const u8 {
         if (piece.blobs.len != 1 or !std.mem.startsWith(u8, piece.data, "{\"" ++ blob_ref_key ++ "\":")) return piece.data;
-        return self.store.manager.getBlob(pa, self.id(), piece.blobs[0]) catch |err| switch (err) {
+        return src.store.manager.getBlob(pa, src.id, piece.blobs[0]) catch |err| switch (err) {
             // A blob the log names that is gone or damaged damages the
             // session, as a bad line does (D39).
             error.NotFound, error.Corrupt => {
-                debug_trace.logf("session", "event=sessions_v2_blob_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
+                debug_trace.logf("session", "event=sessions_v2_blob_unreadable session={s} err={s}", .{ src.id, @errorName(err) });
                 return error.InvalidSessionFormat;
             },
             else => |e| return e,
         };
     }
 };
+
+fn lastStarted(entry: sm.Entry) ?u64 {
+    return switch (entry.body.?) {
+        .item => |piece| piece.turn,
+        else => null,
+    };
+}
+
+fn replay(
+    src: Source,
+    alloc: Allocator,
+    sa: Allocator,
+    start: sm.From,
+    skip_offset: ?u64,
+    /// Takes each finished turn, even when it fails: `turn(value, number)`.
+    sink: anytype,
+) !void {
+    var builder = session_log.ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    var interrupted_item = false;
+    var superseded = false;
+    var piece_arena = std.heap.ArenaAllocator.init(alloc);
+    defer piece_arena.deinit();
+    // The open turn's calls saved as running, and the call ids its pieces
+    // already answer or hold (D28).
+    var turn_arena = std.heap.ArenaAllocator.init(alloc);
+    defer turn_arena.deinit();
+    var running: std.ArrayList(session_event.ConversationToolCall) = .empty;
+    var represented: std.ArrayList([]const u8) = .empty;
+    var from = start;
+    while (true) {
+        var page = try src.read(sa, from, replay_page_lines);
+        defer page.deinit();
+        if (page.damaged) debug_trace.logf("session", "event=sessions_v2_replay_damaged session={s} dropped=lines_after_damage", .{src.id});
+        for (page.entries) |entry| {
+            _ = piece_arena.reset(.retain_capacity);
+            const pa = piece_arena.allocator();
+            if (skip_offset) |offset| if (entry.offset == offset) continue;
+            const body = entry.body orelse continue;
+            switch (body) {
+                .turn_started => {
+                    interrupted_item = false;
+                    superseded = false;
+                    _ = turn_arena.reset(.retain_capacity);
+                    running = .empty;
+                    represented = .empty;
+                },
+                .item => |piece| {
+                    if (std.mem.eql(u8, piece.type, superseded_type)) {
+                        superseded = true;
+                        continue;
+                    }
+                    const ta = turn_arena.allocator();
+                    if (std.mem.eql(u8, piece.type, running_type)) {
+                        // Kept for the whole turn: copies, not views of the page.
+                        const call = try decodePiece(ta, .tool_call, try src.pieceData(ta, piece), .alloc_always);
+                        try running.append(ta, call.tool_call);
+                        continue;
+                    }
+                    const kind = pieceKind(piece.type) orelse {
+                        debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ src.id, piece.type });
+                        continue;
+                    };
+                    const data = try src.pieceData(pa, piece);
+                    // The builder copies what it keeps, as it does for v1's
+                    // reader, so strings may point into the page.
+                    switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
+                        .user => |value| try builder.begin(value),
+                        .assistant => |value| try builder.appendAssistant(value),
+                        .tool_call => |value| {
+                            try builder.appendToolCall(value);
+                            try represented.append(ta, try ta.dupe(u8, value.call_id));
+                        },
+                        .tool_result => |value| {
+                            try builder.appendToolResult(value);
+                            try represented.append(ta, try ta.dupe(u8, value.call_id));
+                        },
+                        .steering => |value| try builder.appendSteering(value.text),
+                        .turn_completed => |value| try sink.turn(try builder.finishAssistant(value), lastStarted(entry)),
+                        .interrupted => |value| {
+                            interrupted_item = true;
+                            try sink.turn(try builder.finishInterrupted(value), lastStarted(entry));
+                        },
+                        .context_checkpoint => return error.InvalidConversationFrame,
+                    }
+                },
+                .turn_interrupted => |ended| {
+                    if (superseded) {
+                        debug_trace.logf("session", "event=sessions_v2_replay_superseded session={s} turn={d} dropped=stale_turn", .{ src.id, ended.turn });
+                        builder.deinit();
+                        builder = session_log.ConversationTurnBuilder.init(alloc);
+                        superseded = false;
+                        continue;
+                    }
+                    if (interrupted_item or builder.isIdle()) continue;
+                    var turn = try builder.finishInterrupted(.{ .reason = switch (ended.reason) {
+                        .cancel, .closed => .cancelled,
+                        .failed, .crash => .failed,
+                    } });
+                    const answered = answerRunning(alloc, &turn.interrupted, running.items, represented.items) catch |err| {
+                        types.freeHistoryTurn(alloc, turn);
+                        return err;
+                    };
+                    if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ src.id, ended.turn, answered });
+                    try sink.turn(turn, ended.turn);
+                },
+                .session_created, .compacted, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
+            }
+        }
+        from = .{ .at = page.next orelse break };
+    }
+    if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{src.id});
+}
 
 /// Whether a streamed piece is the final one. fx stamps a tool result's
 /// `created_at_ms` each time it rebuilds a turn, so that field alone may
@@ -1424,25 +1625,55 @@ fn jsonString(alloc: Allocator, value: []const u8) ![]u8 {
 
 /// v1's shape, which `session_codec.parse_preferences` reads back: effort
 /// as its label, the provider in its saved form.
-fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSessionPreferences) ![]u8 {
+/// A child's `prefs` also hold its instructions under this key (D34).
+const instructions_key = "instructions";
+
+fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSessionPreferences, instructions: ?[]const u8) ![]u8 {
     const Saved = struct {
         provider: model_provider.ProviderId,
         model: []const u8,
         effort: []const u8,
         fast_mode: bool,
     };
-    return jsonValue(alloc, Saved{
+    const saved: Saved = .{
         .provider = preferences.provider,
         .model = preferences.model,
         .effort = preferences.effort.label(),
         .fast_mode = preferences.fast_mode,
+    };
+    const text = instructions orelse return jsonValue(alloc, saved);
+    const ChildSaved = struct {
+        provider: model_provider.ProviderId,
+        model: []const u8,
+        effort: []const u8,
+        fast_mode: bool,
+        instructions: []const u8,
+    };
+    return jsonValue(alloc, ChildSaved{
+        .provider = saved.provider,
+        .model = saved.model,
+        .effort = saved.effort,
+        .fast_mode = saved.fast_mode,
+        .instructions = text,
     });
 }
 
 fn decodePreferences(alloc: Allocator, raw: []const u8) !session_codec.DurableSessionPreferences {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
+    // v1's codec knows every field but a child's instructions.
+    if (parsed.value == .object) _ = parsed.value.object.swapRemove(instructions_key);
     return session_codec.parse_preferences(alloc, parsed.value);
+}
+
+/// A child's instructions from its `prefs`, or null. Caller owns.
+fn decodeInstructions(alloc: Allocator, raw: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionFormat;
+    const value = parsed.value.object.get(instructions_key) orelse return null;
+    if (value != .string) return error.InvalidSessionFormat;
+    return try alloc.dupe(u8, value.string);
 }
 
 fn decodeLanguage(arena: Allocator, raw: []const u8) !types.ConversationLanguage {
@@ -1506,7 +1737,8 @@ test "preferences round trip through v1's decoder" {
     var model = "vendor/model-1".*;
     const efforts = [_]types.ReasoningEffort{ .auto, types.ReasoningEffort.parse("high").? };
     for (efforts) |effort| {
-        const raw = try encodePreferences(arena.allocator(), .{ .model = &model, .effort = effort, .fast_mode = true });
+        const raw = try encodePreferences(arena.allocator(), .{ .model = &model, .effort = effort, .fast_mode = true }, null);
+        try testing.expect((try decodeInstructions(testing.allocator, raw)) == null);
         var decoded = try decodePreferences(testing.allocator, raw);
         defer decoded.deinit(testing.allocator);
         try testing.expectEqualStrings("vendor/model-1", decoded.model);
@@ -1587,6 +1819,109 @@ test "a new session commits turns, and resume gives them back with its settings"
     var st = try r.handle.state(testing.allocator);
     defer st.deinit(testing.allocator);
     try testing.expectEqualStrings("\"first question\"", st.title.?);
+}
+
+test "a child's prefs keep its instructions, and v1's decoder still reads the rest (D34)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var model = "vendor/model-1".*;
+    const raw = try encodePreferences(arena.allocator(), .{ .model = &model, .effort = .auto, .fast_mode = false }, "Answer in one line.");
+    const instructions = (try decodeInstructions(testing.allocator, raw)).?;
+    defer testing.allocator.free(instructions);
+    try testing.expectEqualStrings("Answer in one line.", instructions);
+    var decoded = try decodePreferences(testing.allocator, raw);
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqualStrings("vendor/model-1", decoded.model);
+}
+
+fn childSeed(model: []u8, instructions: []const u8) Seed {
+    var seed = testSeed(model);
+    seed.instructions = instructions;
+    return seed;
+}
+
+test "a child opens under the id its parent names, and its parent folds its lines (D22, D34)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = testing.allocator;
+    var model = "test-model".*;
+    const parent = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer parent.close();
+    try parent.commitTurn(assistantTurn("delegate this", "delegated"), types.ConversationLanguage.default());
+    const child_id = "1786460757753-kid";
+    try parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w1", .data = "{\"kind\":\"persistent\"}" } }});
+
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Be brief."));
+        defer child.close();
+        try testing.expectEqualStrings(child_id, child.id());
+        try testing.expectEqualStrings("Be brief.", child.childInstructions());
+        try child.commitTurn(assistantTurn("task one", "done one"), types.ConversationLanguage.default());
+    }
+    try parent.appendChildLines(&.{.{ .finished = .{ .child = child_id, .work_id = "w1", .outcome = .ok, .data = "{}" } }});
+
+    const children = try parent.children(alloc);
+    defer freeChildren(alloc, children);
+    try testing.expectEqual(@as(usize, 1), children.len);
+    try testing.expectEqualStrings(child_id, children[0].id);
+    try testing.expectEqualStrings("w1", children[0].work_id);
+    try testing.expect(!children[0].open);
+    try testing.expectEqual(ChildOutcome.ok, children[0].outcome.?);
+    try testing.expectEqualStrings("{\"kind\":\"persistent\"}", children[0].spawn_data.?);
+    try testing.expectEqualStrings("{}", children[0].finish_data.?);
+
+    // Read by id, without the child's lock.
+    const history = try t.store.childHistory(alloc, child_id);
+    defer types.freeHistoryTurnSlice(alloc, history);
+    try testing.expectEqual(@as(usize, 1), history.len);
+    try testing.expectEqualStrings("done one", history[0].assistant.assistant);
+    var preferences = try t.store.childPreferences(alloc, child_id);
+    defer preferences.deinit(alloc);
+    try testing.expectEqualStrings("test-model", preferences.model);
+
+    // New instructions replace the stored ones; none keeps them.
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Be thorough."));
+        defer child.close();
+        try testing.expectEqualStrings("Be thorough.", child.childInstructions());
+    }
+    {
+        const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", testSeed(&model));
+        defer child.close();
+        try testing.expectEqualStrings("Be thorough.", child.childInstructions());
+        var restored = try child.restore(alloc);
+        defer restored.deinit(alloc);
+        try testing.expectEqualStrings("test-model", restored.preferences.?.model);
+        try testing.expectEqual(@as(usize, 1), restored.history.len);
+    }
+    // Children stay out of the session list.
+    var page = try t.store.manager.list(alloc, .all, null, 10);
+    defer page.deinit();
+    try testing.expectEqual(@as(usize, 1), page.items.len);
+}
+
+test "the manager guards child lines, and a child without a log reopens under its id (D22, D34)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const alloc = testing.allocator;
+    var model = "test-model".*;
+    const parent = try Session.create(alloc, &t.store, "/w", .ask, testSeed(&model));
+    defer parent.close();
+    try parent.commitTurn(assistantTurn("delegate", "ok"), types.ConversationLanguage.default());
+    const child_id = "1786460757753-lost";
+    try parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w1" } }});
+    try testing.expectError(error.InvalidTransition, parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "w2" } }}));
+    try testing.expectError(error.InvalidTransition, parent.appendChildLines(&.{.{ .finished = .{ .child = child_id, .work_id = "w9", .outcome = .ok } }}));
+
+    // Closed before its first turn, as a crash would leave it: nothing on disk.
+    (try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Stay short."))).close();
+    try testing.expectError(error.NotFound, t.store.childHistory(alloc, child_id));
+    const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", testSeed(&model));
+    defer child.close();
+    try testing.expectEqualStrings(child_id, child.id());
+    try testing.expectEqualStrings("", child.childInstructions());
 }
 
 fn countItems(manager: *sm.Manager, id: []const u8, item_type: []const u8) !usize {
