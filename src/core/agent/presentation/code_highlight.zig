@@ -296,15 +296,18 @@ pub fn highlightDiff(
     return styled.toOwnedSlice(alloc);
 }
 
+const block_comment_starts = [_][]const u8{ "", "/*", "<!--", "<#", "--[[", "{-" };
+const block_comment_ends = [_][]const u8{ "", "*/", "-->", "#>", "]]", "-}" };
+
 fn blockCommentEnd(source: []const u8, index: usize, kind: languages.BlockComments) ?usize {
-    return switch (kind) {
-        .none => null,
-        .slash_star => delimitedCommentEnd(source, index, "/*", "*/"),
-        .html => delimitedCommentEnd(source, index, "<!--", "-->"),
-        .powershell => delimitedCommentEnd(source, index, "<#", "#>"),
-        .lua => delimitedCommentEnd(source, index, "--[[", "]]"),
-        .haskell => delimitedCommentEnd(source, index, "{-", "-}"),
-    };
+    const delimiter_index = @intFromEnum(kind);
+    if (delimiter_index == 0) return null;
+    return delimitedCommentEnd(
+        source,
+        index,
+        block_comment_starts[delimiter_index],
+        block_comment_ends[delimiter_index],
+    );
 }
 
 fn delimitedCommentEnd(source: []const u8, index: usize, start: []const u8, end: []const u8) ?usize {
