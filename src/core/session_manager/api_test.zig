@@ -69,6 +69,12 @@ const Fixture = struct {
 
 const piece: api.Event = .{ .item = .{ .type = "assistant", .data = "{\"text\":\"hi\"}" } };
 
+/// Returns once the wall clock shows a later millisecond than when called.
+fn nextMillisecond() !void {
+    const start = std.Io.Timestamp.now(io, .real).toMilliseconds();
+    while (std.Io.Timestamp.now(io, .real).toMilliseconds() == start) try io.sleep(.fromMilliseconds(1), .awake);
+}
+
 fn listIds(m: *api.Manager, filter: api.Filter) ![][]const u8 {
     var page = try m.list(gpa, filter, null, 100);
     defer page.deinit();
@@ -150,6 +156,25 @@ test "a session's whole life through the API" {
     try testing.expectEqual(@as(u64, 0), verified.bad_snapshots);
 }
 
+test "sessions tied on their update time resolve as the list sorts them (D11)" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const m = f.manager;
+    // Written in the same millisecond, as a fast machine does.
+    for ([_][]const u8{ "1786460757753-tie-f", "1786460757753-tie-c", "1786460757753-tie-e", "1786460757753-tie-a", "1786460757753-tie-d", "1786460757753-tie-b" }) |id| {
+        const s = try m.openImport(.{ .id = id, .workspace = "/w", .host = .app, .created_ms = 1000 });
+        _ = try s.appendAt(&.{ .turn_started, .turn_committed }, 2000);
+        s.release();
+    }
+    const ids = try listIds(m, .all);
+    defer freeIds(ids);
+    try testing.expectEqualStrings("1786460757753-tie-a", ids[0]);
+    const last = try m.openResume(.{ .target = .last, .workspace = "/w", .host = .ask });
+    defer last.release();
+    try testing.expectEqualStrings(ids[0], last.id());
+}
+
 test "-c and --resume last stay distinct (D11)" {
     var f: Fixture = undefined;
     try f.init();
@@ -169,8 +194,10 @@ test "-c and --resume last stay distinct (D11)" {
     _ = try other.append(&.{ .turn_started, .turn_committed });
     other.release();
 
-    // The app opens a; then ask and acp open b.
+    // The app opens a; then ask and acp open b, a millisecond later at
+    // least, so b is the newer one however fast this runs.
     (try m.openResume(.{ .target = .{ .id = a_id }, .workspace = "/w", .host = .app })).release();
+    try nextMillisecond();
     (try m.openResume(.{ .target = .{ .id = b_id }, .workspace = "/w", .host = .ask })).release();
     (try m.openResume(.{ .target = .{ .id = b_id }, .workspace = "/w", .host = .acp })).release();
 

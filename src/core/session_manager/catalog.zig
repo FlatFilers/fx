@@ -344,7 +344,10 @@ pub const Catalog = struct {
                     .last_opened => |host| entry.summary.opened_ms[@intFromEnum(host)],
                 };
                 if (key == 0 and target == .last_opened) continue;
-                if (best == null or key > best_key) {
+                // A tie resolves as `list` sorts: the smaller id first (D11).
+                const better = best == null or key > best_key or
+                    (key == best_key and std.mem.lessThan(u8, entry.summary.id, best.?.id));
+                if (better) {
                     best = &entry.summary;
                     best_key = key;
                 }
