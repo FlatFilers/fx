@@ -10,6 +10,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
@@ -3532,11 +3533,15 @@ describe("acp: model-independent", () => {
           "call_http_auth",
           `${MODERN_HTTP_TOOL_RESULT}:authenticated`,
         );
-        const session = readFileSync(
-          join(root.home, ".fx", "sessions", sessionId, "session.json"),
-          "utf8",
-        );
-        expect(session).not.toContain(bearer);
+        // Every saved file, on either session backend: the scan must see the
+        // saved tool result, and nothing may hold the credential.
+        const fxDir = join(root.home, ".fx");
+        const saved = (readdirSync(fxDir, { recursive: true }) as string[])
+          .map((name) => join(fxDir, name))
+          .filter((path) => statSync(path).isFile())
+          .map((path) => readFileSync(path, "utf8"));
+        expect(saved.some((text) => text.includes(`${MODERN_HTTP_TOOL_RESULT}:authenticated`))).toBe(true);
+        for (const text of saved) expect(text).not.toContain(bearer);
         expect(client.stderr).not.toContain(bearer);
       } finally {
         await client?.close();

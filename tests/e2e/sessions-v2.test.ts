@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
+  type FakeGatewayOptions,
   fakeGatewayFinalText,
   fakeShellRun,
   startDynamicFakeGateway,
@@ -622,7 +623,7 @@ test("a full disk fails the turn cleanly and the session resumes after", async (
 /// Answers the newest prompt in the request, in the order given: every
 /// request carries the earlier prompts, and a fresh session also asks for a
 /// title. A null answer holds that request open and calls `held`.
-function replyToLatest(pairs: [string, string | null][], held?: () => void) {
+function replyToLatest(pairs: [string, string | null][], held?: () => void, options: FakeGatewayOptions = {}) {
   return startDynamicFakeGateway(async (body) => {
     for (let index = pairs.length - 1; index >= 0; index -= 1) {
       const [prompt, answer] = pairs[index]!;
@@ -632,7 +633,7 @@ function replyToLatest(pairs: [string, string | null][], held?: () => void) {
       return new Promise<Response>(() => {});
     }
     return fakeGatewayFinalText("UNEXPECTED_REQUEST");
-  });
+  }, options);
 }
 
 async function startApp(fixture: Fixture, gateway: any, args: string[], waitForComposer = true) {
@@ -841,6 +842,585 @@ test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as 
     expectNoV1Sessions(fixture);
   } finally {
     if (contender) await contender.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+// ---------------------------------------------------------------------------
+// ACP
+
+/// A minimal ACP client: requests by id, every `session/update` kept,
+/// permission requests allowed once.
+class AcpRpc {
+  private proc: ReturnType<typeof spawn>;
+  private buffer = "";
+  private nextId = 1;
+  private pending = new Map<number, (msg: any) => void>();
+  readonly updates: any[] = [];
+  readonly exited: Promise<number | null>;
+
+  constructor(fixture: Fixture, gateway: any, extraEnv: Record<string, string | undefined> = {}) {
+    this.proc = spawn(FX_BIN, ["acp"], {
+      cwd: fixture.workspace,
+      env: { ...process.env, ...env(fixture, gateway), ...extraEnv } as Record<string, string>,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.exited = new Promise((resolve) => this.proc.on("exit", (code) => resolve(code)));
+    this.proc.stdout!.on("data", (chunk: Buffer) => {
+      this.buffer += chunk.toString();
+      let newline: number;
+      while ((newline = this.buffer.indexOf("\n")) >= 0) {
+        const line = this.buffer.slice(0, newline);
+        this.buffer = this.buffer.slice(newline + 1);
+        if (line.trim()) this.onMessage(JSON.parse(line));
+      }
+    });
+  }
+
+  static async start(fixture: Fixture, gateway: any, extraEnv: Record<string, string | undefined> = {}) {
+    const client = new AcpRpc(fixture, gateway, extraEnv);
+    const initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    if (initialized.error) throw new Error(JSON.stringify(initialized.error));
+    return client;
+  }
+
+  private onMessage(msg: any) {
+    if (msg.method === "session/update") {
+      this.updates.push(msg.params);
+    } else if (msg.method !== undefined && msg.id !== undefined) {
+      const result = msg.method === "session/request_permission" ? { outcome: { outcome: "selected", optionId: "allow_once" } } : {};
+      this.proc.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\n");
+    } else if (msg.id !== undefined && this.pending.has(msg.id)) {
+      this.pending.get(msg.id)!(msg);
+      this.pending.delete(msg.id);
+    }
+  }
+
+  /// Resolves with the whole response, `error` included.
+  request(method: string, params: object, timeoutMs = 20_000): Promise<any> {
+    const id = this.nextId++;
+    this.proc.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${method} timed out`)), timeoutMs);
+      this.pending.set(id, (msg) => {
+        clearTimeout(timer);
+        resolve(msg);
+      });
+    });
+  }
+
+  async ok(method: string, params: object) {
+    const response = await this.request(method, params);
+    if (response.error) throw new Error(`${method}: ${JSON.stringify(response.error)}`);
+    return response.result;
+  }
+
+  /// Text of the updates of one kind, in order.
+  texts(kind: "user_message_chunk" | "agent_message_chunk") {
+    return this.updates.filter((u) => u.update?.sessionUpdate === kind).map((u) => u.update.content?.text ?? "");
+  }
+
+  async close() {
+    this.proc.stdin!.end();
+    const exited = await Promise.race([this.exited, Bun.sleep(10_000).then(() => "timeout")]);
+    if (exited === "timeout") this.proc.kill("SIGKILL");
+    return exited;
+  }
+
+  kill() {
+    this.proc.kill("SIGKILL");
+    return this.exited;
+  }
+}
+
+function acpPrompt(text: string) {
+  return { prompt: [{ type: "text", text }] };
+}
+
+test("ACP keeps a session once prompted, lists it, and loads every turn after a restart", async () => {
+  const fixture = createFixture("fx-v2-acp-");
+  const gateway = replyToLatest([
+    ["First ACP question.", "ACP_ONE"],
+    ["Second ACP question.", "ACP_TWO"],
+    ["Third ACP question.", "ACP_THREE"],
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    // Never prompted, so never written (D24).
+    const unused = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    expect(id).not.toBe(unused);
+    expect((await client.ok("session/prompt", { sessionId: id, ...acpPrompt("First ACP question.") })).stopReason).toBe("end_turn");
+    expect((await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Second ACP question.") })).stopReason).toBe("end_turn");
+    const listed = await client.ok("session/list", { cwd: fixture.workspace });
+    expect(listed.sessions.map((s: any) => s.sessionId)).toEqual([id]);
+    expect(listed.sessions[0].cwd).toBe(fixture.workspace);
+    expect(Date.parse(listed.sessions[0].updatedAt)).toBeGreaterThan(0);
+    expect((await client.ok("session/list", { cwd: join(fixture.root, "elsewhere") })).sessions).toEqual([]);
+    // v1 matches the folder after trailing slashes too.
+    expect((await client.ok("session/list", { cwd: `${fixture.workspace}/` })).sessions.map((s: any) => s.sessionId)).toEqual([id]);
+    expect(await client.close()).toBe(0);
+    expect(existsSync(join(v2Root(fixture), unused))).toBe(false);
+
+    client = await AcpRpc.start(fixture, gateway);
+    const missing = await client.request("session/load", { sessionId: unused, cwd: fixture.workspace, mcpServers: [] });
+    expect(missing.error?.message).toBe("Session not found");
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(client.texts("user_message_chunk")).toEqual(["First ACP question.", "Second ACP question."]);
+    expect(client.texts("agent_message_chunk")).toEqual(["ACP_ONE", "ACP_TWO"]);
+    // Resume attaches without replaying.
+    const replayed = client.updates.length;
+    await client.ok("session/resume", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(client.updates.slice(replayed).filter((u) => u.update?.sessionUpdate === "user_message_chunk")).toEqual([]);
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Third ACP question.") });
+    const body = gateway.requests.at(-1)!.body;
+    expect(body).toContain("ACP_ONE");
+    expect(body).toContain("ACP_TWO");
+    expect(await client.close()).toBe(0);
+    client = undefined;
+
+    const lines = logLines(fixture, id);
+    expect(lines.filter((line) => line.kind === "turn_committed").length).toBe(3);
+    expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test("ACP killed in the middle of a prompt loads with that turn interrupted", async () => {
+  const fixture = createFixture("fx-v2-acp-kill-");
+  let held: () => void = () => {};
+  const holding = new Promise<void>((resolve) => (held = resolve));
+  const gateway = replyToLatest(
+    [
+      ["Before the ACP kill.", "ACP_BEFORE"],
+      ["Held ACP question.", null],
+      ["After the ACP kill.", "ACP_AFTER"],
+    ],
+    () => held(),
+  );
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Before the ACP kill.") });
+    void client.request("session/prompt", { sessionId: id, ...acpPrompt("Held ACP question.") }).catch(() => {});
+    await holding;
+    await waitForLog(fixture, id, "Held ACP question.");
+    await client.kill();
+
+    client = await AcpRpc.start(fixture, gateway);
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(client.texts("user_message_chunk")).toEqual(["Before the ACP kill.", "Held ACP question."]);
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("After the ACP kill.") });
+    expect(gateway.requests.at(-1)!.body).toContain("ACP_BEFORE");
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    const lines = logLines(fixture, id);
+    expect(lines.filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+    expectWholeLog(fixture, id);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP saves a model change with the session and loads it back", async () => {
+  const fixture = createFixture("fx-v2-acp-prefs-");
+  const gateway = replyToLatest([["Pick a model.", "ACP_MODEL"]]);
+  // A process-wide model would win over the saved one on load, as on v1.
+  const noModel = { FX_MODEL: undefined };
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway, noModel);
+    const created = await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] });
+    const id = created.sessionId;
+    const current = created.configOptions.find((option: any) => option.id === "model").currentValue;
+    const other = "openai/gpt-5-mini";
+    expect(other).not.toBe(current);
+    const changed = await client.ok("session/set_config_option", { sessionId: id, configId: "model", value: other });
+    expect(changed.configOptions.find((option: any) => option.id === "model").currentValue).toBe(other);
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Pick a model.") });
+    expect(gateway.requests.at(-1)!.headers.get("ai-language-model-id")).toBe(other);
+    expect(await client.close()).toBe(0);
+
+    client = await AcpRpc.start(fixture, gateway, noModel);
+    const loaded = await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(loaded.configOptions.find((option: any) => option.id === "model").currentValue).toBe(other);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expect(logLines(fixture, id).filter((line) => line.kind === "set" && line.key === "prefs").length).toBeGreaterThan(1);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP keeps a tool result as a side file, and load replays the call with its result", async () => {
+  const fixture = createFixture("fx-v2-acp-tool-");
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes("After the ACP tool.")) return fakeGatewayFinalText("ACP_AFTER_TOOL");
+    if (body.includes("Run an ACP tool.") && body.includes("ACP_TOOL_OUTPUT_77")) return fakeGatewayFinalText("ACP_TOOL_DONE");
+    if (body.includes("Run an ACP tool.")) return fakeShellRun("acp-tool-1", "echo ACP_TOOL_OUTPUT_77");
+    return fakeGatewayFinalText("ACP_OTHER");
+  });
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Run an ACP tool.") });
+    // session/close ends the session; it stays saved.
+    await client.ok("session/close", { sessionId: id });
+    expect(await client.close()).toBe(0);
+    expect(readdirSync(join(fixture.home, ".fx", "session-files", id)).length).toBeGreaterThan(0);
+
+    client = await AcpRpc.start(fixture, gateway);
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    const calls = client.updates.filter((u) => u.update?.sessionUpdate === "tool_call" && u.update.toolCallId === "acp-tool-1");
+    expect(calls.length).toBe(1);
+    const results = client.updates.filter((u) => u.update?.sessionUpdate === "tool_call_update" && u.update.toolCallId === "acp-tool-1");
+    // The replay sends the stored preview, as on v1; the model gets the
+    // whole output back from the side file (below).
+    expect(results.length).toBe(1);
+    expect(results[0].update.status).toBe("completed");
+    expect(results[0].update.content[0].content.text.length).toBeGreaterThan(0);
+    expect(client.texts("agent_message_chunk")).toEqual(["ACP_TOOL_DONE"]);
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("After the ACP tool.") });
+    expect(gateway.requests.at(-1)!.body).toContain("ACP_TOOL_OUTPUT_77");
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP lists more than a page of sessions with a cursor, newest first, each once", async () => {
+  const fixture = createFixture("fx-v2-acp-page-");
+  const gateway = startDynamicFakeGateway(async () => fakeGatewayFinalText("ACP_PAGE"));
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const created: string[] = [];
+    for (let index = 0; index < 101; index += 1) {
+      const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+      await client.ok("session/prompt", { sessionId: id, ...acpPrompt(`Page session ${index}.`) });
+      created.push(id);
+    }
+    const first = await client.ok("session/list", {});
+    expect(first.sessions.length).toBe(100);
+    expect(typeof first.nextCursor).toBe("string");
+    const second = await client.ok("session/list", { cursor: first.nextCursor });
+    expect(second.nextCursor).toBeUndefined();
+    const listed = [...first.sessions, ...second.sessions];
+    expect(listed.map((s: any) => s.sessionId).sort()).toEqual([...created].sort());
+    const times = listed.map((s: any) => Date.parse(s.updatedAt));
+    for (let index = 1; index < times.length; index += 1) expect(times[index - 1]).toBeGreaterThanOrEqual(times[index]);
+    const bad = await client.request("session/list", { cursor: "not-a-cursor" });
+    expect(bad.error?.message).toBe("Invalid params");
+    expect(await client.close()).toBe(0);
+    client = undefined;
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+/// A catalog whose model can see images, so fx sends them to it as they are.
+const VISION_MODEL: FakeGatewayOptions = {
+  models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"] }],
+};
+const PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+function imageFiles(fixture: Fixture, id: string) {
+  const dir = join(fixture.home, ".fx", "session-files", id, "images");
+  return existsSync(dir) ? readdirSync(dir) : [];
+}
+
+test("fx ask keeps an image of a new session with its side files, and resume sends it again", async () => {
+  const fixture = createFixture("fx-v2-image-");
+  const gateway = replyToLatest([
+    ["Describe the image.", "IMAGE_SEEN"],
+    ["And again.", "IMAGE_AGAIN"],
+  ], undefined, VISION_MODEL);
+  try {
+    const image = join(fixture.workspace, "dot.png");
+    writeFileSync(image, Buffer.from(PNG_1X1, "base64"));
+    const created = await ask(fixture, gateway, ["--image", image, "Describe the image."]);
+    expect(created.code).toBe(0);
+    expect(JSON.parse(created.stdout).output).toBe("IMAGE_SEEN");
+    const id = JSON.parse(created.stdout).session_id;
+    expect(imageFiles(fixture, id).length).toBe(1);
+    const resumed = await ask(fixture, gateway, ["--resume-id", id, "And again."]);
+    expect(resumed.code).toBe(0);
+    // The prompt text says "image" too, so match the part's media type.
+    expect(gateway.requests[0]!.body).toContain("image/png");
+    expect(gateway.requests.at(-1)!.body).toContain("image/png");
+    expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("ACP keeps an image prompt and replays it with the image on load", async () => {
+  const fixture = createFixture("fx-v2-acp-image-");
+  const gateway = replyToLatest([["Describe this ACP image.", "ACP_IMAGE_SEEN"]], undefined, VISION_MODEL);
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    const prompted = await client.ok("session/prompt", {
+      sessionId: id,
+      prompt: [
+        { type: "text", text: "Describe this ACP image." },
+        { type: "image", data: PNG_1X1, mimeType: "image/png" },
+      ],
+    });
+    expect(prompted.stopReason).toBe("end_turn");
+    expect(imageFiles(fixture, id).length).toBe(1);
+    expect(await client.close()).toBe(0);
+
+    client = await AcpRpc.start(fixture, gateway);
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    const images = client.updates.filter((u) => u.update?.sessionUpdate === "user_message_chunk" && u.update.content?.type === "image");
+    expect(images.length).toBe(1);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectWholeLog(fixture, id);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("a second ACP process is refused an open v2 session, then loads it once the owner exits", async () => {
+  const fixture = createFixture("fx-v2-acp-busy-");
+  const gateway = replyToLatest([["Hold this session.", "ACP_OWNER"]]);
+  let owner: AcpRpc | undefined;
+  let other: AcpRpc | undefined;
+  try {
+    owner = await AcpRpc.start(fixture, gateway);
+    const id = (await owner.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await owner.ok("session/prompt", { sessionId: id, ...acpPrompt("Hold this session.") });
+    other = await AcpRpc.start(fixture, gateway);
+    const refused = await other.request("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(refused.error?.message).toBe("Session is busy");
+    expect(await owner.close()).toBe(0);
+    owner = undefined;
+    await other.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(other.texts("agent_message_chunk")).toEqual(["ACP_OWNER"]);
+    expect(await other.close()).toBe(0);
+    other = undefined;
+    expectWholeLog(fixture, id);
+  } finally {
+    if (owner) await owner.kill();
+    if (other) await other.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP loads a session whose saved image was deleted, and says the image is unavailable", async () => {
+  const fixture = createFixture("fx-v2-acp-image-gone-");
+  const gateway = replyToLatest([["Save this image.", "IMAGE_SAVED"]], undefined, VISION_MODEL);
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", {
+      sessionId: id,
+      prompt: [
+        { type: "text", text: "Save this image." },
+        { type: "image", data: PNG_1X1, mimeType: "image/png" },
+      ],
+    });
+    expect(await client.close()).toBe(0);
+    const images = imageFiles(fixture, id);
+    expect(images.length).toBe(1);
+    rmSync(join(fixture.home, ".fx", "session-files", id, "images", images[0]!));
+
+    client = await AcpRpc.start(fixture, gateway);
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    const userTexts = client.updates
+      .filter((u) => u.update?.sessionUpdate === "user_message_chunk" && u.update.content?.type === "text")
+      .map((u) => u.update.content.text);
+    expect(userTexts).toEqual(["Save this image.\n[Image #1]", "Image #1 unavailable"]);
+    expect(client.updates.some((u) => u.update?.content?.type === "image")).toBe(false);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectWholeLog(fixture, id);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+function infoTitles(updates: any[]) {
+  return updates.filter((u) => u.update?.sessionUpdate === "session_info_update").map((u) => u.update.title);
+}
+
+test("ACP keeps a generated title, and list and load show it after a restart", async () => {
+  const fixture = createFixture("fx-v2-acp-title-");
+  const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("ACP_TITLED_ANSWER"), {
+    titleResponses: [fakeGatewayFinalText("ACP Generated Title")],
+  });
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Name this conversation for me.") });
+    expect(infoTitles(client.updates)).toContain("ACP Generated Title");
+    expect(await client.close()).toBe(0);
+
+    client = await AcpRpc.start(fixture, gateway);
+    const listed = await client.ok("session/list", { cwd: fixture.workspace });
+    expect(listed.sessions.map((s: any) => [s.sessionId, s.title])).toEqual([[id, "ACP Generated Title"]]);
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(infoTitles(client.updates)).toEqual(["ACP Generated Title"]);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectWholeLog(fixture, id);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP lists by workspace: each cwd sees its own sessions, and no cwd sees all", async () => {
+  const fixture = createFixture("fx-v2-acp-cwd-");
+  const other = join(fixture.root, "other-workspace");
+  mkdirSync(other);
+  const otherRoot = realpathSync(other);
+  const gateway = replyToLatest([
+    ["First workspace prompt.", "FIRST_WORKSPACE"],
+    ["Second workspace prompt.", "SECOND_WORKSPACE"],
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    // A session belongs to the workspace its ACP process runs in, as in v1.
+    client = await AcpRpc.start(fixture, gateway);
+    const first = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", { sessionId: first, ...acpPrompt("First workspace prompt.") });
+    expect(await client.close()).toBe(0);
+    client = await AcpRpc.start({ ...fixture, workspace: otherRoot }, gateway);
+    const second = (await client.ok("session/new", { cwd: otherRoot, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", { sessionId: second, ...acpPrompt("Second workspace prompt.") });
+    expect(await client.close()).toBe(0);
+
+    client = await AcpRpc.start(fixture, gateway);
+    const ids = async (params: object) => (await client!.ok("session/list", params)).sessions.map((s: any) => [s.sessionId, s.cwd]);
+    expect(await ids({ cwd: fixture.workspace })).toEqual([[first, fixture.workspace]]);
+    expect(await ids({ cwd: `${fixture.workspace}/` })).toEqual([[first, fixture.workspace]]);
+    expect(await ids({ cwd: otherRoot })).toEqual([[second, otherRoot]]);
+    expect(await ids({ cwd: join(fixture.root, "no-sessions-here") })).toEqual([]);
+    expect((await ids({})).sort()).toEqual([[first, fixture.workspace], [second, otherRoot]].sort());
+    expect(await client.close()).toBe(0);
+    client = undefined;
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP load takes a special-token id literally and never loads the newest session", async () => {
+  const fixture = createFixture("fx-v2-acp-literal-id-");
+  const gateway = replyToLatest([["The only saved prompt.", "ONLY_SAVED_ANSWER"]]);
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("The only saved prompt.") });
+    expect(await client.close()).toBe(0);
+    const saved = readFileSync(join(v2Root(fixture), id, "log.jsonl"));
+
+    client = await AcpRpc.start(fixture, gateway);
+    for (const token of ["last", "last_opened", ".", "..", `../${id}`]) {
+      const response = await client.request("session/load", { sessionId: token, cwd: fixture.workspace, mcpServers: [] });
+      expect(response.error, token).toBeDefined();
+    }
+    expect(client.updates).toEqual([]);
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expect(readFileSync(join(v2Root(fixture), id, "log.jsonl"))).toEqual(saved);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("ACP load after a compaction shows every earlier turn and never the handoff", async () => {
+  const fixture = createFixture("fx-v2-acp-compacted-");
+  const gateway = startFakeGateway([
+    fakeShellRun("saved-history-effect", "printf 'V2_SAVED_TOOL_OUTPUT\\n' >> replay-effects.txt; printf 'V2_SAVED_TOOL_OUTPUT\\n'"),
+    fakeGatewayFinalText("V2_EARLIER_VISIBLE"),
+    fakeGatewayFinalText("V2_MIDDLE_VISIBLE"),
+    fakeGatewayFinalText("V2_LATEST_VISIBLE"),
+    fakeGatewayFinalText("V2_INTERNAL_HANDOFF: continue the task."),
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    const app = await startApp(fixture, gateway, []);
+    for (const [prompt, answer] of [
+      ["Earlier v2 request", "V2_EARLIER_VISIBLE"],
+      ["Middle v2 request", "V2_MIDDLE_VISIBLE"],
+      ["Latest v2 request", "V2_LATEST_VISIBLE"],
+    ]) {
+      await app.session.sendText(prompt!);
+      await scrollbackContains(app.session, answer!);
+      await app.session.waitForComposer(TIMEOUT);
+    }
+    const id = onlySession(fixture);
+    await app.session.sendText("/compact");
+    await waitForLog(fixture, id, "V2_INTERNAL_HANDOFF", TIMEOUT);
+    await app.session.waitForComposer(TIMEOUT);
+    await quitApp(app);
+    const saved = readFileSync(join(v2Root(fixture), id, "log.jsonl"));
+    expect(gateway.requests).toHaveLength(5);
+
+    client = await AcpRpc.start(fixture, gateway);
+    for (let load = 0; load < 2; load += 1) {
+      client.updates.length = 0;
+      await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+      const visible = JSON.stringify(client.updates);
+      expect(infoTitles(client.updates)).toEqual(["Earlier v2 request"]);
+      expect(client.texts("user_message_chunk")).toEqual(["Earlier v2 request", "Middle v2 request", "Latest v2 request"]);
+      expect(visible).toContain("V2_SAVED_TOOL_OUTPUT");
+      expect(visible).not.toContain("V2_INTERNAL_HANDOFF");
+      const order = ["V2_EARLIER_VISIBLE", "V2_MIDDLE_VISIBLE", "V2_LATEST_VISIBLE"].map((text) => visible.indexOf(text));
+      expect(order.every((at) => at >= 0)).toBe(true);
+      expect(order).toEqual([...order].sort((a, b) => a - b));
+    }
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    const after = readFileSync(join(v2Root(fixture), id, "log.jsonl"));
+    // Load adds no history: its writable open ends with the clean-exit
+    // marker every close appends.
+    expect(after.subarray(0, saved.length)).toEqual(saved);
+    const appended = after.subarray(saved.length).toString("utf8").split("\n").filter(Boolean);
+    expect(appended.map((line) => JSON.parse(line).kind)).toEqual(["closed"]);
+    expect(readFileSync(join(fixture.workspace, "replay-effects.txt"), "utf8")).toBe("V2_SAVED_TOOL_OUTPUT\n");
+    expect(gateway.requests).toHaveLength(5);
+    expectWholeLog(fixture, id);
+  } finally {
+    if (client) await client.kill();
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
   }

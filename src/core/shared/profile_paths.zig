@@ -8,6 +8,9 @@ pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
 pub const sessions_dir_name = "sessions";
+/// Side folders of v2 sessions (D27): v1's per-session layout, one folder
+/// per session id.
+pub const session_files_dir_name = "session-files";
 pub const prompt_history_file_name = "history.jsonl";
 pub const usage_file_name = "usage.jsonl";
 pub const usage_recovery_dir_name = "usage-recovery";

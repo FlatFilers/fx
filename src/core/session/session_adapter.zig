@@ -39,7 +39,7 @@ const Event = session_event.ConversationEvent;
 const PieceKind = std.meta.Tag(Event);
 
 /// Folder of the side files of v2 sessions, under `~/.fx`.
-pub const files_dir_name = "session-files";
+pub const files_dir_name = profile_paths.session_files_dir_name;
 /// Folder of the usage-recovery markers of v2 sessions, under `~/.fx`;
 /// v1's readers load only v1 sessions, so v2 markers live apart.
 pub const usage_markers_dir_name = "usage-recovery-v2";
@@ -74,7 +74,12 @@ pub const Store = struct {
 
     /// Touches no disk: a session's folder appears with its first turn.
     pub fn open(alloc: Allocator, home: []const u8) !Store {
-        const owned_home = try alloc.dupe(u8, home);
+        // Resolved as v1 resolves its sessions root, so a home reached
+        // through a symlink (macOS `/var`) passes the no-follow opens below.
+        const owned_home = io_mod.realpathAlloc(alloc, home) catch |err| blk: {
+            debug_trace.logf("session", "event=sessions_v2_home_unresolved err={s} using=given", .{@errorName(err)});
+            break :blk try alloc.dupe(u8, home);
+        };
         errdefer alloc.free(owned_home);
         const root = try std.fs.path.join(alloc, &.{
             home,
@@ -197,6 +202,10 @@ pub const Session = struct {
     usage_at_ms: i64 = 0,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
+        // Every v2 write needs a writable open, and both start here or in
+        // resumeSession: E2E tests use this to prove read-only paths never
+        // reach one.
+        io_mod.e2eFailIfDurableMutationAttempted();
         const handle = try store.manager.openNew(.{ .workspace = workspace, .host = host });
         errdefer handle.release();
         const self = try init(alloc, store, handle, true);
@@ -225,6 +234,7 @@ pub const Session = struct {
 
     /// `lock_wait_ms` null waits the manager's 2 s for the writer lock.
     fn resumeWaiting(alloc: Allocator, store: *Store, target: Target, workspace: []const u8, host: Host, lock_wait_ms: ?u64) !*Session {
+        io_mod.e2eFailIfDurableMutationAttempted();
         const handle = store.manager.openResume(.{
             .target = switch (target) {
                 .id => |session_id| .{ .id = session_id },
@@ -329,6 +339,16 @@ pub const Session = struct {
         const dir = try self.openFilesDir();
         self.capability = try session_child_store.SessionChildCapability.init(self.alloc, dir.dir, self.files_path, .writable);
         return &self.capability.?;
+    }
+
+    /// Creates the side folder (`0700`) if it is missing, for writers that
+    /// use it before any capability does, such as a prompt's images, and
+    /// returns `filesPath()`.
+    pub fn ensureFilesPath(self: *Session) ![]const u8 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        _ = try self.openFilesDir();
+        return self.files_path;
     }
 
     fn openFilesDir(self: *Session) !*io_mod.VerifiedDir {
@@ -796,9 +816,46 @@ pub const Session = struct {
             from = .{ .at = cursor };
             if (compacted.keep_from_turn) |turn| from = .{ .at = try self.findTurnStart(sa, cursor, turn) };
         }
-        try self.replay(alloc, sa, from, skip_offset, &history);
+        var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers_alloc = self.alloc, .numbers = &self.turn_numbers };
+        try self.replay(alloc, sa, from, skip_offset, &sink);
         restored.history = try history.toOwnedSlice(alloc);
         return restored;
+    }
+
+    /// Keeps each turn for resume, with the number of the turn that holds it.
+    const RestoreSink = struct {
+        alloc: Allocator,
+        history: *std.ArrayList(types.HistoryTurn),
+        numbers_alloc: Allocator,
+        numbers: *std.ArrayList(?u64),
+
+        fn turn(sink: *RestoreSink, value: types.HistoryTurn, number: ?u64) !void {
+            errdefer types.freeHistoryTurn(sink.alloc, value);
+            try sink.history.ensureUnusedCapacity(sink.alloc, 1);
+            try sink.numbers.append(sink.numbers_alloc, number);
+            sink.history.appendAssumeCapacity(value);
+        }
+    };
+
+    /// Hands `visitor.append` every turn in the log, oldest first, as v1's
+    /// conversation reader does: a compaction hides no turn from the
+    /// transcript. Each turn is freed after its call, and pages are freed as
+    /// they are read, so memory stays bounded by one page and one turn.
+    /// Leaves the state resume keeps untouched.
+    pub fn visitHistory(self: *Session, alloc: Allocator, visitor: anytype) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const Sink = struct {
+            alloc: Allocator,
+            visitor: @TypeOf(visitor),
+
+            fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
+                defer types.freeHistoryTurn(sink.alloc, value);
+                try sink.visitor.append(value);
+            }
+        };
+        var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
+        try self.replay(alloc, alloc, .start, null, &sink);
     }
 
     /// The session as v1's `DurableSessionState`, for hosts that restore
@@ -840,6 +897,23 @@ pub const Session = struct {
         return resumed;
     }
 
+    pub const Info = struct {
+        /// The stored title, decoded; owned by the caller.
+        title: ?[]u8,
+        /// The time of the newest line; 0 before the first turn.
+        updated_ms: i64,
+    };
+
+    /// What a host shows about the open session.
+    pub fn info(self: *Session, alloc: Allocator) !Info {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const st = try self.handle.state(sa);
+        const title = if (st.title) |raw| try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{})) else null;
+        return .{ .title = title, .updated_ms = std.math.cast(i64, st.updated_ms) orelse 0 };
+    }
+
     /// The cursor of `turn`'s `turn_started`, reading back from `before`.
     fn findTurnStart(self: *Session, sa: Allocator, before: sm.Cursor, turn: u64) !sm.Cursor {
         var from: sm.From = .{ .at = before };
@@ -860,7 +934,8 @@ pub const Session = struct {
         sa: Allocator,
         start: sm.From,
         skip_offset: ?u64,
-        history: *std.ArrayList(types.HistoryTurn),
+        /// Takes each finished turn, even when it fails: `turn(value, number)`.
+        sink: anytype,
     ) !void {
         var builder = session_log.ConversationTurnBuilder.init(alloc);
         defer builder.deinit();
@@ -899,7 +974,8 @@ pub const Session = struct {
                         }
                         const ta = turn_arena.allocator();
                         if (std.mem.eql(u8, piece.type, running_type)) {
-                            const call = try decodePiece(ta, .tool_call, try self.pieceData(ta, piece));
+                            // Kept for the whole turn: copies, not views of the page.
+                            const call = try decodePiece(ta, .tool_call, try self.pieceData(ta, piece), .alloc_always);
                             try running.append(ta, call.tool_call);
                             continue;
                         }
@@ -908,7 +984,9 @@ pub const Session = struct {
                             continue;
                         };
                         const data = try self.pieceData(pa, piece);
-                        switch (try decodePiece(pa, kind, data)) {
+                        // The builder copies what it keeps, as it does for v1's
+                        // reader, so strings may point into the page.
+                        switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
                             .user => |value| try builder.begin(value),
                             .assistant => |value| try builder.appendAssistant(value),
                             .tool_call => |value| {
@@ -920,18 +998,10 @@ pub const Session = struct {
                                 try represented.append(ta, try ta.dupe(u8, value.call_id));
                             },
                             .steering => |value| try builder.appendSteering(value.text),
-                            .turn_completed => |value| {
-                                const turn = try builder.finishAssistant(value);
-                                errdefer types.freeHistoryTurn(alloc, turn);
-                                try history.append(alloc, turn);
-                                try self.turn_numbers.append(self.alloc, self.lastStarted(entry));
-                            },
+                            .turn_completed => |value| try sink.turn(try builder.finishAssistant(value), self.lastStarted(entry)),
                             .interrupted => |value| {
                                 interrupted_item = true;
-                                const turn = try builder.finishInterrupted(value);
-                                errdefer types.freeHistoryTurn(alloc, turn);
-                                try history.append(alloc, turn);
-                                try self.turn_numbers.append(self.alloc, self.lastStarted(entry));
+                                try sink.turn(try builder.finishInterrupted(value), self.lastStarted(entry));
                             },
                             .context_checkpoint => return error.InvalidConversationFrame,
                         }
@@ -949,11 +1019,12 @@ pub const Session = struct {
                             .cancel, .closed => .cancelled,
                             .failed, .crash => .failed,
                         } });
-                        errdefer types.freeHistoryTurn(alloc, turn);
-                        const answered = try answerRunning(alloc, &turn.interrupted, running.items, represented.items);
+                        const answered = answerRunning(alloc, &turn.interrupted, running.items, represented.items) catch |err| {
+                            types.freeHistoryTurn(alloc, turn);
+                            return err;
+                        };
                         if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ self.id(), ended.turn, answered });
-                        try history.append(alloc, turn);
-                        try self.turn_numbers.append(self.alloc, ended.turn);
+                        try sink.turn(turn, ended.turn);
                     },
                     .session_created, .compacted, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
                 }
@@ -1325,13 +1396,14 @@ fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
 }
 
 /// Payload slices point into `arena` or `data`.
-fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8) !Event {
+/// With `.alloc_if_needed`, strings may point into `data`.
+fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: std.json.AllocWhen) !Event {
     const event: Event = switch (kind) {
         inline else => |tag| @unionInit(Event, @tagName(tag), try std.json.parseFromSliceLeaky(
             @FieldType(Event, @tagName(tag)),
             arena,
             data,
-            .{ .allocate = .alloc_always },
+            .{ .allocate = allocate },
         )),
     };
     try session_event.validateConversationEventShape(event, session_event.conversation_schema_version);
@@ -1662,6 +1734,57 @@ test "a finished turn keeps no trace of its running calls" {
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("answered", restored.history[0].assistant.assistant);
     try testing.expectEqual(@as(usize, 0), restored.history[0].assistant.execution.tool_steps.len);
+}
+
+test "the history visit shows every turn, even those a compaction summarized" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "a"), language);
+    try s.commitTurn(assistantTurn("two", "b"), language);
+    try s.commitCompaction(.{ .summary = @constCast("summary"), .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("three", "c"), language);
+
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+        fail_at: ?usize = null,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            if (self.fail_at == self.prompts.items.len) return error.ConsumerFailed;
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+            self.prompts.deinit(testing.allocator);
+        }
+    };
+    const numbers = try testing.allocator.dupe(?u64, s.turn_numbers.items);
+    defer testing.allocator.free(numbers);
+    var visitor: Visitor = .{};
+    defer visitor.deinit();
+    try s.visitHistory(testing.allocator, &visitor);
+    try testing.expectEqual(@as(usize, 3), visitor.prompts.items.len);
+    for (visitor.prompts.items, [_][]const u8{ "one", "two", "three" }) |got, want| try testing.expectEqualStrings(want, got);
+    // The visit leaves what resume and compaction rely on unchanged.
+    try testing.expectEqualSlices(?u64, numbers, s.turn_numbers.items);
+
+    // A visitor that fails stops the visit without leaking its turn.
+    var failing: Visitor = .{ .fail_at = 1 };
+    defer failing.deinit();
+    try testing.expectError(error.ConsumerFailed, s.visitHistory(testing.allocator, &failing));
+    try testing.expectEqual(@as(usize, 1), failing.prompts.items.len);
+
+    // Resume still starts from the summary.
+    var restored = try s.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("summary", restored.history[0].compacted_summary.summary);
+    try testing.expectEqualStrings("three", restored.history[1].assistant.user.text);
 }
 
 test "a tool result backed only by its command replay streams as it commits" {

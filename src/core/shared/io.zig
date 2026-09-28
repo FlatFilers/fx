@@ -667,6 +667,24 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
     return .{ .dir = dir };
 }
 
+/// Opens an existing private folder, checked as
+/// `openOrCreateVerifiedPrivateDir` checks it, without creating it: null
+/// when it is missing.
+pub fn openVerifiedPrivateDirIfPresent(parent: *VerifiedDir, name: []const u8) !?VerifiedDir {
+    try validateRelativeLeaf(name);
+    var dir = parent.dir.openDir(getIo(), name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
+        else => return err,
+    };
+    errdefer dir.close(getIo());
+    try verifyPrivateDirectory(dir);
+    return .{ .dir = dir };
+}
+
 pub fn openOrCreateVerifiedPrivateDir(parent: *VerifiedDir, name: []const u8) !VerifiedDir {
     return openOrCreateVerifiedPrivateChild(parent.dir, name);
 }

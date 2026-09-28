@@ -1441,7 +1441,7 @@ pub fn Runtime(comptime App: type) type {
         fn imageSnapshotStorageDir(app: *App) ![]u8 {
             // A v2 session keeps its images with its side files.
             const sessions_dir = if (app.session_persistence.v2) |v2|
-                std.fs.path.dirname(v2.filesPath())
+                std.fs.path.dirname(try v2.ensureFilesPath())
             else if (app.session_persistence.store) |*store|
                 store.sessions_dir
             else
@@ -4553,6 +4553,22 @@ pub fn Runtime(comptime App: type) type {
                         var visitor = Visitor{ .app = app, .sink = sink, .labels = labels };
                         return store.visitConversationHistory(app.alloc, loaded.active_id, &visitor);
                     }
+                }
+                // v2 shows every saved turn too, not only those since the
+                // newest compaction.
+                if (app.session_persistence.v2) |v2| {
+                    const Visitor = struct {
+                        app: *App,
+                        sink: @TypeOf(sink),
+                        labels: *HistoricalSessionLabels,
+                        has_prior_turns: bool = false,
+
+                        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                            return replayHistoryToSinkIncremental(self.app, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
+                        }
+                    };
+                    var visitor = Visitor{ .app = app, .sink = sink, .labels = labels };
+                    return v2.visitHistory(app.alloc, &visitor);
                 }
             }
             return replayHistoryToSink(app, sink, context_history, labels);

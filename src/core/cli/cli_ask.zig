@@ -883,7 +883,7 @@ const AskContext = struct {
 
     fn imageSnapshotStorageDir(self: *AskContext) ![]u8 {
         const sessions_dir = if (self.v2) |v2|
-            std.fs.path.dirname(v2.filesPath())
+            std.fs.path.dirname(try v2.ensureFilesPath())
         else if (self.store) |*store| store.sessions_dir else null;
         const session_id = self.activeSessionId();
         return session_store.imageSnapshotStorageDir(

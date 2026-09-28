@@ -1355,6 +1355,9 @@ pub fn readPage(
 
 /// A page of the lines before `end` in an open log, shared by the read by
 /// id and `Session.readPage`. The caller keeps `file` open throughout.
+/// Entries of a page allocated up front, without the safety fill.
+const max_raw_page_entries = 1024;
+
 fn readLines(
     s: storage.Storage,
     gpa: std.mem.Allocator,
@@ -1367,7 +1370,12 @@ fn readLines(
     var page: Page = .{ .arena = .init(gpa), .entries = &.{}, .next = null, .damaged = false };
     errdefer page.arena.deinit();
     const arena = page.arena.allocator();
-    var entries: std.ArrayList(Entry) = .empty;
+    // Raw, as `log.ReadBuffer` explains: every entry is written in full
+    // before it is read. A longer page grows the list as usual.
+    const first_capacity: usize = @min(limit, max_raw_page_entries);
+    const first_memory = arena.rawAlloc(first_capacity * @sizeOf(Entry), .of(Entry), @returnAddress()) orelse return error.OutOfMemory;
+    const first_entries: [*]Entry = @ptrCast(@alignCast(first_memory));
+    var entries: std.ArrayList(Entry) = .initBuffer(first_entries[0..first_capacity]);
     switch (direction) {
         .forward => {
             const at: Cursor = switch (from) {
@@ -1433,11 +1441,15 @@ fn readLines(
 
 fn copyEntry(arena: std.mem.Allocator, line: log_mod.Line) error{OutOfMemory}!Entry {
     // The reader's buffer is reused on the next line: copy before parsing.
-    const bytes = try arena.dupe(u8, line.bytes);
-    const header = log_mod.checkLine(bytes) catch unreachable;
+    // Raw, as `log.ReadBuffer` explains: the copy writes every byte.
+    const bytes = (arena.rawAlloc(line.bytes.len, .@"1", @returnAddress()) orelse return error.OutOfMemory)[0..line.bytes.len];
+    @memcpy(bytes, line.bytes);
+    // The reader checked the line; only the header's name moves.
+    var header = line.header;
+    header.kind_name = bytes[@intFromPtr(header.kind_name.ptr) - @intFromPtr(line.bytes.ptr) ..][0..header.kind_name.len];
     const kind = header.kind;
     const body: ?schema.Body = if (kind) |k|
-        schema.parseBody(arena, k, log_mod.lineBody(bytes, header)) catch |err| switch (err) {
+        schema.parseLineBody(arena, k, bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadBody => null,
         }

@@ -217,7 +217,18 @@ pub const BodyError = error{ BadBody, OutOfMemory };
 /// Parses the fields of a line of `kind`. Unknown fields are ignored.
 /// Returned slices point into `fields` or into `arena`.
 pub fn parseBody(arena: std.mem.Allocator, kind: Kind, fields: []const u8) BodyError!Body {
-    const f = try Fields.parse(arena, fields);
+    return bodyOf(kind, try Fields.parse(arena, fields));
+}
+
+/// `parseBody` for a whole checked line, newline included. The line is a
+/// JSON object up to its newline, so its fields are read in place rather
+/// than copied; the header and `crc` fields are never body field names.
+pub fn parseLineBody(arena: std.mem.Allocator, kind: Kind, line: []const u8) BodyError!Body {
+    if (line.len == 0 or line[line.len - 1] != '\n') return error.BadBody;
+    return bodyOf(kind, try Fields.parseObject(arena, line[0 .. line.len - 1]));
+}
+
+fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
     return switch (kind) {
         .session_created => .{ .session_created = .{
             .id = try f.req([]const u8, "id"),
@@ -280,6 +291,107 @@ pub const Fields = struct {
 
     /// `object` is a complete JSON object; slices point into it.
     pub fn parseObject(arena: std.mem.Allocator, object: []const u8) BodyError!Fields {
+        return splitObject(arena, object) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Unusual => parseObjectStrict(arena, object),
+        };
+    }
+
+    const max_split_fields = 24;
+
+    /// The fast path of `parseObject`, for objects as this module writes
+    /// them: no whitespace, unescaped names, at most `max_split_fields`.
+    /// It finds each value's end without tokenizing it, which holds because
+    /// every raw value was validated when appended and every line is
+    /// checked by its CRC before it is parsed. Anything else is `Unusual`
+    /// and goes to the strict path, so results and errors do not change.
+    fn splitObject(arena: std.mem.Allocator, object: []const u8) (error{ OutOfMemory, Unusual })!Fields {
+        var names: [max_split_fields][]const u8 = undefined;
+        var values: [max_split_fields][]const u8 = undefined;
+        var n: usize = 0;
+        if (object.len < 2 or object[0] != '{' or object[object.len - 1] != '}') return error.Unusual;
+        var i: usize = 1;
+        if (object.len == 2) return .{ .arena = arena, .names = &.{}, .values = &.{} };
+        while (true) {
+            if (n == max_split_fields or object[i] != '"') return error.Unusual;
+            const name_end = std.mem.findScalarPos(u8, object, i + 1, '"') orelse return error.Unusual;
+            const name = object[i + 1 .. name_end];
+            if (std.mem.findScalar(u8, name, '\\') != null) return error.Unusual;
+            i = name_end + 1;
+            if (i >= object.len or object[i] != ':') return error.Unusual;
+            i += 1;
+            const value_end = valueEnd(object, i) orelse return error.Unusual;
+            if (value_end == i) return error.Unusual;
+            names[n] = name;
+            values[n] = object[i..value_end];
+            n += 1;
+            i = value_end;
+            if (i == object.len - 1) break;
+            if (object[i] != ',') return error.Unusual;
+            i += 1;
+        }
+        return .{ .arena = arena, .names = try rawCopy([]const u8, arena, names[0..n]), .values = try rawCopy([]const u8, arena, values[0..n]) };
+    }
+
+    /// Where the value starting at `i` ends, or null for bytes this writer
+    /// never produces.
+    fn valueEnd(bytes: []const u8, i: usize) ?usize {
+        if (i >= bytes.len) return null;
+        switch (bytes[i]) {
+            '"' => return stringEnd(bytes, i),
+            '{', '[' => {
+                var depth: usize = 0;
+                var j = i;
+                while (j < bytes.len) {
+                    switch (bytes[j]) {
+                        '"' => {
+                            j = stringEnd(bytes, j) orelse return null;
+                            continue;
+                        },
+                        '{', '[' => depth += 1,
+                        '}', ']' => {
+                            depth -= 1;
+                            if (depth == 0) return j + 1;
+                        },
+                        else => {},
+                    }
+                    j += 1;
+                }
+                return null;
+            },
+            else => {
+                // A number, `true`, `false` or `null`: up to the next
+                // delimiter of the enclosing object.
+                var j = i;
+                while (j < bytes.len and bytes[j] != ',' and bytes[j] != '}') j += 1;
+                return if (j < bytes.len) j else null;
+            },
+        }
+    }
+
+    /// Just past the closing quote of the string opening at `open`: the next
+    /// quote not escaped by an odd run of backslashes.
+    fn stringEnd(bytes: []const u8, open: usize) ?usize {
+        var from = open + 1;
+        while (true) {
+            const quote = std.mem.findScalarPos(u8, bytes, from, '"') orelse return null;
+            var run: usize = 0;
+            while (quote - run > open + 1 and bytes[quote - run - 1] == '\\') run += 1;
+            if (run % 2 == 0) return quote + 1;
+            from = quote + 1;
+        }
+    }
+
+    /// `arena.dupe` without the safety fill: every element is copied.
+    fn rawCopy(comptime T: type, arena: std.mem.Allocator, items: []const T) error{OutOfMemory}![]const T {
+        if (items.len == 0) return &.{};
+        const bytes = arena.rawAlloc(items.len * @sizeOf(T), .of(T), @returnAddress()) orelse return error.OutOfMemory;
+        const copy: [*]T = @ptrCast(@alignCast(bytes));
+        @memcpy(copy[0..items.len], items);
+        return copy[0..items.len];
+    }
+
+    fn parseObjectStrict(arena: std.mem.Allocator, object: []const u8) BodyError!Fields {
         var names: std.ArrayList([]const u8) = .empty;
         var values: std.ArrayList([]const u8) = .empty;
         var scanner = std.json.Scanner.initCompleteInput(arena, object);

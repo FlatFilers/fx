@@ -107,6 +107,29 @@ test "init touches nothing on disk" {
     root.close(io);
 }
 
+test "reads before any session create nothing on disk" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    // An editor listing sessions on a machine that never saved one.
+    var page = try f.manager.list(gpa, .all, null, 10);
+    try testing.expectEqual(@as(usize, 0), page.items.len);
+    page.deinit();
+    try testing.expectError(error.NotFound, f.manager.read(gpa, "AAAAAAAAAAAA", .start, .forward, 10));
+    try testing.expectError(error.NotFound, f.manager.getBlob(gpa, "AAAAAAAAAAAA", "0" ** 64));
+    try testing.expectError(error.NotFound, f.manager.openResume(.{ .target = .last, .workspace = "/w", .host = .acp }));
+    try testing.expectError(error.NotFound, f.manager.verify("AAAAAAAAAAAA"));
+    try testing.expectError(error.NotFound, f.manager.delete("AAAAAAAAAAAA"));
+    try testing.expectError(error.FileNotFound, f.dir());
+    // Once a session is saved, the same calls find it.
+    const s = try f.manager.openNew(.{ .workspace = "/w", .host = .acp });
+    _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+    s.release();
+    var listed = try f.manager.list(gpa, .all, null, 10);
+    defer listed.deinit();
+    try testing.expectEqual(@as(usize, 1), listed.items.len);
+}
+
 test "a read-only session folder fails with AccessDenied, not Io (D29)" {
     var f: Fixture = undefined;
     try f.init();

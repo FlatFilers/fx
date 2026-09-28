@@ -105,6 +105,22 @@ pub const Storage = struct {
         return s.ensureDir(.{ .handle = parent }, name);
     }
 
+    /// Whether the sessions root exists, creating neither it nor its parents.
+    pub fn rootExists(s: Storage, path: []const u8) Error!bool {
+        try s.alive();
+        const parent_path = std.fs.path.dirname(path) orelse ".";
+        var parent = Io.Dir.cwd().openDir(s.io, parent_path, .{}) catch |err| return switch (translate(err)) {
+            error.NotFound => false,
+            else => |e| e,
+        };
+        defer parent.close(s.io);
+        _ = s.stat(.{ .handle = parent }, std.fs.path.basename(path)) catch |err| return switch (err) {
+            error.NotFound => false,
+            else => err,
+        };
+        return true;
+    }
+
     /// Opens `name` inside `parent`, creating it `0700` if it is missing.
     pub fn ensureDir(s: Storage, parent: Dir, name: []const u8) Error!Dir {
         s.makeDir(parent, name) catch |err| switch (err) {

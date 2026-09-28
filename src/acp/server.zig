@@ -28,6 +28,7 @@ const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
+const session_adapter = @import("../core/session/session_adapter.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
@@ -192,6 +193,9 @@ pub const ActiveSessionState = struct {
     session_id: []u8,
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
+    /// The session on v2 (`FX_SESSIONS_V2`); `store` and `writable` stay
+    /// null then, as one process uses one backend.
+    v2: ?*session_adapter.Session = null,
     wasm_state: ?session_codec.DurableSessionState = null,
     wasm_revision: ?[]u8 = null,
     session_write_mutex: std.Io.Mutex = .init,
@@ -296,6 +300,11 @@ pub const ServerState = struct {
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     subagent_store: ?session_store.Store = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// Open for the whole connection when sessions are on v2.
+    sessions_v2: ?session_adapter.Store = null,
+    /// v2 was asked for; with no store, sessions are unavailable rather
+    /// than on v1, as one process uses one backend.
+    sessions_v2_requested: bool = false,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
@@ -322,6 +331,7 @@ pub const ServerState = struct {
                 .{@errorName(err)},
             );
         };
+        if (self.sessions_v2) |*store| store.deinit(self.alloc);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
@@ -590,6 +600,19 @@ fn publishRefreshedCredential(
     adoptServerCredential(state, refreshed);
 }
 
+pub const SessionsBackend = union(enum) {
+    v1,
+    v2: *session_adapter.Store,
+    /// v2 was asked for but its store could not open (no `HOME`).
+    v2_unavailable,
+};
+
+/// Where this connection keeps its sessions.
+pub fn sessionsBackend(state: *ServerState) SessionsBackend {
+    if (state.sessions_v2) |*store| return .{ .v2 = store };
+    return if (state.sessions_v2_requested) .v2_unavailable else .v1;
+}
+
 pub fn releaseActiveSession(state: *ServerState) !void {
     clearPendingLegacyUrls(state);
     const active = if (state.active_session) |*session| session else return;
@@ -655,6 +678,7 @@ fn destroyActiveSession(state: *ServerState) void {
     active.session_rt.deinit(state.alloc);
     if (active.writable) |*writable| writable.deinit(state.alloc);
     if (active.store) |*store| store.deinit(state.alloc);
+    if (active.v2) |v2| v2.close();
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;
@@ -663,6 +687,10 @@ fn destroyActiveSession(state: *ServerState) void {
 pub fn enableSubagentHost(state: *ServerState) void {
     disableSubagentHost(state);
     const active = if (state.active_session) |*session| session else return;
+    if (active.v2 != null) {
+        debug_trace.logf("acp", "event=sessions_v2_subagents_off session={s}", .{active.session_id});
+        return;
+    }
     if (active.writable == null) return;
     state.subagent_store = session_store.Store.init(state.alloc, state.workspace_root) catch |err| {
         debug_trace.logf("acp", "subagent host store unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
@@ -752,6 +780,14 @@ pub fn disableSubagentHost(state: *ServerState) void {
 
 fn flushActiveSessionUsage(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
+    if (active.v2) |v2| {
+        if (!active.session_rt.usage.isDirty()) return;
+        var usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
+        defer usage_snapshot.deinit(state.alloc);
+        try v2.persistUsage(usage_snapshot);
+        active.session_rt.usage.markClean(usage_snapshot);
+        return;
+    }
     const writable = if (active.writable) |*value| value else return;
     if (!active.session_rt.usage.isDirty()) return;
 
@@ -812,6 +848,17 @@ pub fn runWithTransport(
         .lifecycle_view = lifecycle_view,
     };
     defer state.deinit();
+    // One backend per process; the wasm host stays on v1.
+    if (comptime !host_target.is_wasm) if (session_adapter.enabled(false)) {
+        state.sessions_v2_requested = true;
+        state.sessions_v2 = (if (cfg.home_override) |home|
+            session_adapter.Store.open(alloc, home)
+        else
+            session_adapter.Store.openFromEnv(alloc)) catch |err| blk: {
+            debug_trace.logf("acp", "event=sessions_v2_store_unavailable err={s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
 
     var reader = reader_value;
     while (!state.terminate_connection) {
@@ -2672,23 +2719,44 @@ fn commitActiveSessionProvider(
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (session.writable) |*active|
-        active
-    else
-        return error.SessionPersistenceUnavailable;
     const staged_model = try alloc.dupe(u8, model);
     errdefer alloc.free(staged_model);
-    _ = try writable.appendEvent(
-        alloc,
-        .{ .preferences_changed = .{
-            .provider = provider,
-            .model = @constCast(model),
-        } },
-        io_mod.milliTimestamp(),
-    );
+    if (session.v2) |v2| {
+        try setV2Preferences(v2, session, provider, model, session.effort);
+    } else {
+        const writable = if (session.writable) |*active|
+            active
+        else
+            return error.SessionPersistenceUnavailable;
+        _ = try writable.appendEvent(
+            alloc,
+            .{ .preferences_changed = .{
+                .provider = provider,
+                .model = @constCast(model),
+            } },
+            io_mod.milliTimestamp(),
+        );
+    }
     alloc.free(session.model);
     session.model = staged_model;
     session.provider = provider;
+}
+
+/// A v2 session stores its preferences as one value, so every change
+/// writes the whole set.
+fn setV2Preferences(
+    v2: *session_adapter.Session,
+    session: *const ActiveSessionState,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    effort: types.ReasoningEffort,
+) !void {
+    try v2.setPreferences(.{
+        .provider = provider,
+        .model = @constCast(model),
+        .effort = effort,
+        .fast_mode = session.fast_mode,
+    });
 }
 
 fn commitActiveSessionModel(
@@ -2698,6 +2766,14 @@ fn commitActiveSessionModel(
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
+    if (session.v2) |v2| {
+        const staged_model = try alloc.dupe(u8, value);
+        errdefer alloc.free(staged_model);
+        try setV2Preferences(v2, session, session.provider, value, session.effort);
+        alloc.free(session.model);
+        session.model = staged_model;
+        return;
+    }
     const writable = if (session.writable) |*active|
         active
     else
@@ -2743,6 +2819,11 @@ fn commitActiveSessionEffort(
     }
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
+    if (session.v2) |v2| {
+        try setV2Preferences(v2, session, session.provider, session.model, effort);
+        session.effort = effort;
+        return;
+    }
     const writable = if (session.writable) |*active|
         active
     else
@@ -3243,6 +3324,7 @@ fn acpModelTestState(
 test "ACP model commits honor the active session write boundary" {
     const alloc = std.testing.allocator;
     var active: ActiveSessionState = undefined;
+    active.v2 = null;
     active.writable = null;
     active.session_write_mutex = .init;
     active.model = try alloc.dupe(u8, "old-model");
@@ -3297,6 +3379,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
     state.credential_refresh_after_ms = 1;
     state.gateway_team = null;
     var active: ActiveSessionState = undefined;
+    active.v2 = null;
     active.api_key = state.api_key;
     active.account_id = state.account_id;
     active.credential_source = .chatgpt_subscription;
@@ -3395,6 +3478,7 @@ test "ACP usage flush preserves snapshot ownership on allocation failure" {
     writable.state = durable;
     durable_owned = false;
     var active: ActiveSessionState = undefined;
+    active.v2 = null;
     active.writable = writable;
     active.session_rt = runtime;
     runtime_owned = false;

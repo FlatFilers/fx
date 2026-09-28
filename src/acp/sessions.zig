@@ -10,6 +10,9 @@ const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
+const session_adapter = @import("../core/session/session_adapter.zig");
+const session_summary_codec = @import("../core/session/session_summary_codec.zig");
+const session_store_paths = @import("../core/session/session_store_paths.zig");
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
@@ -221,6 +224,17 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             alloc.destroy(runtime);
         }
     };
+    switch (server.sessionsBackend(state)) {
+        .v1 => {},
+        .v2 => |v2_store| {
+            session_mcp_owned = false;
+            return startV2Session(state, alloc, msg, v2_store, session_mcp);
+        },
+        .v2_unavailable => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Session store not available",
+        }),
+    }
 
     var store = (if (state.cfg.home_override) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
@@ -297,6 +311,74 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     session_rt_owned = false;
     session_mcp_owned = false;
 
+    try writeNewSessionResponse(state, alloc, msg, session_id);
+}
+
+/// `session/new` on v2. The session stays in memory until its first prompt,
+/// so one that never gets a prompt leaves nothing behind (D24). Owns
+/// `session_mcp`.
+fn startV2Session(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    v2_store: *session_adapter.Store,
+    session_mcp: ?*mcp_runtime.McpRuntime,
+) !void {
+    var session_mcp_owned = true;
+    defer if (session_mcp_owned) {
+        if (session_mcp) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        }
+    };
+    const v2 = session_adapter.Session.create(alloc, v2_store, state.workspace_root, .acp, .{
+        .preferences = .{
+            .provider = state.provider,
+            .model = state.configured_model,
+            .effort = state.effort,
+            .fast_mode = state.fast_mode,
+        },
+        .language = session_runtime.ConversationLanguage.default(),
+        .permission_state = .{},
+    }) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Failed to create session" });
+    var v2_owned = true;
+    defer if (v2_owned) v2.close();
+    const session_id = try alloc.dupe(u8, v2.id());
+    var session_id_owned = true;
+    defer if (session_id_owned) alloc.free(session_id);
+    const model_copy = try alloc.dupe(u8, state.selected_model);
+    var model_owned = true;
+    defer if (model_owned) alloc.free(model_copy);
+    var session_rt = session_runtime.SessionRuntime.initWithProviders(
+        state.cfg.max_history_turns,
+        state.cfg.provider_set.deferredUsageProviders(),
+    );
+    var session_rt_owned = true;
+    defer if (session_rt_owned) session_rt.deinit(alloc);
+    _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+    session_rt.usage.restoreLegacyWallDuration(io_mod.milliTimestamp());
+    session_rt.configureWebFetchArtifacts(alloc, v2.filesPath());
+    server.cancelAndReapActivePrompt(state);
+    activateSession(state, null, .{
+        .session_id = session_id,
+        .v2 = v2,
+        .model = model_copy,
+        .provider = state.provider,
+        .fast_mode = state.fast_mode,
+        .effort = state.effort,
+        .session_rt = session_rt,
+        .mcp = session_mcp,
+    }) catch
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to save active session",
+        });
+    v2_owned = false;
+    session_id_owned = false;
+    model_owned = false;
+    session_rt_owned = false;
+    session_mcp_owned = false;
     try writeNewSessionResponse(state, alloc, msg, session_id);
 }
 
@@ -593,47 +675,68 @@ fn handleRestoreSession(
         }
     }
 
-    var store = (if (state.cfg.home_override) |home|
-        session_store.Store.initFromHome(alloc, home, state.workspace_root)
-    else
-        session_store.Store.init(alloc, state.workspace_root)) catch
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Session store not available",
-        });
+    // One backend per process: the saved state comes from v2 when this
+    // connection keeps sessions there, else from v1.
+    var store: ?session_store.Store = null;
     var store_owned = true;
-    defer if (store_owned) store.deinit(alloc);
-
-    const seed_preferences = session_codec.DurableSessionPreferences{
-        .provider = state.provider,
-        .model = state.configured_model,
-        .effort = state.effort,
-        .fast_mode = state.fast_mode,
-    };
-    var writable = subagent_resume_admission.resumeForExternalPrompt(
-        store,
-        alloc,
-        .{ .id = session_id },
-        state.workspace_root,
-        .{
-            .seed_preferences = seed_preferences,
-            .log = .{},
-        },
-    ) catch |err| return handleLoadFailure(state, alloc, msg, err);
+    defer if (store_owned) if (store) |*value| value.deinit(alloc);
+    var writable: ?session_store.LoadedWritableSession = null;
     var writable_owned = true;
-    defer if (writable_owned) writable.deinit(alloc);
+    defer if (writable_owned) if (writable) |*value| value.deinit(alloc);
+    var v2: ?*session_adapter.Session = null;
+    var v2_owned = true;
+    defer if (v2_owned) if (v2) |value| value.close();
+    var v2_resumed: ?session_adapter.Resumed = null;
+    defer if (v2_resumed) |*value| value.deinit(alloc);
+    const backend = server.sessionsBackend(state);
+    if (backend == .v2_unavailable) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.internal_error,
+        .message = "Session store not available",
+    });
+    if (backend == .v2) {
+        v2 = session_adapter.Session.resumeSession(alloc, backend.v2, .{ .id = session_id }, state.workspace_root, .acp) catch |err|
+            return handleLoadFailure(state, alloc, msg, err);
+        v2_resumed = v2.?.durableState(alloc, state.workspace_root) catch |err|
+            return handleLoadFailure(state, alloc, msg, err);
+    } else {
+        store = (if (state.cfg.home_override) |home|
+            session_store.Store.initFromHome(alloc, home, state.workspace_root)
+        else
+            session_store.Store.init(alloc, state.workspace_root)) catch
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Session store not available",
+            });
+        const seed_preferences = session_codec.DurableSessionPreferences{
+            .provider = state.provider,
+            .model = state.configured_model,
+            .effort = state.effort,
+            .fast_mode = state.fast_mode,
+        };
+        writable = subagent_resume_admission.resumeForExternalPrompt(
+            store.?,
+            alloc,
+            .{ .id = session_id },
+            state.workspace_root,
+            .{
+                .seed_preferences = seed_preferences,
+                .log = .{},
+            },
+        ) catch |err| return handleLoadFailure(state, alloc, msg, err);
+    }
+    const durable: *const session_codec.DurableSessionState = if (v2_resumed) |*value| &value.state else &writable.?.state;
 
-    const sid_copy = try alloc.dupe(u8, writable.state.id);
+    const sid_copy = try alloc.dupe(u8, durable.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
     const effective_provider = if (state.process_provider_override)
         state.provider
     else
-        writable.state.preferences.provider;
+        durable.preferences.provider;
     const effective_model = if (state.process_model_override or state.process_provider_override)
         state.selected_model
     else
-        writable.state.preferences.model;
+        durable.preferences.model;
     var staged_credential = server.prepareCredentialForProvider(state, effective_provider) catch |err| {
         if (err != error.ProviderCredentialUnavailable) return err;
         return state.writer.writeError(alloc, msg.id, .{
@@ -662,35 +765,39 @@ fn handleRestoreSession(
     _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
     try session_rt.restoreWithPermissionState(
         alloc,
-        writable.state.conversation_language,
-        writable.state.history,
-        writable.state.permission_state,
+        durable.conversation_language,
+        durable.history,
+        durable.permission_state,
     );
-    if (writable.state.usage) |usage| {
+    if (durable.usage) |usage| {
         try session_rt.usage.restore(
             alloc,
             usage,
-            writable.state.created_at_ms,
+            durable.created_at_ms,
         );
     } else {
         session_rt.usage.restoreLegacyWallDuration(
-            writable.state.created_at_ms,
+            durable.created_at_ms,
         );
     }
-    const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, session_id);
+    const session_dir = if (v2) |value|
+        try alloc.dupe(u8, value.filesPath())
+    else
+        try session_store.sessionDirPath(alloc, store.?.sessions_dir, session_id);
     defer alloc.free(session_dir);
 
-    writable.releaseHydrationHistory(alloc);
+    if (writable) |*value| value.releaseHydrationHistory(alloc);
     session_rt.configureWebFetchArtifacts(alloc, session_dir);
     server.cancelAndReapActivePrompt(state);
     activateSession(state, store, .{
         .session_id = sid_copy,
         .writable = writable,
+        .v2 = v2,
         .model = model_copy,
         .provider = effective_provider,
         .credential = if (staged_credential) |*credential| credential else null,
-        .fast_mode = writable.state.preferences.fast_mode,
-        .effort = writable.state.preferences.effort,
+        .fast_mode = durable.preferences.fast_mode,
+        .effort = durable.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
     }) catch
@@ -699,6 +806,7 @@ fn handleRestoreSession(
             .message = "Failed to save active session",
         });
     writable_owned = false;
+    v2_owned = false;
     store_owned = false;
     sid_owned = false;
     model_owned = false;
@@ -711,7 +819,7 @@ fn handleRestoreSession(
         state,
         alloc,
         session_id,
-        state.active_session.?.writable.?.state.recovery_checkpoint,
+        if (state.active_session.?.writable) |*value| value.state.recovery_checkpoint else null,
     );
     try sendActiveSessionInfoUpdate(state, alloc);
 
@@ -923,7 +1031,9 @@ fn freshAcpState(
 
 const SessionActivation = struct {
     session_id: []u8,
-    writable: session_store.LoadedWritableSession,
+    /// Exactly one of `writable` (with the store) and `v2` is set.
+    writable: ?session_store.LoadedWritableSession = null,
+    v2: ?*session_adapter.Session = null,
     model: []u8,
     provider: model_provider.ProviderId,
     credential: ?*credentials.Credential = null,
@@ -935,15 +1045,17 @@ const SessionActivation = struct {
 
 fn activateSession(
     state: *server.ServerState,
-    store: session_store.Store,
+    store: ?session_store.Store,
     activation: SessionActivation,
 ) !void {
+    std.debug.assert((activation.writable != null) != (activation.v2 != null));
     try server.releaseActiveSession(state);
     if (activation.credential) |credential| server.adoptServerCredential(state, credential);
     state.active_session = .{
         .session_id = activation.session_id,
         .store = store,
         .writable = activation.writable,
+        .v2 = activation.v2,
         .model = activation.model,
         .provider = activation.provider,
         .mode = state.cfg.mode_registry.default_mode_id,
@@ -1039,6 +1151,7 @@ fn handleLoadFailure(
     }
     if (err == error.InvalidSessionFormat or
         err == error.UnsupportedSessionSchema or
+        err == error.UnsupportedSessionFormat or
         err == error.LegacySessionTooLarge or
         err == error.LegacySessionReadResourceExhausted or
         err == error.SessionAuthorityBoundaryUnavailable or
@@ -1065,6 +1178,12 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
             .code = ErrorCode.invalid_params,
             .message = "Invalid params",
         });
+    switch (server.sessionsBackend(state)) {
+        .v1 => {},
+        .v2 => |v2_store| return listV2Sessions(state, alloc, msg, v2_store, params),
+        // As v1 answers when its store cannot open.
+        .v2_unavailable => return state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}"),
+    }
     var store = (if (state.cfg.home_override) |home|
         session_store.Store.initReadOnlyFromHome(alloc, home, params.cwd orelse state.workspace_root)
     else
@@ -1085,11 +1204,63 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
         return;
     };
     defer page.deinit(alloc);
+    try writeSessionPage(state, alloc, msg, page.summaries.items, page.has_more);
+}
+
+/// `session/list` on v2, paged as v1 pages it: newest first, one
+/// workspace when `cwd` is given, and only what follows the cursor.
+fn listV2Sessions(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    v2_store: *session_adapter.Store,
+    params: ListSessionsParams,
+) !void {
+    var cancel = std.atomic.Value(bool).init(false);
+    var summaries = session_adapter.listSummaries(v2_store, alloc, null, &cancel) catch |err| {
+        debug_trace.logf("acp", "session operation=list outcome=failed backend=v2 error={s}", .{@errorName(err)});
+        try state.writer.writeResponse(alloc, msg.id, "{\"sessions\":[]}");
+        return;
+    };
+    defer {
+        for (summaries.items) |*summary| summary.deinit(alloc);
+        summaries.deinit(alloc);
+    }
+    session_summary_codec.sortSummariesNewestFirst(summaries.items);
+    var page: std.ArrayList(session_store.SessionSummary) = .empty;
+    defer page.deinit(alloc);
+    var has_more = false;
+    // Matched as v1 matches it: exactly, after trailing slashes.
+    const cwd = if (params.cwd) |value| session_store_paths.normalizeWorkspaceRoot(value) else null;
+    for (summaries.items) |summary| {
+        if (cwd) |root| {
+            const workspace_root = summary.workspace_root orelse continue;
+            if (!std.mem.eql(u8, workspace_root, root)) continue;
+        }
+        if (params.continuation) |continuation| {
+            if (!session_summary_codec.summaryFollowsContinuation(summary, continuation)) continue;
+        }
+        if (page.items.len == session_store.session_list_default_limit) {
+            has_more = true;
+            break;
+        }
+        try page.append(alloc, summary);
+    }
+    try writeSessionPage(state, alloc, msg, page.items, has_more);
+}
+
+fn writeSessionPage(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    summaries: []const session_store.SessionSummary,
+    has_more: bool,
+) !void {
     var next_cursor_buf: [320]u8 = undefined;
-    const next_cursor = if (page.has_more and page.summaries.items.len > 0)
+    const next_cursor = if (has_more and summaries.len > 0)
         try std.fmt.bufPrint(&next_cursor_buf, "v1:{d}:{s}", .{
-            page.summaries.items[page.summaries.items.len - 1].updated_at_ms,
-            page.summaries.items[page.summaries.items.len - 1].id,
+            summaries[summaries.len - 1].updated_at_ms,
+            summaries[summaries.len - 1].id,
         })
     else
         null;
@@ -1099,7 +1270,7 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
 
     try out.writer.writeAll("{\"sessions\":[");
     var wrote_session = false;
-    for (page.summaries.items) |summary| {
+    for (summaries) |summary| {
         const workspace_root = summary.workspace_root orelse {
             debug_trace.logf(
                 "acp",
@@ -1205,6 +1376,20 @@ fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, sessio
         };
         var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id };
         return store.visitConversationHistory(alloc, session_id, &visitor);
+    }
+    // Every saved turn, as v1 replays it, not only those in memory.
+    if (active.v2) |v2| {
+        const Visitor = struct {
+            state: *server.ServerState,
+            alloc: Allocator,
+            session_id: []const u8,
+
+            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, turn);
+            }
+        };
+        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id };
+        return v2.visitHistory(alloc, &visitor);
     }
     for (active.session_rt.agent.history.items) |turn| {
         try sendHistoryTurnAsUpdates(state, alloc, session_id, turn);
@@ -1497,10 +1682,18 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
             metadata = .{ .present = true, .title = title };
         }
     }
+    const v2_info: ?session_adapter.Session.Info = if (active.v2) |v2| try v2.info(alloc) else null;
+    if (v2_info) |info| if (info.title) |title| {
+        metadata.deinit(alloc);
+        metadata = .{ .present = true, .title = title };
+    };
     const updated_at_ms = if (active.writable) |*writable|
         writable.state.updated_at_ms
     else if (active.wasm_state) |durable|
         durable.updated_at_ms
+    else if (v2_info) |info|
+        // Not saved yet: a new session has no line before its first prompt.
+        if (info.updated_ms > 0) info.updated_ms else io_mod.milliTimestamp()
     else
         io_mod.milliTimestamp();
     const updated_at = try formatIso8601(alloc, @max(updated_at_ms, 0));

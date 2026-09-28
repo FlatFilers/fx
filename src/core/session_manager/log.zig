@@ -488,12 +488,47 @@ pub const Line = struct {
 /// Reads lines in file order from a line boundary up to `limit`. It stops
 /// quietly at an incomplete or bad final line (a torn tail), and returns
 /// Corrupt for a bad line or seq gap with lines after it.
+/// The block buffer of a reader. Its memory is allocated raw: a checked
+/// build fills every new allocation with 0xaa one byte at a time, and here
+/// each block is overwritten by the read at once, so the fill only cost
+/// time (a third of a full read). Every byte in `items` was read.
+const ReadBuffer = struct {
+    items: []u8 = &.{},
+    capacity: usize = 0,
+
+    fn resize(b: *ReadBuffer, gpa: std.mem.Allocator, new_len: usize) error{OutOfMemory}!void {
+        if (new_len > b.capacity) {
+            const capacity = @max(new_len, b.capacity *| 2);
+            const memory = gpa.rawAlloc(capacity, .@"1", @returnAddress()) orelse return error.OutOfMemory;
+            @memcpy(memory[0..b.items.len], b.items);
+            b.release(gpa);
+            b.items.ptr = memory;
+            b.capacity = capacity;
+        }
+        b.items.len = new_len;
+    }
+
+    fn shrinkRetainingCapacity(b: *ReadBuffer, new_len: usize) void {
+        std.debug.assert(new_len <= b.items.len);
+        b.items.len = new_len;
+    }
+
+    fn release(b: *ReadBuffer, gpa: std.mem.Allocator) void {
+        if (b.capacity > 0) gpa.rawFree(b.items.ptr[0..b.capacity], .@"1", @returnAddress());
+    }
+
+    fn deinit(b: *ReadBuffer, gpa: std.mem.Allocator) void {
+        b.release(gpa);
+        b.* = .{};
+    }
+};
+
 pub const ForwardReader = struct {
     gpa: std.mem.Allocator,
     s: storage.Storage,
     file: storage.File,
     limit: u64,
-    buf: std.ArrayList(u8) = .empty,
+    buf: ReadBuffer = .{},
     /// File offset of `buf.items[0]`.
     buf_offset: u64,
     pos: usize = 0,
@@ -558,7 +593,7 @@ pub const BackwardReader = struct {
     /// Offset just past the next line to return.
     pos: u64,
     /// Holds the file bytes [buf_offset, pos).
-    buf: std.ArrayList(u8) = .empty,
+    buf: ReadBuffer = .{},
     buf_offset: u64,
     expected_seq: ?u64 = null,
     /// Offset just past the damaged line when `next` returned Corrupt.

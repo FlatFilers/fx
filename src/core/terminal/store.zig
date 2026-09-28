@@ -474,6 +474,10 @@ pub const ProfileStore = struct {
     process_provider: process_provider_mod.Provider,
     sessions_dir: io_mod.VerifiedDir,
     display_sessions_path: []u8,
+    /// `~/.fx`, kept open to reach the side folders of v2 sessions, which
+    /// hold their terminal state in v1's layout (D27).
+    fx_dir: io_mod.VerifiedDir,
+    display_files_path: []u8,
     options: Options,
     mutex: std.Io.Mutex = .init,
     residents: std.ArrayList(*DurableSession) = .empty,
@@ -504,17 +508,22 @@ pub const ProfileStore = struct {
             &home_dir,
             profile_paths.root_dir_name,
         );
-        defer fx_dir.close();
+        errdefer fx_dir.close();
         var sessions_dir = try io_mod.openOrCreateVerifiedPrivateDir(
             &fx_dir,
             profile_paths.sessions_dir_name,
         );
         errdefer sessions_dir.close();
+        const display_sessions_path = try profile_paths.sessionsDir(alloc, home);
+        errdefer alloc.free(display_sessions_path);
+        const display_files_path = try std.fs.path.join(alloc, &.{ home, profile_paths.root_dir_name, profile_paths.session_files_dir_name });
         return .{
             .alloc = alloc,
             .process_provider = process_provider,
             .sessions_dir = sessions_dir,
-            .display_sessions_path = try profile_paths.sessionsDir(alloc, home),
+            .display_sessions_path = display_sessions_path,
+            .fx_dir = fx_dir,
+            .display_files_path = display_files_path,
             .options = options,
         };
     }
@@ -523,7 +532,9 @@ pub const ProfileStore = struct {
         std.debug.assert(self.residents.items.len == 0);
         self.residents.deinit(self.alloc);
         self.alloc.free(self.display_sessions_path);
+        self.alloc.free(self.display_files_path);
         self.sessions_dir.close();
+        self.fx_dir.close();
         self.* = undefined;
     }
 
@@ -586,21 +597,10 @@ pub const ProfileStore = struct {
         comptime proof_route: bool,
     ) !session_child_store.SessionChildCapability {
         try session_layout.validateSessionId(owner_session_id);
-        var owner_dir = self.sessions_dir.dir.openDir(
-            io_mod.getIo(),
-            owner_session_id,
-            .{ .iterate = true, .follow_symlinks = false },
-        ) catch |err| switch (err) {
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        defer owner_dir.close(io_mod.getIo());
-        const display_path = try session_layout.sessionDirPath(
-            self.alloc,
-            self.display_sessions_path,
-            owner_session_id,
-        );
-        defer self.alloc.free(display_path);
+        var owner = try self.open_owner(owner_session_id);
+        defer owner.deinit(self.alloc);
+        const owner_dir = owner.dir;
+        const display_path = owner.display_path;
         return if (proof_route)
             session_child_store.SessionChildCapability.initTerminalProofs(
                 self.alloc,
@@ -617,6 +617,83 @@ pub const ProfileStore = struct {
                 .writable,
                 .{},
             );
+    }
+
+    const OwnerFolder = struct {
+        dir: std.Io.Dir,
+        display_path: []u8,
+
+        fn deinit(owner: *OwnerFolder, alloc: Allocator) void {
+            owner.dir.close(io_mod.getIo());
+            alloc.free(owner.display_path);
+        }
+    };
+
+    /// The folder an owner keeps its terminal state in: its v1 session
+    /// folder, or the side folder of a v2 session (D27).
+    fn open_owner(self: *ProfileStore, owner_session_id: []const u8) !OwnerFolder {
+        const zio = io_mod.getIo();
+        const options: std.Io.Dir.OpenOptions = .{ .iterate = true, .follow_symlinks = false };
+        if (self.sessions_dir.dir.openDir(zio, owner_session_id, options)) |found| {
+            var dir = found;
+            errdefer dir.close(zio);
+            return .{ .dir = dir, .display_path = try session_layout.sessionDirPath(self.alloc, self.display_sessions_path, owner_session_id) };
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+            else => return err,
+        }
+        var files = (try self.open_files_root()) orelse return error.FileNotFound;
+        defer files.close();
+        var dir = files.dir.openDir(zio, owner_session_id, options) catch |err| switch (err) {
+            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+            else => return err,
+        };
+        errdefer dir.close(zio);
+        return .{ .dir = dir, .display_path = try session_layout.sessionDirPath(self.alloc, self.display_files_path, owner_session_id) };
+    }
+
+    /// `~/.fx/session-files`, once a v2 session has made it. Opened for each
+    /// use: it can appear after this store opened.
+    fn open_files_root(self: *ProfileStore) !?io_mod.VerifiedDir {
+        return io_mod.openVerifiedPrivateDirIfPresent(&self.fx_dir, profile_paths.session_files_dir_name);
+    }
+
+    /// Every owner folder: v1 session folders, then the side folders of v2
+    /// sessions whose id has no v1 folder. A name lasts until the next call.
+    const OwnerIterator = struct {
+        store: *ProfileStore,
+        sessions: std.Io.Dir.Iterator,
+        files: ?io_mod.VerifiedDir,
+        files_iter: ?std.Io.Dir.Iterator = null,
+
+        fn next(it: *OwnerIterator) !?[]const u8 {
+            const zio = io_mod.getIo();
+            while (try it.sessions.next(zio)) |entry| {
+                if (isOwner(entry)) return entry.name;
+            }
+            const files = if (it.files) |*value| value else return null;
+            if (it.files_iter == null) it.files_iter = files.dir.iterate();
+            while (try it.files_iter.?.next(zio)) |entry| {
+                if (!isOwner(entry)) continue;
+                if (it.store.sessions_dir.dir.statFile(zio, entry.name, .{ .follow_symlinks = false })) |_| continue else |_| {}
+                return entry.name;
+            }
+            return null;
+        }
+
+        fn deinit(it: *OwnerIterator) void {
+            if (it.files) |*value| value.close();
+        }
+
+        fn isOwner(entry: anytype) bool {
+            session_layout.validateSessionId(entry.name) catch return false;
+            return entry.kind == .directory;
+        }
+    };
+
+    fn owner_iterator(self: *ProfileStore) !OwnerIterator {
+        return .{ .store = self, .sessions = self.sessions_dir.dir.iterate(), .files = try self.open_files_root() };
     }
 
     fn open_existing(
@@ -652,11 +729,10 @@ pub const ProfileStore = struct {
         }
         var result: ?DurableSession = null;
         errdefer if (result) |*session| session.deinit();
-        var iter = self.sessions_dir.dir.iterate();
-        while (try iter.next(zio)) |entry| {
-            session_layout.validateSessionId(entry.name) catch continue;
-            if (entry.kind != .directory) continue;
-            var capability = self.open_capability(entry.name, false) catch continue;
+        var owners = try self.owner_iterator();
+        defer owners.deinit();
+        while (try owners.next()) |owner_id| {
+            var capability = self.open_capability(owner_id, false) catch continue;
             defer capability.deinit();
             const name = try record_name(self.alloc, terminal_session_id);
             defer self.alloc.free(name);
@@ -665,7 +741,7 @@ pub const ProfileStore = struct {
                 else => return err,
             };
             if (result != null) return error.DuplicateTerminalSession;
-            result = try self.open_existing(entry.name, terminal_session_id);
+            result = try self.open_existing(owner_id, terminal_session_id);
         }
         const session = result orelse return error.TerminalSessionNotFound;
         const resident = try self.alloc.create(DurableSession);
@@ -795,11 +871,10 @@ pub const ProfileStore = struct {
     }
 
     fn retry_pending_cleanups(self: *ProfileStore) !void {
-        var iter = self.sessions_dir.dir.iterate();
-        while (try iter.next(io_mod.getIo())) |entry| {
-            session_layout.validateSessionId(entry.name) catch continue;
-            if (entry.kind != .directory) continue;
-            var capability = self.open_capability(entry.name, false) catch continue;
+        var owners = try self.owner_iterator();
+        defer owners.deinit();
+        while (try owners.next()) |owner_id| {
+            var capability = self.open_capability(owner_id, false) catch continue;
             defer capability.deinit();
             var names = capability.iterate(self.alloc, .terminal_state) catch continue;
             defer names.deinit();
@@ -807,7 +882,7 @@ pub const ProfileStore = struct {
                 const terminal_id = terminal_id_from_record_name(name) orelse continue;
                 var detached: ?DurableSession = null;
                 const session = self.resident_by_id(terminal_id) orelse blk: {
-                    detached = self.open_existing(entry.name, terminal_id) catch continue;
+                    detached = self.open_existing(owner_id, terminal_id) catch continue;
                     break :blk &detached.?;
                 };
                 defer if (detached) |*value| value.deinit();
@@ -821,11 +896,10 @@ pub const ProfileStore = struct {
     fn scan_payload_candidates(self: *ProfileStore) !CandidateList {
         var list = CandidateList{};
         errdefer list.deinit(self.alloc);
-        var iter = self.sessions_dir.dir.iterate();
-        while (try iter.next(io_mod.getIo())) |entry| {
-            session_layout.validateSessionId(entry.name) catch continue;
-            if (entry.kind != .directory) continue;
-            var capability = self.open_capability(entry.name, false) catch continue;
+        var owners = try self.owner_iterator();
+        defer owners.deinit();
+        while (try owners.next()) |owner_id| {
+            var capability = self.open_capability(owner_id, false) catch continue;
             defer capability.deinit();
             var names = capability.iterate(self.alloc, .terminal_state) catch continue;
             defer names.deinit();
@@ -894,11 +968,10 @@ pub const ProfileStore = struct {
     ) !RecoveredList {
         var recovered = RecoveredList{ .profile = self };
         errdefer recovered.deinit();
-        var iter = self.sessions_dir.dir.iterate();
-        while (try iter.next(io_mod.getIo())) |entry| {
-            session_layout.validateSessionId(entry.name) catch continue;
-            if (entry.kind != .directory) continue;
-            var capability = self.open_capability(entry.name, false) catch continue;
+        var owners = try self.owner_iterator();
+        defer owners.deinit();
+        while (try owners.next()) |owner_id| {
+            var capability = self.open_capability(owner_id, false) catch continue;
             defer capability.deinit();
             var names = capability.iterate(self.alloc, .terminal_state) catch continue;
             defer names.deinit();
@@ -908,7 +981,7 @@ pub const ProfileStore = struct {
                 terminal_ids.deinit(self.alloc);
             }
             try collect_artifact_ids(self.alloc, &terminal_ids, names.names);
-            var proof_capability = self.open_capability(entry.name, true) catch null;
+            var proof_capability = self.open_capability(owner_id, true) catch null;
             defer if (proof_capability) |*proofs| proofs.deinit();
             if (proof_capability) |*proofs| {
                 var proof_names = proofs.iterate(
@@ -925,7 +998,7 @@ pub const ProfileStore = struct {
                 }
             }
             for (terminal_ids.items) |terminal_id| {
-                var session = self.open_existing(entry.name, terminal_id) catch |err| {
+                var session = self.open_existing(owner_id, terminal_id) catch |err| {
                     if (err == error.TerminalRecordNotFound) {
                         cleanup_session_artifacts(
                             self.alloc,
@@ -936,7 +1009,7 @@ pub const ProfileStore = struct {
                     }
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         if (err == error.TerminalRecordNotFound)
                             "PartialStartArtifacts"
@@ -952,7 +1025,7 @@ pub const ProfileStore = struct {
                         try session.isolate_invalid_close_transaction(now_ms);
                         try recovered.append_diagnostic(
                             self.alloc,
-                            entry.name,
+                            owner_id,
                             terminal_id,
                             "InvalidCloseTransaction",
                         );
@@ -963,7 +1036,7 @@ pub const ProfileStore = struct {
                 if (repaired_close) {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         "CloseTransactionReconciled",
                     );
@@ -971,7 +1044,7 @@ pub const ProfileStore = struct {
                 const removed_orphans = session.reconcile_unreferenced_artifacts() catch |err| blk: {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         @errorName(err),
                     );
@@ -980,7 +1053,7 @@ pub const ProfileStore = struct {
                 if (removed_orphans) {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         "UnreferencedArtifacts",
                     );
@@ -990,7 +1063,7 @@ pub const ProfileStore = struct {
                     if (!is_definitive_recovery_authority_error(err)) return err;
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         @errorName(err),
                     );
@@ -1000,7 +1073,7 @@ pub const ProfileStore = struct {
                 if (repaired_authority) {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         "AuthorityRecordReconciled",
                     );
@@ -1008,7 +1081,7 @@ pub const ProfileStore = struct {
                 const repaired_journal = session.reconcile_journals() catch |err| blk: {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         @errorName(err),
                     );
@@ -1017,7 +1090,7 @@ pub const ProfileStore = struct {
                 if (repaired_journal) {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         "CorruptJournalChain",
                     );
@@ -1025,7 +1098,7 @@ pub const ProfileStore = struct {
                 session.reconcile_checkpoint() catch |err| {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         @errorName(err),
                     );
@@ -1033,7 +1106,7 @@ pub const ProfileStore = struct {
                 const repaired_events = session.reconcile_events() catch |err| blk: {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         @errorName(err),
                     );
@@ -1042,7 +1115,7 @@ pub const ProfileStore = struct {
                 if (repaired_events) {
                     try recovered.append_diagnostic(
                         self.alloc,
-                        entry.name,
+                        owner_id,
                         terminal_id,
                         "CorruptEventChain",
                     );
@@ -1056,7 +1129,7 @@ pub const ProfileStore = struct {
                             if (!is_definitive_recovery_authority_error(err)) return err;
                             try recovered.append_diagnostic(
                                 self.alloc,
-                                entry.name,
+                                owner_id,
                                 terminal_id,
                                 @errorName(err),
                             );
@@ -5766,6 +5839,42 @@ fn testSignalProcess(
     _: process_identity.ProcessInstanceToken,
 ) process_provider_mod.ProviderError!void {
     return error.Unsupported;
+}
+
+test "a v2 session's side folder owns terminal state, and every scan sees both roots" {
+    var fixture = try TestStoreFixture.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    // Made after the store opened, as a v2 session makes it (D27).
+    var root = io_mod.VerifiedDir{ .dir = try fixture.tmp.dir.openDir(std.testing.io, ".fx", .{ .iterate = true, .follow_symlinks = false }) };
+    defer root.close();
+    var files = try io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.session_files_dir_name);
+    defer files.close();
+    for ([_][]const u8{ "v2-side-owner", "terminal-store-owner" }) |name| {
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&files, name);
+        owner.close();
+    }
+
+    var capability = try fixture.profile.open_capability("v2-side-owner", false);
+    capability.deinit();
+    try std.testing.expectError(error.FileNotFound, fixture.profile.open_capability("absent-owner", false));
+
+    // A v1 folder and a v2 folder of the same id are one owner, seen once.
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |name| std.testing.allocator.free(name);
+        names.deinit(std.testing.allocator);
+    }
+    var owners = try fixture.profile.owner_iterator();
+    defer owners.deinit();
+    while (try owners.next()) |name| try names.append(std.testing.allocator, try std.testing.allocator.dupe(u8, name));
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn less(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    try std.testing.expectEqual(@as(usize, 2), names.items.len);
+    try std.testing.expectEqualStrings("terminal-store-owner", names.items[0]);
+    try std.testing.expectEqualStrings("v2-side-owner", names.items[1]);
 }
 
 const TestStoreFixture = struct {

@@ -38,6 +38,8 @@ const permission_request = @import("../core/permissions/permission_request.zig")
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
+const session_adapter = @import("../core/session/session_adapter.zig");
+const session_child_store = @import("../core/session/session_child_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
@@ -392,10 +394,7 @@ const AcpContext = struct {
             .on_output_chunk = onCommandOutputChunk,
             .mcp_progress_ctx = @ptrCast(self),
             .on_mcp_progress = onMcpProgress,
-            .session_child_capability = if (session.writable) |*writable|
-                writable.childCapability() catch null
-            else
-                null,
+            .session_child_capability = sessionChildCapability(session),
             .terminal_client = &self.state.terminal_client,
             .managed_executions = &self.state.managed_executions,
             .ephemeral_command_replay = self.state.managed_executions.replayStore(),
@@ -696,7 +695,7 @@ pub fn handlePrompt(
         return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
-        if (session.store == null and session.wasm_state == null) {
+        if (session.store == null and session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
             prompt_input.captureImagesInline(alloc) catch |err|
@@ -705,10 +704,11 @@ pub fn handlePrompt(
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
+            // A v2 session keeps them in its side folder, like v1's.
             const snapshot_dir = try session_store.imageSnapshotStorageDir(
                 alloc,
-                if (session.store) |store| store.sessions_dir else null,
-                if (session.store != null) session.session_id else null,
+                if (session.v2) |v2| std.fs.path.dirname(try v2.ensureFilesPath()) else if (session.store) |store| store.sessions_dir else null,
+                if (session.store != null or session.v2 != null) session.session_id else null,
                 &temporary_snapshot_dir,
             );
             defer alloc.free(snapshot_dir);
@@ -840,7 +840,7 @@ pub fn handlePrompt(
     };
 
     session.session_rt.usage.configureCheckpointSink(
-        if (session.writable != null)
+        if (session.writable != null or session.v2 != null)
             .{
                 .context = @ptrCast(&ctx),
                 .allocator = alloc,
@@ -881,10 +881,7 @@ pub fn handlePrompt(
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
     }, current_prompt_is_root_authority);
-    agent_config.session_child_capability = if (session.writable) |*writable|
-        writable.childCapability() catch null
-    else
-        null;
+    agent_config.session_child_capability = sessionChildCapability(session);
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null);
     defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
@@ -931,14 +928,14 @@ fn maybeStartAcpTitleTask(
     if (!state.session_titles or recovery) return;
     if (session.title_task != null) return;
     if (session.session_rt.agent.history.items.len != 0) return;
-    const writable = if (session.writable) |*value| value else return;
+    const session_id = if (session.writable) |*value| value.active_id else if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
     const title_model = bundle.title_model orelse return;
     const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
     if (session.credential_source != .host_managed and session.api_key.len == 0) return;
     const task = session_title_generation.Task.create(.{
-        .session_id = writable.active_id,
+        .session_id = session_id,
         .model = title_model,
         .prompt_excerpt = excerpt,
         .api_key = if (session.api_key.len > 0) session.api_key else null,
@@ -967,6 +964,18 @@ fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessi
     defer std.heap.c_allocator.free(title);
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
+    if (session.v2) |v2| {
+        if (!std.mem.eql(u8, v2.id(), task.session_id)) {
+            debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+            return;
+        }
+        const installed = v2.installGeneratedTitle(session.session_rt.agent.history.items, title) catch |err| {
+            debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+            return;
+        };
+        if (installed) debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+        return;
+    }
     const writable = if (session.writable) |*value| value else return;
     if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
         debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
@@ -1452,6 +1461,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
+        .append_turn_piece = if (session.v2 != null) appendTurnPiece else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.writable != null)
             .{
@@ -1538,6 +1548,7 @@ fn persistUsageCheckpoint(
     }
     active.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer active.session_write_mutex.unlock(io_mod.getIo());
+    if (active.v2) |v2| return v2.persistUsage(snapshot);
     const writable = if (active.writable) |*value|
         value
     else
@@ -2140,6 +2151,26 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     }
 }
 
+/// `AgentRuntimeDeps.append_turn_piece` on v2: the pieces finished so far,
+/// and the tool calls about to run, reach the log before the next request.
+/// A failed write only defers them to the turn's commit.
+fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    v2.appendProgress(progress.user, progress.execution, progress.running_calls) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
+    };
+}
+
+fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
+    if (session.writable) |*writable| return writable.childCapability() catch null;
+    if (session.v2) |v2| return v2.childCapability() catch null;
+    return null;
+}
+
 fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
@@ -2156,6 +2187,18 @@ fn persistAcpHistoryTurn(
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
+        return;
+    }
+    if (session.v2) |v2| {
+        try v2.prepareTurn(&prepared);
+        v2.commitTurn(prepared, session.session_rt.languageSnapshot()) catch |err| {
+            // A failed write may still have reached the log: keep its images.
+            if (session_adapter.writeMayHaveLanded(err)) if (current_prompt_input) |input| input.retainImageSnapshots();
+            return err;
+        };
+        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
+        prepared_owned = false;
+        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         return;
     }
     const writable = if (session.writable) |*value| value else {
@@ -2198,6 +2241,17 @@ fn commitContextCompaction(
     const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, session.session_rt.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(session.session_rt.agent.history.items) });
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurnSlice(ctx.alloc, prepared);
+    if (session.v2) |v2| {
+        v2.commitCompaction(summary, active_prefix != null, retained_from) catch |err| {
+            if (session_adapter.writeMayHaveLanded(err) and active_prefix != null) {
+                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+            }
+            return err;
+        };
+        if (active_prefix != null) {
+            if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
+        }
+    }
     if (session.writable) |*writable| {
         _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
             if (err == error.SessionPersistenceUncertain and active_prefix != null) {
@@ -3051,6 +3105,7 @@ test "ACP usage checkpoints honor the active session write boundary" {
     defer snapshot.deinit(alloc);
 
     var active: server.ActiveSessionState = undefined;
+    active.v2 = null;
     active.session_id = @constCast("session-test");
     active.writable = null;
     active.session_write_mutex = .init;
@@ -3162,6 +3217,7 @@ test "ACP usage checkpoints maintain the profile recovery marker" {
     defer pending.deinit(alloc);
 
     var active: server.ActiveSessionState = undefined;
+    active.v2 = null;
     active.session_id = writable.active_id;
     active.store = store;
     active.writable = writable;
