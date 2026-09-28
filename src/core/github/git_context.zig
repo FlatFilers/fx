@@ -46,11 +46,11 @@ fn snapshotAt(alloc: Allocator, cwd: []const u8) !Snapshot {
 
     return .{
         .in_git_repo = in_git_repo,
-        .text = try formatSnapshot(alloc, branch, status, log, staged, unstaged),
+        .text = try formatSnapshot(alloc, branch, status, log, staged, unstaged, content_overrides != null),
     };
 }
 
-const diff_stat_args = [_][]const u8{ "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--stat" };
+const diff_stat_args = [_][]const u8{ "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--submodule=short", "--stat" };
 
 const Git = struct {
     executable: ?[]const u8,
@@ -62,7 +62,7 @@ const Git = struct {
         const executable = self.executable orelse return null;
         return git_command.repositoryFilterOverrides(arena, executable, self.cwd, null) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.RepositoryFiltersUnverified => {
+            error.RepositoryFiltersUnverified, error.TimeoutExpired, error.Cancelled => {
                 debug_trace.logf("core", "git snapshot omitted worktree status and diff: repository filters unverified", .{});
                 return null;
             },
@@ -86,10 +86,16 @@ const Git = struct {
         const executable = self.executable orelse return null;
         var argv = try buildGitArgv(alloc, executable, overrides, args);
         defer argv.deinit(alloc);
+        var environment = git_command.readOnlyEnvironment(alloc, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer environment.deinit();
 
         const result = std.process.run(alloc, io_mod.getIo(), .{
             .argv = argv.items,
             .cwd = .{ .path = self.cwd },
+            .environ_map = &environment,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return null,
@@ -135,6 +141,7 @@ fn formatSnapshot(
     log: ?[]const u8,
     staged: ?[]const u8,
     unstaged: ?[]const u8,
+    filters_verified: bool,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -148,7 +155,7 @@ fn formatSnapshot(
     try out.writer.writeAll("\nStaged diff stat:\n");
     try writeBody(&out.writer, staged, "none");
     try out.writer.writeAll("\nUnstaged diff stat:\n");
-    try writeBody(&out.writer, unstaged, "none");
+    try writeBody(&out.writer, unstaged, if (filters_verified) "none" else "unavailable");
 
     return try out.toOwnedSlice();
 }
@@ -160,7 +167,7 @@ fn writeBody(writer: *std.Io.Writer, value: ?[]const u8, fallback: []const u8) !
 }
 
 test "snapshot formatting: null git values match core fallback text exactly" {
-    const text = try formatSnapshot(std.testing.allocator, null, null, null, null, null);
+    const text = try formatSnapshot(std.testing.allocator, null, null, null, null, null, true);
     defer std.testing.allocator.free(text);
 
     try std.testing.expectEqualStrings(
@@ -190,6 +197,7 @@ test "snapshot formatting: populated sections preserve layout exactly" {
         "abc123 first\n",
         " src/main.zig | 2 ++",
         " src/core/github/git_context.zig | 5 +++++",
+        true,
     );
     defer std.testing.allocator.free(text);
 
@@ -242,13 +250,36 @@ test "snapshot returns owned Git status text" {
     try std.testing.expect(std.mem.find(u8, state.text, "Branch:") != null);
 }
 
+test "snapshot marks worktree details unavailable when repository filter keys cannot be overridden" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const trap = try git_command.createTrapRepositoryForTest(alloc, &tmp);
+    defer trap.deinit(alloc);
+    const executable = git_command.trustedExecutable() orelse return error.SkipZigTest;
+    const configured = try std.process.run(alloc, std.testing.io, .{
+        .argv = &.{ executable, "config", "filter.a=b.clean", "cat" },
+        .cwd = .{ .path = trap.root },
+    });
+    defer alloc.free(configured.stdout);
+    defer alloc.free(configured.stderr);
+    try std.testing.expect(configured.term == .exited and configured.term.exited == 0);
+
+    const state = try snapshotAt(alloc, trap.root);
+    defer state.deinit(alloc);
+    try std.testing.expect(state.in_git_repo);
+    try std.testing.expect(std.mem.find(u8, state.text, "Status:\nunavailable\n") != null);
+    try std.testing.expect(std.mem.find(u8, state.text, "Unstaged diff stat:\nunavailable\n") != null);
+    try std.testing.expect(!trap.markerExists());
+}
+
 test "snapshot does not run programs named by repository config" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const trap = try git_command.createTrapRepositoryForTest(alloc, &tmp);
     defer trap.deinit(alloc);
-    try git_command.TrapRepositoryForTest.touchTrackedFile(&tmp);
+    try git_command.TrapRepositoryForTest.touchTrackedFile(&tmp, "needle edited\n");
 
     const state = try snapshotAt(alloc, trap.root);
     defer state.deinit(alloc);

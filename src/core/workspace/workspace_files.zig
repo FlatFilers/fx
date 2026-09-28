@@ -235,9 +235,12 @@ fn runGitRawList(
     stdout_limit: usize,
     stop_requested: ?*std.atomic.Value(bool),
 ) ![]u8 {
+    var environment = try git_command.readOnlyEnvironment(arena, null);
+    defer environment.deinit();
     const run_options: std.process.RunOptions = .{
         .argv = argv,
         .cwd = .{ .path = workspace_root },
+        .environ_map = &environment,
         .stdout_limit = std.Io.Limit.limited(stdout_limit),
         .stderr_limit = std.Io.Limit.limited(1024),
     };

@@ -780,7 +780,7 @@ fn planGitDiff(
 ) std.mem.Allocator.Error!StageAdmission {
     var argv: std.ArrayList([]const u8) = .empty;
     try appendGitPrelude(alloc, &argv);
-    try argv.appendSlice(alloc, &.{ "diff", "--no-ext-diff", "--no-textconv", "--color=never", "--ignore-submodules=dirty" });
+    try argv.appendSlice(alloc, &.{ "diff", "--no-ext-diff", "--no-textconv", "--color=never", "--ignore-submodules=dirty", "--submodule=short" });
 
     var index: usize = 0;
     while (index < arguments.len and !std.mem.eql(u8, arguments[index], "--")) : (index += 1) {
@@ -814,7 +814,7 @@ fn planGitLog(
 ) std.mem.Allocator.Error!StageAdmission {
     var argv: std.ArrayList([]const u8) = .empty;
     try appendGitPrelude(alloc, &argv);
-    try argv.appendSlice(alloc, &.{ "log", "--no-show-signature", "--no-ext-diff", "--no-textconv", "--color=never", "--max-count=100" });
+    try argv.appendSlice(alloc, &.{ "log", "--no-show-signature", "--pretty=medium", "--no-ext-diff", "--no-textconv", "--submodule=short", "--color=never", "--max-count=100" });
 
     var index: usize = 0;
     while (index < arguments.len and !std.mem.eql(u8, arguments[index], "--")) : (index += 1) {
@@ -1301,6 +1301,7 @@ test "planner pins read-only git inspection to hardened argv and environment" {
         "--no-textconv",
         "--color=never",
         "--ignore-submodules=dirty",
+        "--submodule=short",
         "--name-only",
         "--",
         "src",
@@ -1312,8 +1313,10 @@ test "planner pins read-only git inspection to hardened argv and environment" {
     const log_expected = [_][]const u8{"/usr/bin/git"} ++ git_command.global_options ++ [_][]const u8{
         "log",
         "--no-show-signature",
+        "--pretty=medium",
         "--no-ext-diff",
         "--no-textconv",
+        "--submodule=short",
         "--color=never",
         "--max-count=100",
         "--oneline",

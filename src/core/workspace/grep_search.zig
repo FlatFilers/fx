@@ -189,9 +189,12 @@ fn countDirectoryMatchesWithOptions(
 fn gitIgnoresRoot(arena: Allocator, absolute_root: []const u8) bool {
     const executable = git_command.trustedExecutable() orelse return false;
     const argv = git_command.argv(executable, &.{ "check-ignore", "-q", "--", "." });
+    var environment = git_command.readOnlyEnvironment(arena, null) catch return false;
+    defer environment.deinit();
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = &argv,
         .cwd = .{ .path = absolute_root },
+        .environ_map = &environment,
         .stdout_limit = std.Io.Limit.limited(1024),
         .stderr_limit = std.Io.Limit.limited(1024),
     }) catch return false;
@@ -447,10 +450,13 @@ fn gitGrepTrackedMatches(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
     try appendGitGrepArgv(arena, &argv, &git_grep_match_args, pattern, case_insensitive, include);
+    var environment = try git_command.readOnlyEnvironment(arena, null);
+    defer environment.deinit();
 
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = argv.items,
         .cwd = .{ .path = absolute_root },
+        .environ_map = &environment,
         .stdout_limit = std.Io.Limit.limited(git_grep_stdout_limit),
         .stderr_limit = std.Io.Limit.limited(1024),
     }) catch return error.GitGrepFailed;
@@ -483,10 +489,13 @@ fn gitGrepTrackedCounts(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
     try appendGitGrepArgv(arena, &argv, &git_grep_count_args, pattern, case_insensitive, include);
+    var environment = try git_command.readOnlyEnvironment(arena, null);
+    defer environment.deinit();
 
     const result = std.process.run(arena, io_mod.getIo(), .{
         .argv = argv.items,
         .cwd = .{ .path = absolute_root },
+        .environ_map = &environment,
         .stdout_limit = std.Io.Limit.limited(git_grep_stdout_limit),
         .stderr_limit = std.Io.Limit.limited(1024),
     }) catch return error.GitGrepFailed;

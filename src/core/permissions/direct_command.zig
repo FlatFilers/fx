@@ -220,7 +220,7 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
         defer environment.deinit();
         const stage_argv = switch (stage.environment_profile) {
             .basic_read_only => stage.argv,
-            .git_read_only => try gitStageArgv(scratch, stage.argv, plan.cwd, &environment),
+            .git_read_only => try gitStageArgv(scratch, stage.argv, plan.cwd, &environment, execution_cfg),
         };
 
         const child = std.process.spawn(io_mod.getIo(), .{
@@ -421,8 +421,13 @@ fn gitStageArgv(
     argv: []const []const u8,
     cwd: []const u8,
     environment: *const std.process.Environ.Map,
+    cfg: command_runner.Config,
 ) ![]const []const u8 {
-    const overrides = git_command.repositoryFilterOverrides(scratch, argv[0], cwd, environment) catch |err| {
+    const overrides = git_command.repositoryFilterOverridesControlled(scratch, argv[0], cwd, environment, .{
+        .cancel_flag = cfg.cancel_flag,
+        .started_ms = cfg.timeout_started_ms,
+        .timeout_ms = cfg.timeout_ms,
+    }) catch |err| {
         debug_trace.logf("core", "direct git stage withheld: repository filters unverified cwd={s} err={s}", .{ cwd, @errorName(err) });
         return err;
     };
@@ -455,6 +460,7 @@ fn environmentForProfile(
         try environment.put("GIT_TERMINAL_PROMPT", "0");
         try environment.put("GIT_PAGER", "cat");
         try environment.put("PAGER", "cat");
+        try git_command.hardenEnvironment(&environment);
     }
     return environment;
 }
@@ -1037,8 +1043,10 @@ test "direct git inspection does not run programs named by repository config" {
     const trap = try git_command.createTrapRepositoryForTest(alloc, &tmp);
     defer trap.deinit(alloc);
 
-    for ([_][]const u8{ "git status --short", "git diff --stat", "git diff", "git log --oneline" }) |command| {
-        try git_command.TrapRepositoryForTest.touchTrackedFile(&tmp);
+    for ([_][]const u8{ "git status --short", "git diff --stat", "git diff", "git log --oneline" }, 0..) |command, index| {
+        const changed = try std.fmt.allocPrint(alloc, "needle changed {d}\n", .{index});
+        defer alloc.free(changed);
+        try git_command.TrapRepositoryForTest.touchTrackedFile(&tmp, changed);
         var admission = try command_effect.plan(alloc, command, trap.root, false, builtin.os.tag);
         defer admission.deinit(alloc);
         const result = try executeDirectReadOnly(.{
@@ -1050,6 +1058,32 @@ test "direct git inspection does not run programs named by repository config" {
         try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
         try std.testing.expect(!trap.markerExists());
     }
+}
+
+test "direct git inspection refuses an unaddressable repository filter" {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const trap = try git_command.createTrapRepositoryForTest(alloc, &tmp);
+    defer trap.deinit(alloc);
+    const executable = git_command.trustedExecutable() orelse return error.SkipZigTest;
+    const configured = try std.process.run(alloc, std.testing.io, .{
+        .argv = &.{ executable, "config", "filter.a=b.clean", "cat" },
+        .cwd = .{ .path = trap.root },
+    });
+    defer alloc.free(configured.stdout);
+    defer alloc.free(configured.stderr);
+    try std.testing.expect(configured.term == .exited and configured.term.exited == 0);
+
+    var admission = try command_effect.plan(alloc, "git status --short", trap.root, false, builtin.os.tag);
+    defer admission.deinit(alloc);
+    try std.testing.expectError(error.RepositoryFiltersUnverified, executeDirectReadOnly(
+        .{ .max_command_output_bytes = 4096 },
+        alloc,
+        admission.direct_read_only,
+    ));
+    try std.testing.expect(!trap.markerExists());
 }
 
 test "direct executor rejects plans above the pipeline stage limit" {
