@@ -145,7 +145,7 @@ pub const Store = struct {
     /// first. Free with `types.freeHistoryTurnSlice`.
     /// `~/.fx/session-files`, or null when nothing has used it yet.
     fn openFilesRoot(store: *Store) !?io_mod.VerifiedDir {
-        var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), store.home, .{ .follow_symlinks = false }) };
+        var home = try openHome(store.home);
         defer home.close();
         var fx = try io_mod.openVerifiedPrivateDirIfPresent(&home, profile_paths.root_dir_name) orelse return null;
         defer fx.close();
@@ -2874,7 +2874,7 @@ test "recover copies side files and folders, never a link, and says when it left
     var model = "m".*;
     const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
     {
-        var files = try std.Io.Dir.openDirAbsolute(io, try s.ensureFilesPath(), .{});
+        var files = try std.Io.Dir.openDirAbsolute(io, try s.ensureFilesPath(), .{ .iterate = true });
         defer files.close(io);
         try files.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = .fromMode(0o600) } });
         var nested = try io_mod.openOrCreateVerifiedPrivateDirFromDir(files, "nested");
