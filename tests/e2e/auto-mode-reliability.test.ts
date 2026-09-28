@@ -1007,6 +1007,65 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "read-only git inspection does not run programs named by repository config",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "repository-program-ran");
+      const hooks = join(root.root, "repository-hooks");
+      mkdirSync(hooks, { recursive: true });
+      const hook = join(hooks, "post-index-change");
+      writeFileSync(hook, `#!/bin/sh\necho hook >> ${JSON.stringify(marker)}\n`);
+      chmodSync(hook, 0o755);
+      runGit(root.workspace, ["init", "--quiet", "--initial-branch=main"]);
+      writeFileSync(join(root.workspace, ".gitattributes"), "*.txt filter=trap\n");
+      writeFileSync(join(root.workspace, "tracked.txt"), "tracked\n");
+      runGit(root.workspace, ["add", "."]);
+      runGit(root.workspace, [
+        "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+        "commit", "--quiet", "-m", "initial",
+      ]);
+      const settings: Array<[string, string]> = [
+        ["core.fsmonitor", `echo fsmonitor >> ${JSON.stringify(marker)}; false`],
+        ["core.hooksPath", hooks],
+        ["filter.trap.clean", `sh -c 'echo filter >> ${JSON.stringify(marker)}; cat'`],
+        ["filter.trap.required", "true"],
+      ];
+      for (const [key, value] of settings) runGit(root.workspace, ["config", key, value]);
+
+      // Plain git runs the configured programs, which proves the fixture is armed.
+      writeFileSync(join(root.workspace, "tracked.txt"), "tracked\n");
+      runGit(root.workspace, ["status", "--short"]);
+      expect(existsSync(marker)).toBe(true);
+      rmSync(marker);
+      writeFileSync(join(root.workspace, "tracked.txt"), "tracked\n");
+
+      const gateway = startGateway([
+        cleanCommandCall("git status --short", "inspect_status"),
+        cleanCommandCall("git diff --stat", "inspect_diff"),
+        cleanCommandCall("git log --oneline", "inspect_log"),
+        (body) => {
+          expect(toolResultText(body, "inspect_log")).toContain("initial");
+          return fakeGatewayFinalText("inspection complete");
+        },
+      ]);
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("inspection complete");
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "git pull post-merge hook remains reviewer owned",
     async () => {
       const root = createIsolatedRoot();

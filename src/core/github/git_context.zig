@@ -1,4 +1,6 @@
 const std = @import("std");
+const debug_trace = @import("../shared/debug_trace.zig");
+const git_command = @import("../workspace/git_command.zig");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -13,16 +15,33 @@ pub const Snapshot = struct {
 };
 
 pub fn snapshot(alloc: Allocator) !Snapshot {
-    const in_git_repo = isGitRepository(alloc);
-    const branch = try runGit(alloc, &.{ "branch", "--show-current" });
+    return snapshotAt(alloc, ".");
+}
+
+fn snapshotAt(alloc: Allocator, cwd: []const u8) !Snapshot {
+    const git: Git = .{ .executable = git_command.trustedExecutable(), .cwd = cwd };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    // Worktree status and the unstaged diff compare file contents, which runs
+    // filter drivers, so they are omitted when the drivers cannot be disabled.
+    const content_overrides = try git.filterOverrides(arena_state.allocator());
+
+    const in_git_repo = git.isRepository(alloc);
+    const branch = try git.run(alloc, &.{}, &.{ "branch", "--show-current" });
     defer if (branch) |text| alloc.free(text);
-    const status = try runGit(alloc, &.{ "status", "--short", "--branch" });
+    const status = if (content_overrides) |overrides|
+        try git.run(alloc, overrides, &.{ "status", "--short", "--branch", "--ignore-submodules=dirty" })
+    else
+        null;
     defer if (status) |text| alloc.free(text);
-    const log = try runGit(alloc, &.{ "log", "--oneline", "-5" });
+    const log = try git.run(alloc, &.{}, &.{ "log", "--no-show-signature", "--oneline", "-5" });
     defer if (log) |text| alloc.free(text);
-    const staged = try runGit(alloc, &.{ "diff", "--stat", "--cached" });
+    const staged = try git.run(alloc, &.{}, &(diff_stat_args ++ [_][]const u8{"--cached"}));
     defer if (staged) |text| alloc.free(text);
-    const unstaged = try runGit(alloc, &.{ "diff", "--stat" });
+    const unstaged = if (content_overrides) |overrides|
+        try git.run(alloc, overrides, &diff_stat_args)
+    else
+        null;
     defer if (unstaged) |text| alloc.free(text);
 
     return .{
@@ -31,49 +50,82 @@ pub fn snapshot(alloc: Allocator) !Snapshot {
     };
 }
 
-fn buildGitArgv(alloc: Allocator, args: []const []const u8) !std.ArrayList([]const u8) {
+const diff_stat_args = [_][]const u8{ "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--stat" };
+
+const Git = struct {
+    executable: ?[]const u8,
+    cwd: []const u8,
+
+    /// Returns filter overrides owned by `arena`, or null when git is
+    /// unavailable or repository filters cannot be verified.
+    fn filterOverrides(self: Git, arena: Allocator) Allocator.Error!?[]const []const u8 {
+        const executable = self.executable orelse return null;
+        return git_command.repositoryFilterOverrides(arena, executable, self.cwd, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RepositoryFiltersUnverified => {
+                debug_trace.logf("core", "git snapshot omitted worktree status and diff: repository filters unverified", .{});
+                return null;
+            },
+        };
+    }
+
+    fn isRepository(self: Git, alloc: Allocator) bool {
+        const result = self.run(alloc, &.{}, &.{ "rev-parse", "--is-inside-work-tree" }) catch return false;
+        defer if (result) |text| alloc.free(text);
+        return if (result) |text| std.mem.eql(u8, text, "true") else false;
+    }
+
+    /// Returns trimmed stdout owned by `alloc`, or null when git is
+    /// unavailable, fails, or prints nothing.
+    fn run(
+        self: Git,
+        alloc: Allocator,
+        overrides: []const []const u8,
+        args: []const []const u8,
+    ) Allocator.Error!?[]u8 {
+        const executable = self.executable orelse return null;
+        var argv = try buildGitArgv(alloc, executable, overrides, args);
+        defer argv.deinit(alloc);
+
+        const result = std.process.run(alloc, io_mod.getIo(), .{
+            .argv = argv.items,
+            .cwd = .{ .path = self.cwd },
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        defer alloc.free(result.stderr);
+        errdefer alloc.free(result.stdout);
+
+        const succeeded = switch (result.term) {
+            .exited => |code| code == 0,
+            .signal, .stopped, .unknown => false,
+        };
+        const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+        if (!succeeded or trimmed.len == 0) {
+            alloc.free(result.stdout);
+            return null;
+        }
+        if (trimmed.len == result.stdout.len) return result.stdout;
+
+        const owned = try alloc.dupe(u8, trimmed);
+        alloc.free(result.stdout);
+        return owned;
+    }
+};
+
+fn buildGitArgv(
+    alloc: Allocator,
+    executable: []const u8,
+    overrides: []const []const u8,
+    args: []const []const u8,
+) Allocator.Error!std.ArrayList([]const u8) {
     var argv = std.ArrayList([]const u8).empty;
     errdefer argv.deinit(alloc);
-    try argv.append(alloc, "git");
-    try argv.append(alloc, "--no-optional-locks");
+    try git_command.appendPrefix(alloc, &argv, executable);
+    try argv.appendSlice(alloc, overrides);
     try argv.appendSlice(alloc, args);
     return argv;
-}
-
-pub fn isGitRepository(alloc: Allocator) bool {
-    const result = runGit(alloc, &.{ "rev-parse", "--is-inside-work-tree" }) catch return false;
-    defer if (result) |text| alloc.free(text);
-    return if (result) |text| std.mem.eql(u8, text, "true") else false;
-}
-
-fn runGit(alloc: Allocator, args: []const []const u8) !?[]u8 {
-    var argv = try buildGitArgv(alloc, args);
-    defer argv.deinit(alloc);
-
-    const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = argv.items,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    defer alloc.free(result.stderr);
-    errdefer alloc.free(result.stdout);
-
-    if (result.term.exited != 0) {
-        alloc.free(result.stdout);
-        return null;
-    }
-
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (trimmed.len == 0) {
-        alloc.free(result.stdout);
-        return null;
-    }
-    if (trimmed.len == result.stdout.len) return result.stdout;
-
-    const owned = try alloc.dupe(u8, trimmed);
-    alloc.free(result.stdout);
-    return owned;
 }
 
 fn formatSnapshot(
@@ -161,21 +213,25 @@ test "snapshot formatting: populated sections preserve layout exactly" {
     , text);
 }
 
-test "git argv: read-only commands disable optional locks" {
-    var argv = try buildGitArgv(std.testing.allocator, &.{ "status", "--short", "--branch" });
+test "git argv: hardening options and filter overrides precede the subcommand" {
+    const overrides = [_][]const u8{ "-c", "filter.trap.clean=" };
+    var argv = try buildGitArgv(std.testing.allocator, "/usr/bin/git", &overrides, &.{ "status", "--short" });
     defer argv.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 5), argv.items.len);
-    try std.testing.expectEqualStrings("git", argv.items[0]);
-    try std.testing.expectEqualStrings("--no-optional-locks", argv.items[1]);
-    try std.testing.expectEqualStrings("status", argv.items[2]);
-    try std.testing.expectEqualStrings("--short", argv.items[3]);
-    try std.testing.expectEqualStrings("--branch", argv.items[4]);
+    const tail_start = 1 + git_command.global_options.len;
+    try std.testing.expectEqualStrings("/usr/bin/git", argv.items[0]);
+    try std.testing.expectEqualSlices([]const u8, &git_command.global_options, argv.items[1..tail_start]);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "-c", "filter.trap.clean=", "status", "--short" },
+        argv.items[tail_start..],
+    );
 }
 
 test "git repository detection treats allocation failure as unavailable" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expect(!isGitRepository(failing.allocator()));
+    const git: Git = .{ .executable = git_command.trustedExecutable(), .cwd = "." };
+    try std.testing.expect(!git.isRepository(failing.allocator()));
 }
 
 test "snapshot returns owned Git status text" {
@@ -184,4 +240,22 @@ test "snapshot returns owned Git status text" {
 
     try std.testing.expect(std.mem.find(u8, state.text, "Git snapshot") != null);
     try std.testing.expect(std.mem.find(u8, state.text, "Branch:") != null);
+}
+
+test "snapshot does not run programs named by repository config" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const trap = try git_command.createTrapRepositoryForTest(alloc, &tmp);
+    defer trap.deinit(alloc);
+    try git_command.TrapRepositoryForTest.touchTrackedFile(&tmp);
+
+    const state = try snapshotAt(alloc, trap.root);
+    defer state.deinit(alloc);
+
+    try std.testing.expect(state.in_git_repo);
+    // The branch header proves worktree status ran, and the commit subject proves log ran.
+    try std.testing.expect(std.mem.find(u8, state.text, "Status:\n## ") != null);
+    try std.testing.expect(std.mem.find(u8, state.text, "trap") != null);
+    try std.testing.expect(!trap.markerExists());
 }
