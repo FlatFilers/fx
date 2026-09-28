@@ -11,6 +11,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -195,6 +196,11 @@ function shape(lines: Line[]): string[] {
 function expectNoV1Sessions(fixture: Fixture) {
   const sessions = join(fixture.home, ".fx", "sessions");
   expect(readdirSync(sessions).filter((name) => name !== "v2")).toEqual([]);
+}
+
+/// A local command such as `fx sessions`, run in the fixture's workspace.
+function command(fixture: Fixture, gateway: any, args: string[], v2 = true, cwd = fixture.workspace) {
+  return runFx(args, { cwd, env: env(fixture, gateway, v2), timeoutMs: TIMEOUT });
 }
 
 async function ask(fixture: Fixture, gateway: any, args: string[], v2 = true) {
@@ -750,6 +756,21 @@ test.skipIf(!tmuxAvailable())("the interactive app resumes a session with a shel
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("an app quit before its first prompt leaves no session and no side folder", async () => {
+  const fixture = createFixture("fx-v2-app-pristine-");
+  const gateway = replyToLatest([]);
+  try {
+    const app = await startApp(fixture, gateway, []);
+    await quitApp(app);
+    expect(existsSync(v2Root(fixture)) ? savedSessions(fixture) : []).toEqual([]);
+    const files = join(fixture.home, ".fx", "session-files");
+    expect(existsSync(files) ? readdirSync(files) : []).toEqual([]);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
 
 test.skipIf(!tmuxAvailable())("a killed interactive turn comes back interrupted and -c continues it", async () => {
   const fixture = createFixture("fx-v2-app-kill-");
@@ -1504,6 +1525,14 @@ test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in
     // No v1 subagent files: the parent's log is the record (D22).
     expectNoV1Sessions(fixture);
     expect(existsSync(join(fixture.home, ".fx", "session-files", id, "subagent"))).toBe(false);
+    // A child is reached only through its parent: never listed, read or recovered.
+    const listed = JSON.parse((await command(fixture, gateway, ["sessions", "--all", "--json"])).stdout);
+    expect(listed.sessions.map((summary: any) => summary.id)).toEqual([id]);
+    for (const args of [["session", childId, "--json"], ["session", "recover", childId, "--json"]]) {
+      const direct = await command(fixture, gateway, args);
+      expect(direct.code).toBe(1);
+      expect(JSON.parse(direct.stdout).code).toBe("SessionNotFound");
+    }
   } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -1692,6 +1721,277 @@ test("ACP runs a subagent on v2, and load replays the delegation", async () => {
     expectWholeLog(fixture, childId);
   } finally {
     if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+// -- fx sessions, fx session and doctor ----------------------------------------
+
+/// Every file under `dir`, as paths relative to it with their modes.
+function treeOf(dir: string, prefix = ""): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    const name = prefix + entry.name;
+    const mode = (statSync(path).mode & 0o777).toString(8);
+    return entry.isDirectory() ? [`${name}/ ${mode}`, ...treeOf(path, `${name}/`)] : [`${name} ${mode}`];
+  }).sort();
+}
+
+test("fx sessions and fx session show v2 sessions by workspace, page them, and v1 sees none", async () => {
+  const fixture = createFixture("fx-v2-commands-");
+  mkdirSync(join(fixture.root, "other"));
+  const other = realpathSync(join(fixture.root, "other"));
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("LIST_A1"),
+    fakeGatewayFinalText("LIST_A2"),
+    fakeGatewayFinalText("LIST_B1"),
+    fakeGatewayFinalText("LIST_C1"),
+  ]);
+  try {
+    const a = JSON.parse((await ask(fixture, gateway, ["List question A."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume-id", a, "List question A two."])).code).toBe(0);
+    const inOther = await runFx(["ask", "--json", "--auto", "List question B."], { cwd: other, env: env(fixture, gateway), timeoutMs: TIMEOUT });
+    const b = JSON.parse(inOther.stdout).session_id;
+    const c = JSON.parse((await ask(fixture, gateway, ["List question C."])).stdout).session_id;
+    const ids = (listed: any) => listed.sessions.map((summary: any) => summary.id);
+
+    const here = await command(fixture, gateway, ["sessions", "--json"]);
+    expect(here.code).toBe(0);
+    expect(here.stderr).toBe("");
+    const listed = JSON.parse(here.stdout);
+    expect(ids(listed)).toEqual([c, a]);
+    expect(listed.sessions[1].title).toBe("List question A.");
+    expect(listed.sessions[1].history_len).toBe(2);
+    expect(listed.sessions[1].workspace_root).toBe(fixture.workspace);
+    expect(ids(JSON.parse((await command(fixture, gateway, ["sessions", "--json"], true, other)).stdout))).toEqual([b]);
+    expect(ids(JSON.parse((await command(fixture, gateway, ["sessions", "--all", "--json"])).stdout))).toEqual([c, b, a]);
+    const text = await command(fixture, gateway, ["sessions"]);
+    expect(text.code).toBe(0);
+    expect(text.stdout).toContain(a);
+    expect(text.stdout).toContain("List question A.");
+
+    // A page at a time, each session once, newest first.
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 3; page += 1) {
+      const args = ["sessions", "--all", "--limit", "1", "--json", ...(cursor ? ["--cursor", cursor] : [])];
+      const result = JSON.parse((await command(fixture, gateway, args)).stdout);
+      seen.push(...ids(result));
+      cursor = result.next_cursor ?? undefined;
+    }
+    expect(seen).toEqual([c, b, a]);
+    expect(cursor).toBeUndefined();
+
+    const last = await command(fixture, gateway, ["session", "last", "--json"]);
+    expect(last.code).toBe(0);
+    expect(JSON.parse(last.stdout).id).toBe(c);
+    expect(JSON.parse((await command(fixture, gateway, ["session", "last", "--json"], true, other)).stdout).id).toBe(b);
+
+    const detail = await command(fixture, gateway, ["session", a, "--json"]);
+    expect(detail.code).toBe(0);
+    expect(detail.stderr).toBe("");
+    const shown = JSON.parse(detail.stdout);
+    expect(shown.kind).toBe("session_detail");
+    expect(shown.id).toBe(a);
+    expect(shown.history_len).toBe(2);
+    expect(shown.history.map((turn: any) => [turn.user.text, turn.assistant])).toEqual([
+      ["List question A.", "LIST_A1"],
+      ["List question A two.", "LIST_A2"],
+    ]);
+    const detailText = await command(fixture, gateway, ["session", a]);
+    expect(detailText.stdout).toContain(`[session] ${a}`);
+    expect(detailText.stdout).toContain("List question A two.");
+
+    const missing = await command(fixture, gateway, ["session", "NoSuchSession1", "--json"]);
+    expect(missing.code).toBe(1);
+    expect(JSON.parse(missing.stdout).code).toBe("SessionNotFound");
+
+    // A v1 process reads only v1 sessions, and there are none.
+    const v1 = JSON.parse((await command(fixture, gateway, ["sessions", "--all", "--json"], false)).stdout);
+    expect(v1.sessions).toEqual([]);
+    expect((await command(fixture, gateway, ["session", a, "--json"], false)).code).toBe(1);
+    expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test("fx session reads a session another process holds, and reads past a torn tail without cutting it", async () => {
+  const fixture = createFixture("fx-v2-peek-");
+  let stalled: () => void = () => {};
+  const reachedStall = new Promise<void>((resolve) => (stalled = resolve));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes("Hold the session for reading.")) {
+      stalled();
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("BEFORE_THE_HOLD");
+  });
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Before the held read."])).stdout).session_id;
+    const holder = spawnAsk(fixture, gateway, ["--resume-id", id, "Hold the session for reading."]);
+    await reachedStall;
+    const path = join(v2Root(fixture), id, "log.jsonl");
+    const held = readFileSync(path);
+    const read = await command(fixture, gateway, ["session", id, "--json"]);
+    expect(read.code).toBe(0);
+    expect(read.stderr).toBe("");
+    expect(JSON.parse(read.stdout).history[0].user.text).toBe("Before the held read.");
+    expect(JSON.parse((await command(fixture, gateway, ["sessions", "--json"])).stdout).sessions.map((summary: any) => summary.id)).toEqual([id]);
+    // Reading took no lock and wrote nothing.
+    expect(readFileSync(path)).toEqual(held);
+    holder.child.kill("SIGKILL");
+    await holder.exited;
+
+    appendFileSync(path, '{"v":1,"seq":99,"ts":1,"kind":"item","ty');
+    const torn = readFileSync(path);
+    const past = await command(fixture, gateway, ["session", id, "--json"]);
+    expect(past.code).toBe(0);
+    expect(JSON.parse(past.stdout).history[0].assistant).toBe("BEFORE_THE_HOLD");
+    // Only a writer cuts a torn tail.
+    expect(readFileSync(path)).toEqual(torn);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("fx session recover copies the good turns and side files of a damaged session, which stays as it was", async () => {
+  const fixture = createFixture("fx-v2-recover-");
+  const gateway = startFakeGateway([
+    fakeShellRun("recover-shell", "echo RECOVER_TOOL_OUTPUT_4410"),
+    fakeGatewayFinalText("RECOVER_ONE"),
+    fakeGatewayFinalText("RECOVER_TWO"),
+    fakeGatewayFinalText("RECOVER_THREE"),
+    fakeGatewayFinalText("RECOVER_LOST"),
+    fakeGatewayFinalText("RECOVER_AFTER"),
+  ]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Recover question one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume-id", id, "Recover question two."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume-id", id, "Recover question three."])).code).toBe(0);
+    const path = join(v2Root(fixture), id, "log.jsonl");
+    writeFileSync(path, readFileSync(path, "utf8").replace("Recover question three.", "Recover question thr3e."));
+    const damaged = readFileSync(path);
+
+    const result = await command(fixture, gateway, ["session", "recover", id, "--json"]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const recovered = JSON.parse(result.stdout);
+    expect(recovered).toMatchObject({ kind: "session_recovery", source_id: id, status: "recovered", history_turns: 2 });
+    const copy: string = recovered.recovered_id;
+    expect(copy).not.toBe(id);
+    expect(readFileSync(path)).toEqual(damaged);
+    expectWholeLog(fixture, copy);
+    // The same side files, still private.
+    const files = (session: string) => join(fixture.home, ".fx", "session-files", session);
+    expect(treeOf(files(copy))).toEqual(treeOf(files(id)));
+    expect(treeOf(files(copy)).length).toBeGreaterThan(0);
+    expect(treeOf(files(copy)).every((entry) => entry.endsWith("/ 700") || entry.endsWith(" 600"))).toBe(true);
+
+    // The tool output shows only if the copy has its side file.
+    const shown = await command(fixture, gateway, ["session", copy, "--json"]);
+    expect(shown.code).toBe(0);
+    expect(JSON.parse(shown.stdout).history_len).toBe(2);
+    expect(shown.stdout).toContain("RECOVER_TOOL_OUTPUT_4410");
+    const resumed = await ask(fixture, gateway, ["--resume-id", copy, "After the recovery."]);
+    expect(resumed.code).toBe(0);
+    expect(JSON.parse(resumed.stdout).output).toBe("RECOVER_LOST");
+    const sent = gateway.requests.at(-1)!.body;
+    expect(sent).toContain("RECOVER_TOOL_OUTPUT_4410");
+    expect(sent).toContain("RECOVER_TWO");
+    expect(sent).not.toContain("RECOVER_THREE");
+    expect(sent).not.toContain("thr3e");
+
+    // A session whose first turn is damaged has nothing to copy.
+    const lone = JSON.parse((await ask(fixture, gateway, ["Lone question."])).stdout).session_id;
+    const lonePath = join(v2Root(fixture), lone, "log.jsonl");
+    writeFileSync(lonePath, readFileSync(lonePath, "utf8").replace("Lone question.", "L0ne question."));
+    const count = JSON.parse((await command(fixture, gateway, ["sessions", "--all", "--json"])).stdout).count;
+    const nothing = await command(fixture, gateway, ["session", "recover", lone, "--json"]);
+    expect(nothing.code).toBe(1);
+    expect(JSON.parse(nothing.stdout).code).toBe("SessionRecoveryBoundaryInvalid");
+    const text = await command(fixture, gateway, ["session", "recover", lone]);
+    expect(text.stderr).toContain("the source was left unchanged");
+    expect(JSON.parse((await command(fixture, gateway, ["sessions", "--all", "--json"])).stdout).count).toBe(count);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test("fx session migrate refuses on v2 and changes nothing", async () => {
+  const fixture = createFixture("fx-v2-migrate-");
+  const gateway = startFakeGateway([fakeGatewayFinalText("MIGRATE_ANSWER")]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Migrate question."])).stdout).session_id;
+    const before = readFileSync(join(v2Root(fixture), id, "log.jsonl"));
+    const refused = await command(fixture, gateway, ["session", "migrate", id, "--json"]);
+    expect(refused.code).toBe(1);
+    expect(JSON.parse(refused.stdout).code).toBe("SessionMigrationUnavailable");
+    const text = await command(fixture, gateway, ["session", "migrate", id]);
+    expect(text.code).toBe(1);
+    expect(text.stderr).toBe("fx session: session migrate converts v1 sessions and is not available with sessions v2 yet\n");
+    expect(readFileSync(join(v2Root(fixture), id, "log.jsonl"))).toEqual(before);
+    expectNoV1Sessions(fixture);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test("doctor on v2 reports a damaged session and removes only old side folders with no session", async () => {
+  const fixture = createFixture("fx-v2-doctor-");
+  const gateway = startFakeGateway([
+    fakeShellRun("doctor-shell", "echo DOCTOR_TOOL_OUTPUT"),
+    fakeGatewayFinalText("DOCTOR_ONE"),
+    fakeGatewayFinalText("DOCTOR_TWO"),
+  ]);
+  try {
+    const kept = JSON.parse((await ask(fixture, gateway, ["Doctor question one."])).stdout).session_id;
+    const damaged = JSON.parse((await ask(fixture, gateway, ["Doctor question two."])).stdout).session_id;
+    const path = join(v2Root(fixture), damaged, "log.jsonl");
+    writeFileSync(path, readFileSync(path, "utf8").replace("Doctor question two.", "Doctor question tw0."));
+    const before = readFileSync(path);
+    const files = join(fixture.home, ".fx", "session-files");
+    const old = join(files, "OldOrphan0001");
+    const young = join(files, "NewOrphan0002");
+    mkdirSync(old, { mode: 0o700 });
+    writeFileSync(join(old, "left.txt"), "left", { mode: 0o600 });
+    mkdirSync(young, { mode: 0o700 });
+    const twoDaysAgo = (Date.now() - 2 * 24 * 3600 * 1000) / 1000;
+    utimesSync(old, twoDaysAgo, twoDaysAgo);
+    // An old folder whose session exists is never an orphan.
+    utimesSync(join(files, kept), twoDaysAgo, twoDaysAgo);
+
+    const result = await command(fixture, gateway, ["doctor", "--json"]);
+    expect(result.code).toBe(0);
+    const checks: any[] = JSON.parse(result.stdout).checks;
+    const named = (name: string) => checks.filter((check) => check.name === name).map((check) => `${check.status}: ${check.detail}`);
+    expect(named("state")).toEqual(["ok: sessions v2"]);
+    expect(named("session")).toEqual([
+      `warn: session ${damaged} has a damaged log; \`fx session recover ${damaged}\` copies its good turns`,
+      "ok: removed 1 side folder(s) whose session is gone",
+    ]);
+    expect(named("sessions")).toEqual([`ok: 2 saved session(s); latest=${damaged}`]);
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(young)).toBe(true);
+    expect(existsSync(join(files, kept))).toBe(true);
+    // Doctor reports damage and repairs nothing.
+    expect(readFileSync(path)).toEqual(before);
+    const again = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
+    expect(again.filter((check: any) => check.detail.includes("removed"))).toEqual([]);
+
+    // v1's doctor on the same profile sees no v2 folder as a session.
+    const v1 = await command(fixture, gateway, ["doctor", "--json"], false);
+    expect(v1.code).toBe(0);
+    const v1Checks: any[] = JSON.parse(v1.stdout).checks;
+    expect(v1Checks.filter((check) => check.status === "fail" || check.name === "session")).toEqual([]);
+    expect(v1Checks.find((check) => check.name === "sessions").detail).toBe("no saved sessions yet");
+    expect(JSON.stringify(v1Checks)).not.toContain("sessions/v2");
+  } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
   }

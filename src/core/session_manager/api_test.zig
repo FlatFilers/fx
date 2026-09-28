@@ -354,6 +354,62 @@ test "only a child takes an id, it must be valid, and a taken id never replaces 
     }
 }
 
+test "peek reads a session without its lock and repairs nothing (D37)" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const m = f.manager;
+    // Nothing saved yet: NotFound, and the root is not created.
+    try testing.expectError(error.NotFound, m.peek(gpa, "1786460757753-none"));
+    try testing.expectError(error.InvalidArgument, m.peek(gpa, "../escape"));
+
+    const p = try m.openNew(.{ .workspace = "/w", .host = .app });
+    _ = try p.append(&.{ .turn_started, piece, .turn_committed, .{ .set = .{ .key = .title, .value = "\"T\"" } } });
+    const p_id = try gpa.dupe(u8, p.id());
+    defer gpa.free(p_id);
+    // Open for writing elsewhere: peek still reads it.
+    {
+        var peeked = try m.peek(gpa, p_id);
+        defer peeked.deinit(gpa);
+        try testing.expectEqual(api.Role.root, peeked.role);
+        try testing.expectEqualStrings("/w", peeked.workspace);
+        try testing.expectEqual(@as(u64, 1), peeked.state.last_turn);
+        try testing.expectEqualStrings("\"T\"", peeked.state.title.?);
+        try testing.expect(peeked.state.created_ms > 0);
+    }
+    const c = try m.openNew(.{ .workspace = "/w", .host = .child, .role = .child, .parent = p_id, .id = "1786460757753-peek-kid" });
+    _ = try p.append(&.{.{ .child_spawned = .{ .child = c.id(), .work_id = "w" } }});
+    _ = try c.append(&.{ .turn_started, .turn_committed });
+    c.release();
+    p.release();
+
+    // A child reads without its parent.
+    {
+        var peeked = try m.peek(gpa, "1786460757753-peek-kid");
+        defer peeked.deinit(gpa);
+        try testing.expectEqual(api.Role.child, peeked.role);
+        try testing.expectEqualStrings(p_id, peeked.parent.?);
+    }
+
+    // A torn tail is read around and left in place.
+    var root = try f.dir();
+    defer root.close(io);
+    const log_path = try std.fs.path.join(gpa, &.{ p_id, "log.jsonl" });
+    defer gpa.free(log_path);
+    var torn_len: u64 = 0;
+    {
+        var log = try root.openFile(io, log_path, .{ .mode = .read_write });
+        defer log.close(io);
+        try log.writePositionalAll(io, "{\"v\":1,\"seq", try log.length(io));
+        torn_len = try log.length(io);
+    }
+    var peeked = try m.peek(gpa, p_id);
+    defer peeked.deinit(gpa);
+    try testing.expectEqual(@as(u64, 1), peeked.state.last_turn);
+    const after = try root.statFile(io, log_path, .{});
+    try testing.expectEqual(torn_len, after.size);
+}
+
 test "import keeps the v1 id and the original times" {
     var f: Fixture = undefined;
     try f.init();

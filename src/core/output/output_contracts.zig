@@ -7,6 +7,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_codec = @import("../session/session_codec.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_json = @import("../session/session_json.zig");
 const session_store = @import("../session/session_store.zig");
@@ -1147,7 +1148,7 @@ fn writeSessionDisplayJsonFields(writer: *std.Io.Writer, summary: session_store.
 }
 
 pub const SessionDetailSnapshot = struct {
-    detail: session_store.ReadOnlyDetail,
+    state: session_codec.DurableSessionState,
 
     pub fn render(self: SessionDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1160,7 +1161,7 @@ pub const SessionDetailSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        const state = self.detail.state;
+        const state = self.state;
         try out.writer.print("[session] {s}\n", .{state.id});
         try out.writer.print("created_at_ms: {d}\n", .{state.created_at_ms});
         try out.writer.print("updated_at_ms: {d}\n", .{state.updated_at_ms});
@@ -1184,7 +1185,7 @@ pub const SessionDetailSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        const state = self.detail.state;
+        const state = self.state;
         try out.writer.writeAll("{\"kind\":\"session_detail\",\"id\":");
         try std.json.Stringify.value(state.id, .{}, &out.writer);
         try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"history_len\":{d}", .{ state.created_at_ms, state.updated_at_ms, state.history.len });
@@ -2505,14 +2506,14 @@ test "core empty session detail snapshot text and json stay stable" {
         .storage_format = .schema_v3,
     };
 
-    const text = try (SessionDetailSnapshot{ .detail = detail }).renderText(std.testing.allocator);
+    const text = try (SessionDetailSnapshot{ .state = detail.state }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
         "[session] sess-empty\ncreated_at_ms: 1\nupdated_at_ms: 2\nlanguage: en\nhistory_len: 0\n\n(no history yet)\n",
         text,
     );
 
-    const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
+    const json = try (SessionDetailSnapshot{ .state = detail.state }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"session_detail\",\"id\":\"sess-empty\",\"created_at_ms\":1,\"updated_at_ms\":2,\"history_len\":0,\"conversation_language\":\"en\",\"history\":[]}",
@@ -2580,7 +2581,7 @@ test "core session detail snapshot preserves history variant shapes" {
         .storage_format = .schema_v3,
     };
 
-    const text = try (SessionDetailSnapshot{ .detail = detail }).renderText(std.testing.allocator);
+    const text = try (SessionDetailSnapshot{ .state = detail.state }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text, "[compacted] removed_turns=3 compactions=1") != null);
     try std.testing.expect(std.mem.find(u8, text, "[user]\nhola\n[images] 1\n - /tmp/a.png (image/png)\n[assistant]\nque tal\n") != null);
@@ -2588,7 +2589,7 @@ test "core session detail snapshot preserves history variant shapes" {
     try std.testing.expect(std.mem.find(u8, text, "[background]") == null);
     try std.testing.expect(std.mem.find(u8, text, "[assistant]\nI inspected the entry point.\n[interrupted]") != null);
 
-    const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
+    const json = try (SessionDetailSnapshot{ .state = detail.state }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"compacted_summary\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"kind\":\"assistant\"") != null);
@@ -2665,7 +2666,7 @@ test "core session detail JSON includes assistant execution memory" {
         .storage_format = .schema_v3,
     };
 
-    const json = try (SessionDetailSnapshot{ .detail = detail }).renderJson(std.testing.allocator);
+    const json = try (SessionDetailSnapshot{ .state = detail.state }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"execution\":{\"schema_version\":3") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"turn_summary\"") == null);
@@ -2675,7 +2676,7 @@ test "core session detail JSON includes assistant execution memory" {
     try std.testing.expect(std.mem.find(u8, json, "command_process_presentation") == null);
     try std.testing.expect(std.mem.find(u8, json, "fx-command-replay-private-sentinel.bin") == null);
 
-    const text = try (SessionDetailSnapshot{ .detail = detail }).renderText(std.testing.allocator);
+    const text = try (SessionDetailSnapshot{ .state = detail.state }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text, "started_at_ms") == null);
     try std.testing.expect(std.mem.find(u8, text, "input_tokens") == null);

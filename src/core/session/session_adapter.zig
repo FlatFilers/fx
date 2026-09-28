@@ -31,6 +31,7 @@ const session_layout = @import("session_layout.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
+const session_summary_codec = @import("session_summary_codec.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
 
@@ -142,6 +143,77 @@ pub const Store = struct {
 
     /// A child's whole history, read without its lock: every turn, oldest
     /// first. Free with `types.freeHistoryTurnSlice`.
+    /// `~/.fx/session-files`, or null when nothing has used it yet.
+    fn openFilesRoot(store: *Store) !?io_mod.VerifiedDir {
+        var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), store.home, .{ .follow_symlinks = false }) };
+        defer home.close();
+        var fx = try io_mod.openVerifiedPrivateDirIfPresent(&home, profile_paths.root_dir_name) orelse return null;
+        defer fx.close();
+        return io_mod.openVerifiedPrivateDirIfPresent(&fx, files_dir_name);
+    }
+
+    /// Removes `~/.fx/session-files/{id}`; `why` names the caller in the trace.
+    fn removeFiles(store: *Store, id: []const u8, why: []const u8) void {
+        var files = (store.openFilesRoot() catch |err| {
+            debug_trace.logf("session", "event=sessions_v2_files_kept session={s} why={s} err={s}", .{ id, why, @errorName(err) });
+            return;
+        }) orelse return;
+        defer files.close();
+        files.dir.deleteTree(io_mod.getIo(), id) catch |err| {
+            debug_trace.logf("session", "event=sessions_v2_files_kept session={s} why={s} err={s}", .{ id, why, @errorName(err) });
+            return;
+        };
+        debug_trace.logf("session", "event=sessions_v2_files_removed session={s} why={s}", .{ id, why });
+    }
+
+    /// Copies `session-files/{from}` to `session-files/{to}`: plain files and
+    /// folders only, never through a link. False when anything was left out;
+    /// a source with no side files has nothing to copy.
+    fn copyFiles(store: *Store, from: []const u8, to: []const u8) bool {
+        var files = (store.openFilesRoot() catch |err| return copyFailed(from, err)) orelse return true;
+        defer files.close();
+        var source = (io_mod.openVerifiedPrivateDirIfPresent(&files, from) catch |err| return copyFailed(from, err)) orelse return true;
+        defer source.close();
+        var target = io_mod.openOrCreateVerifiedPrivateDir(&files, to) catch |err| return copyFailed(from, err);
+        defer target.close();
+        return copyTree(&source, &target, 0);
+    }
+
+    /// Removes side folders whose session is gone, except young ones (D36).
+    fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64) !void {
+        var files = try store.openFilesRoot() orelse return;
+        defer files.close();
+        var it = files.dir.iterate();
+        while (try it.next(io_mod.getIo())) |entry| {
+            if (entry.kind != .directory) continue;
+            session_layout.validateSessionId(entry.name) catch continue;
+            var probe = store.manager.read(alloc, entry.name, .start, .forward, 1) catch |err| switch (err) {
+                error.NotFound => null,
+                else => continue,
+            };
+            if (probe) |*page| {
+                page.deinit();
+                continue;
+            }
+            const stat = files.dir.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false }) catch {
+                report.kept += 1;
+                continue;
+            };
+            const changed_ms: i64 = @intCast(@divFloor(stat.mtime.toNanoseconds(), std.time.ns_per_ms));
+            if (now_ms - changed_ms < orphan_min_age_ms) {
+                debug_trace.logf("session", "event=sessions_v2_orphan_files_young session={s}", .{entry.name});
+                continue;
+            }
+            files.dir.deleteTree(io_mod.getIo(), entry.name) catch |err| {
+                debug_trace.logf("session", "event=sessions_v2_files_kept session={s} why=orphan err={s}", .{ entry.name, @errorName(err) });
+                report.kept += 1;
+                continue;
+            };
+            debug_trace.logf("session", "event=sessions_v2_files_removed session={s} why=orphan", .{entry.name});
+            report.removed += 1;
+        }
+    }
+
     pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
         var history: std.ArrayList(types.HistoryTurn) = .empty;
         errdefer {
@@ -188,6 +260,198 @@ fn traceDiagnostic(_: ?*anyopaque, event: sm.Diagnostic) void {
 // Session: one per open session
 
 /// Settings a new session starts with; held in memory until its first turn.
+// ---------------------------------------------------------------------------
+// Commands: `fx session {id}`, `fx session recover`, doctor
+
+/// What the session commands report, in the names fx's CLI knows.
+pub const CommandError = error{
+    SessionNotFound,
+    InvalidSessionId,
+    SessionBusy,
+    InvalidSessionFormat,
+    UnsupportedSessionSchema,
+    SessionRecoveryBoundaryInvalid,
+    SessionStoreUnavailable,
+    DurablePathUnsafe,
+    HomeNotSet,
+    OutOfMemory,
+};
+
+/// Maps an error from `Store.openFromEnv`, `listPage`, `readSession`,
+/// `recover` or `doctor` onto `CommandError`: a storage fault leaves the
+/// store unavailable, and anything else a record fails with is damage.
+pub fn commandError(err: anyerror) CommandError {
+    return switch (err) {
+        error.SessionNotFound, error.NotFound, error.ChildSession => error.SessionNotFound,
+        error.InvalidArgument, error.InvalidSessionId => error.InvalidSessionId,
+        error.Busy, error.SessionBusy => error.SessionBusy,
+        error.UnsupportedVersion => error.UnsupportedSessionSchema,
+        error.Corrupt => error.InvalidSessionFormat,
+        // `recover` of a session whose first turn never ended whole (D15).
+        error.InvalidForkPoint => error.SessionRecoveryBoundaryInvalid,
+        error.DurablePathUnsafe, error.SessionPathUnsafe => error.DurablePathUnsafe,
+        error.HomeNotSet => error.HomeNotSet,
+        error.OutOfMemory => error.OutOfMemory,
+        error.Io, error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig => blk: {
+            debug_trace.logf("session", "event=sessions_v2_command_failed kind=store err={s}", .{@errorName(err)});
+            break :blk error.SessionStoreUnavailable;
+        },
+        else => blk: {
+            debug_trace.logf("session", "event=sessions_v2_command_failed kind=record err={s}", .{@errorName(err)});
+            break :blk error.InvalidSessionFormat;
+        },
+    };
+}
+
+/// A saved root session as v1's state, read without its lock while another
+/// process may hold it (D37), for `fx session {id}`. A missing session, a
+/// child, or an id that cannot name one is `error.SessionNotFound`. Caller
+/// owns the result.
+pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
+    var peeked = store.manager.peek(alloc, id) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        else => err,
+    };
+    defer peeked.deinit(alloc);
+    if (peeked.role != .root) return error.SessionNotFound;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var restored = try restoreFrom(.{ .store = store, .id = id }, alloc, scratch.allocator(), peeked.state, null);
+    defer restored.deinit(alloc);
+    return resumedOf(alloc, &restored, id, peeked.workspace);
+}
+
+/// A page of saved root sessions as v1 pages them: newest first, one
+/// workspace when `workspace` is set, and only what follows `continuation`.
+/// Caller owns the page.
+pub fn listPage(
+    store: *Store,
+    alloc: Allocator,
+    workspace: ?[]const u8,
+    continuation: ?session_store.ResumableSessionContinuation,
+    limit: usize,
+) !session_store.SessionListPage {
+    if (limit == 0 or limit > session_store.session_list_max_limit) return error.InvalidSessionListLimit;
+    var cancel = std.atomic.Value(bool).init(false);
+    var summaries = try listSummaries(store, alloc, null, &cancel);
+    defer {
+        for (summaries.items) |*summary| summary.deinit(alloc);
+        summaries.deinit(alloc);
+    }
+    session_summary_codec.sortSummariesNewestFirst(summaries.items);
+    return session_summary_codec.sessionListPageFromSummaries(alloc, summaries.items, workspace, continuation, limit);
+}
+
+pub const Recovered = struct {
+    id: []u8,
+    /// Entries in the copy's history; a compaction summary counts as one.
+    history_len: usize,
+    /// False when a side file could not be copied.
+    files_complete: bool,
+
+    pub fn deinit(recovered: *Recovered, alloc: Allocator) void {
+        alloc.free(recovered.id);
+        recovered.* = undefined;
+    }
+};
+
+/// `fx session recover` (D15): a new root session copied from `id` up to
+/// its last turn that ended before any damage, with a copy of its side
+/// files. The source is never changed, and may be held by another process.
+/// Caller owns the result.
+pub fn recover(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    // Line 1 names the session's kind and workspace, however damaged the rest is.
+    var first = store.manager.read(sa, id, .start, .forward, 1) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        else => err,
+    };
+    defer first.deinit();
+    if (first.entries.len == 0) return error.SessionNotFound;
+    const created = switch (first.entries[0].body orelse return error.InvalidSessionFormat) {
+        .session_created => |value| value,
+        else => return error.InvalidSessionFormat,
+    };
+    if (created.role != .root) return error.SessionNotFound;
+    const copy = store.manager.openFork(.{ .source = id, .at = .last_good, .workspace = created.workspace, .host = .ask }) catch |err| return switch (err) {
+        error.NotFound, error.ChildSession => error.SessionNotFound,
+        else => err,
+    };
+    defer copy.release();
+    var restored = try restoreFrom(.{ .store = store, .id = copy.id(), .handle = copy }, alloc, sa, try copy.state(sa), null);
+    defer restored.deinit(alloc);
+    const copy_id = try alloc.dupe(u8, copy.id());
+    errdefer alloc.free(copy_id);
+    copy.close() catch |err| debug_trace.logf("session", "event=sessions_v2_recovered_close_failed session={s} err={s}", .{ copy_id, @errorName(err) });
+    return .{ .id = copy_id, .history_len = restored.history.len, .files_complete = store.copyFiles(id, copy_id) };
+}
+
+pub const Doctor = struct {
+    /// Saved root sessions.
+    sessions: usize = 0,
+    /// The most recently updated one.
+    latest: ?[]u8 = null,
+    /// Sessions whose log was checked, up to the limit.
+    checked: usize = 0,
+    /// Checked sessions with a damaged line or a stale snapshot.
+    damaged: std.ArrayList([]u8) = .empty,
+    /// Side folders removed because their session is gone.
+    removed: usize = 0,
+    /// Side folders with no session that could not be removed.
+    kept: usize = 0,
+
+    pub fn deinit(report: *Doctor, alloc: Allocator) void {
+        if (report.latest) |id| alloc.free(id);
+        for (report.damaged.items) |id| alloc.free(id);
+        report.damaged.deinit(alloc);
+        report.* = undefined;
+    }
+};
+
+/// A side folder younger than this may belong to a new session whose first
+/// turn has not created its log yet (D36).
+const orphan_min_age_ms: i64 = 24 * std.time.ms_per_hour;
+
+/// `fx doctor` on v2 (D36): verifies up to `limit` sessions and removes side
+/// folders whose session is gone. Rebuilds nothing. Caller owns the report.
+pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Doctor {
+    var report: Doctor = .{};
+    errdefer report.deinit(alloc);
+    var latest_ms: u64 = 0;
+    var cursor: ?sm.ListCursor = null;
+    while (true) {
+        var page = try store.manager.list(alloc, .all, cursor, list_page_size);
+        defer page.deinit();
+        for (page.items) |item| {
+            if (item.role != .root) continue;
+            report.sessions += 1;
+            if (report.latest == null or item.updated_ms > latest_ms) {
+                const id = try alloc.dupe(u8, item.id);
+                if (report.latest) |old| alloc.free(old);
+                report.latest = id;
+                latest_ms = item.updated_ms;
+            }
+            if (report.checked == limit) continue;
+            report.checked += 1;
+            const verified = store.manager.verify(item.id) catch |err| switch (err) {
+                error.NotFound => continue,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf("session", "event=sessions_v2_doctor_unreadable session={s} err={s}", .{ item.id, @errorName(err) });
+                    try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
+                    continue;
+                },
+            };
+            if (verified.damaged_at != null or verified.bad_snapshots > 0) try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
+        }
+        cursor = page.next orelse break;
+    }
+    try store.sweepFiles(alloc, &report, now_ms);
+    return report;
+}
+
 pub const Seed = struct {
     preferences: session_codec.DurableSessionPreferences,
     language: types.ConversationLanguage,
@@ -431,8 +695,34 @@ pub const Session = struct {
     pub fn close(self: *Session) void {
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         if (self.turn_open) debug_trace.logf("session", "event=sessions_v2_turn_closed_open session={s} streamed={d}", .{ self.id(), self.streamed.items.len });
+        // Before `release`: the id lives in the handle.
+        if (self.files_dir != null and !self.saved()) self.removeUnsavedFiles();
         self.handle.release();
         self.destroyInner();
+    }
+
+    /// A session that never reached the disk takes its side folder with it,
+    /// as v1 removes a pristine session's folder. Asks the manager first: a
+    /// first write that failed may still have landed, and its turn points
+    /// into this folder.
+    fn removeUnsavedFiles(self: *Session) void {
+        var probe = self.store.manager.read(self.alloc, self.id(), .start, .forward, 1) catch |err| switch (err) {
+            error.NotFound => null,
+            else => {
+                debug_trace.logf("session", "event=sessions_v2_unsaved_files_kept session={s} err={s}", .{ self.id(), @errorName(err) });
+                return;
+            },
+        };
+        if (probe) |*page| {
+            page.deinit();
+            return;
+        }
+        // The capability borrows the folder.
+        if (self.capability) |*capability| capability.deinit();
+        self.capability = null;
+        if (self.files_dir) |*dir| dir.close();
+        self.files_dir = null;
+        self.store.removeFiles(self.id(), "unsaved");
     }
 
     fn destroyInner(self: *Session) void {
@@ -938,11 +1228,9 @@ pub const Session = struct {
 
     // -- resume --------------------------------------------------------------
 
-    /// Rebuilds fx's history and settings from the log: the newest
-    /// compaction's summary, then every turn after it (or after the turn it
-    /// kept). A turn a crash or close ended has no `interruption` item and
-    /// comes back interrupted: `failed` after a crash, `cancelled` after a
-    /// close.
+    /// Rebuilds fx's history and settings from the open log (`restoreFrom`),
+    /// and keeps what later appends compare against: the last turn, the turn
+    /// behind each history entry, and the stored usage and language.
     pub fn restore(self: *Session, alloc: Allocator) !Restored {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -951,77 +1239,23 @@ pub const Session = struct {
         const sa = scratch.allocator();
         const state = try self.handle.state(sa);
         self.last_turn = state.last_turn;
-
-        const language = if (state.language) |raw| try decodeLanguage(sa, raw) else types.ConversationLanguage.default();
-        var restored: Restored = .{
-            .history = &.{},
-            .language = language,
-            .created_at_ms = std.math.cast(i64, state.created_ms) orelse 0,
-            .updated_at_ms = std.math.cast(i64, state.updated_ms) orelse 0,
-        };
+        self.turn_numbers.clearRetainingCapacity();
+        var restored = try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers });
         errdefer restored.deinit(alloc);
-        if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
-        if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
-        if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
         if (state.usage) |raw| {
-            const checkpoint = try decodeUsage(alloc, raw);
-            restored.usage = checkpoint.snapshot;
+            const checkpoint = try decodeUsage(sa, raw);
             self.usage_at_ms = checkpoint.at_ms;
             self.usage_marked = session_usage.needsProfileRecovery(checkpoint.snapshot);
         }
         if (state.language != null) {
-            const owned = try self.alloc.dupe(u8, language.view());
+            const owned = try self.alloc.dupe(u8, restored.language.view());
             if (self.language) |old| self.alloc.free(old);
             self.language = owned;
         }
-
-        var history: std.ArrayList(types.HistoryTurn) = .empty;
-        errdefer {
-            for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
-            history.deinit(alloc);
-        }
-        self.turn_numbers.clearRetainingCapacity();
-        var from: sm.From = .start;
-        var skip_offset: ?u64 = null;
-        if (state.compaction_offset) |offset| {
-            const cursor: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq.? };
-            var page = try self.handle.read(sa, .{ .at = cursor }, .forward, 1);
-            defer page.deinit();
-            const data = page.entries[0].body.?.compacted.data;
-            const compacted = try std.json.parseFromSliceLeaky(CompactedData, sa, data, .{});
-            try history.append(alloc, .{ .compacted_summary = .{
-                .summary = try alloc.dupe(u8, compacted.summary),
-                .removed_turn_count = compacted.removed_turn_count,
-                .compaction_count = compacted.compaction_count,
-                .root_user_messages_complete = false,
-                .permission_feedback_complete = false,
-            } });
-            try self.turn_numbers.append(self.alloc, null);
-            skip_offset = offset;
-            from = .{ .at = cursor };
-            if (compacted.keep_from_turn) |turn| from = .{ .at = try self.findTurnStart(sa, cursor, turn) };
-        }
-        var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers_alloc = self.alloc, .numbers = &self.turn_numbers };
-        try replay(self.source(), alloc, sa, from, skip_offset, &sink);
-        restored.history = try history.toOwnedSlice(alloc);
         return restored;
     }
 
     /// Keeps each turn for resume, with the number of the turn that holds it.
-    const RestoreSink = struct {
-        alloc: Allocator,
-        history: *std.ArrayList(types.HistoryTurn),
-        numbers_alloc: Allocator,
-        numbers: *std.ArrayList(?u64),
-
-        fn turn(sink: *RestoreSink, value: types.HistoryTurn, number: ?u64) !void {
-            errdefer types.freeHistoryTurn(sink.alloc, value);
-            try sink.history.ensureUnusedCapacity(sink.alloc, 1);
-            try sink.numbers.append(sink.numbers_alloc, number);
-            sink.history.appendAssumeCapacity(value);
-        }
-    };
-
     /// Hands `visitor.append` every turn in the log, oldest first, as v1's
     /// conversation reader does: a compaction hides no turn from the
     /// transcript. Each turn is freed after its call, and pages are freed as
@@ -1049,38 +1283,7 @@ pub const Session = struct {
     pub fn durableState(self: *Session, alloc: Allocator, workspace: []const u8) !Resumed {
         var restored = try self.restore(alloc);
         defer restored.deinit(alloc);
-        const id_copy = try alloc.dupe(u8, self.id());
-        errdefer alloc.free(id_copy);
-        const origin = try alloc.dupe(u8, workspace);
-        errdefer alloc.free(origin);
-        const workspace_copy = try alloc.dupe(u8, workspace);
-        errdefer alloc.free(workspace_copy);
-        // Every session starts with its preferences (`create`).
-        const preferences = restored.preferences orelse return error.InvalidSessionFormat;
-        restored.preferences = null;
-        const resumed: Resumed = .{
-            .state = .{
-                .id = id_copy,
-                .origin_workspace_root = origin,
-                .workspace_root = workspace_copy,
-                .created_at_ms = restored.created_at_ms,
-                .updated_at_ms = restored.updated_at_ms,
-                .conversation_language = restored.language,
-                .preferences = preferences,
-                .history = restored.history,
-                // v1 reloads its totals as zero as well.
-                .total_input_tokens = 0,
-                .total_output_tokens = 0,
-                .permission_state = restored.permission_state orelse .{},
-                .usage = restored.usage,
-            },
-            .title = restored.title,
-        };
-        restored.history = &.{};
-        restored.permission_state = null;
-        restored.usage = null;
-        restored.title = null;
-        return resumed;
+        return resumedOf(alloc, &restored, self.id(), workspace);
     }
 
     pub const Info = struct {
@@ -1100,20 +1303,6 @@ pub const Session = struct {
         return .{ .title = title, .updated_ms = std.math.cast(i64, st.updated_ms) orelse 0 };
     }
 
-    /// The cursor of `turn`'s `turn_started`, reading back from `before`.
-    fn findTurnStart(self: *Session, sa: Allocator, before: sm.Cursor, turn: u64) !sm.Cursor {
-        var from: sm.From = .{ .at = before };
-        while (true) {
-            var page = try self.handle.read(sa, from, .backward, replay_page_lines);
-            defer page.deinit();
-            for (page.entries) |entry| {
-                const body = entry.body orelse continue;
-                if (body == .turn_started and body.turn_started.turn == turn) return .{ .offset = entry.offset, .seq = entry.seq };
-            }
-            from = .{ .at = page.next orelse return error.InvalidConversationFrame };
-        }
-    }
-
     fn source(self: *Session) Source {
         return .{ .store = self.store, .id = self.id(), .handle = self.handle };
     }
@@ -1127,8 +1316,26 @@ const Source = struct {
     handle: ?sm.Session = null,
 
     fn read(src: Source, sa: Allocator, from: sm.From, limit: usize) !sm.Page {
-        if (src.handle) |handle| return handle.read(sa, from, .forward, limit);
-        return src.store.manager.read(sa, src.id, from, .forward, limit);
+        return src.readTo(sa, from, .forward, limit);
+    }
+
+    fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
+        if (src.handle) |handle| return handle.read(sa, from, direction, limit);
+        return src.store.manager.read(sa, src.id, from, direction, limit);
+    }
+
+    /// The cursor of `turn`'s `turn_started`, reading back from `before`.
+    fn findTurnStart(src: Source, sa: Allocator, before: sm.Cursor, turn: u64) !sm.Cursor {
+        var from: sm.From = .{ .at = before };
+        while (true) {
+            var page = try src.readTo(sa, from, .backward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                if (body == .turn_started and body.turn_started.turn == turn) return .{ .offset = entry.offset, .seq = entry.seq };
+            }
+            from = .{ .at = page.next orelse return error.InvalidConversationFrame };
+        }
     }
 
     /// A piece's bytes, from its blob when the line holds a reference.
@@ -1145,6 +1352,169 @@ const Source = struct {
         };
     }
 };
+
+fn copyFailed(id: []const u8, err: anyerror) bool {
+    debug_trace.logf("session", "event=sessions_v2_files_copy_incomplete session={s} err={s}", .{ id, @errorName(err) });
+    return false;
+}
+
+/// Side folders are a few levels deep (a kind, then files); deeper trees
+/// are not fx's and are left out.
+const max_copy_depth = 8;
+
+fn copyTree(source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usize) bool {
+    const io = io_mod.getIo();
+    var complete = true;
+    var it = source.dir.iterate();
+    while (it.next(io) catch |err| return copyFailed("tree", err)) |entry| switch (entry.kind) {
+        .directory => {
+            if (depth + 1 == max_copy_depth) {
+                complete = copyFailed(entry.name, error.TooDeep);
+                continue;
+            }
+            var from = (io_mod.openVerifiedPrivateDirIfPresent(source, entry.name) catch |err| {
+                complete = copyFailed(entry.name, err);
+                continue;
+            }) orelse continue;
+            defer from.close();
+            var to = io_mod.openOrCreateVerifiedPrivateDir(target, entry.name) catch |err| {
+                complete = copyFailed(entry.name, err);
+                continue;
+            };
+            defer to.close();
+            if (!copyTree(&from, &to, depth + 1)) complete = false;
+        },
+        .file => copyFile(source.dir, target.dir, entry.name) catch |err| {
+            complete = copyFailed(entry.name, err);
+        },
+        else => complete = copyFailed(entry.name, error.NotAFile),
+    };
+    return complete;
+}
+
+fn copyFile(from: std.Io.Dir, to: std.Io.Dir, name: []const u8) !void {
+    const io = io_mod.getIo();
+    var source = try from.openFile(io, name, .{ .follow_symlinks = false, .resolve_beneath = true, .allow_directory = false });
+    defer source.close(io);
+    var target = try to.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600), .resolve_beneath = true });
+    defer target.close(io);
+    var buffer: [16 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const n = try source.readPositional(io, &.{&buffer}, offset);
+        if (n == 0) break;
+        try target.writePositionalAll(io, buffer[0..n], offset);
+        offset += n;
+    }
+}
+
+/// Where `restoreFrom` puts the number of the turn behind each history entry.
+const TurnNumbers = struct {
+    alloc: Allocator,
+    list: *std.ArrayList(?u64),
+};
+
+/// Rebuilds fx's history and settings from `state` and its log: the newest
+/// compaction's summary, then every turn after it (or after the turn it
+/// kept). A turn a crash or close ended has no `interruption` item and
+/// comes back interrupted: `failed` after a crash, `cancelled` after a
+/// close. Caller owns the result.
+fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, numbers: ?TurnNumbers) !Restored {
+    const language = if (state.language) |raw| try decodeLanguage(sa, raw) else types.ConversationLanguage.default();
+    var restored: Restored = .{
+        .history = &.{},
+        .language = language,
+        .created_at_ms = std.math.cast(i64, state.created_ms) orelse 0,
+        .updated_at_ms = std.math.cast(i64, state.updated_ms) orelse 0,
+    };
+    errdefer restored.deinit(alloc);
+    if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
+    if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
+    if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
+    if (state.usage) |raw| restored.usage = (try decodeUsage(alloc, raw)).snapshot;
+
+    var history: std.ArrayList(types.HistoryTurn) = .empty;
+    errdefer {
+        for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
+        history.deinit(alloc);
+    }
+    var from: sm.From = .start;
+    var skip_offset: ?u64 = null;
+    if (state.compaction_offset) |offset| {
+        const cursor: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq.? };
+        var page = try src.read(sa, .{ .at = cursor }, 1);
+        defer page.deinit();
+        const data = page.entries[0].body.?.compacted.data;
+        const compacted = try std.json.parseFromSliceLeaky(CompactedData, sa, data, .{});
+        try history.ensureUnusedCapacity(alloc, 1);
+        if (numbers) |n| try n.list.append(n.alloc, null);
+        history.appendAssumeCapacity(.{ .compacted_summary = .{
+            .summary = try alloc.dupe(u8, compacted.summary),
+            .removed_turn_count = compacted.removed_turn_count,
+            .compaction_count = compacted.compaction_count,
+            .root_user_messages_complete = false,
+            .permission_feedback_complete = false,
+        } });
+        skip_offset = offset;
+        from = .{ .at = cursor };
+        if (compacted.keep_from_turn) |turn| from = .{ .at = try src.findTurnStart(sa, cursor, turn) };
+    }
+    var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers = numbers };
+    try replay(src, alloc, sa, from, skip_offset, &sink);
+    restored.history = try history.toOwnedSlice(alloc);
+    return restored;
+}
+
+/// Keeps each turn for resume, with the number of the turn that holds it.
+const RestoreSink = struct {
+    alloc: Allocator,
+    history: *std.ArrayList(types.HistoryTurn),
+    numbers: ?TurnNumbers,
+
+    fn turn(sink: *RestoreSink, value: types.HistoryTurn, number: ?u64) !void {
+        errdefer types.freeHistoryTurn(sink.alloc, value);
+        try sink.history.ensureUnusedCapacity(sink.alloc, 1);
+        if (sink.numbers) |n| try n.list.append(n.alloc, number);
+        sink.history.appendAssumeCapacity(value);
+    }
+};
+
+/// Moves `restored` into v1's `DurableSessionState` with its stored title;
+/// `restored` keeps only what it still owns. Caller owns the result.
+fn resumedOf(alloc: Allocator, restored: *Restored, id: []const u8, workspace: []const u8) !Resumed {
+    const id_copy = try alloc.dupe(u8, id);
+    errdefer alloc.free(id_copy);
+    const origin = try alloc.dupe(u8, workspace);
+    errdefer alloc.free(origin);
+    const workspace_copy = try alloc.dupe(u8, workspace);
+    errdefer alloc.free(workspace_copy);
+    // Every session starts with its preferences (`create`).
+    const preferences = restored.preferences orelse return error.InvalidSessionFormat;
+    restored.preferences = null;
+    const resumed: Resumed = .{
+        .state = .{
+            .id = id_copy,
+            .origin_workspace_root = origin,
+            .workspace_root = workspace_copy,
+            .created_at_ms = restored.created_at_ms,
+            .updated_at_ms = restored.updated_at_ms,
+            .conversation_language = restored.language,
+            .preferences = preferences,
+            .history = restored.history,
+            // v1 reloads its totals as zero as well.
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+            .permission_state = restored.permission_state orelse .{},
+            .usage = restored.usage,
+        },
+        .title = restored.title,
+    };
+    restored.history = &.{};
+    restored.permission_state = null;
+    restored.usage = null;
+    restored.title = null;
+    return resumed;
+}
 
 fn lastStarted(entry: sm.Entry) ?u64 {
     return switch (entry.body.?) {
@@ -2455,6 +2825,91 @@ test "side files live in a private session-files folder" {
     try testing.expect(std.mem.endsWith(u8, s.filesPath(), s.id()));
     const stat = try t.tmp.dir.statFile(io_mod.getIo(), ".fx/" ++ files_dir_name, .{});
     try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+}
+
+fn filesExist(t: *TestHome, id: []const u8) bool {
+    const path = std.fs.path.join(testing.allocator, &.{ ".fx", files_dir_name, id }) catch return false;
+    defer testing.allocator.free(path);
+    t.tmp.dir.access(io_mod.getIo(), path, .{}) catch return false;
+    return true;
+}
+
+test "a session that never reached the disk takes its side folder, and a saved one keeps it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const unsaved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    _ = try unsaved.ensureFilesPath();
+    const unsaved_id = try testing.allocator.dupe(u8, unsaved.id());
+    defer testing.allocator.free(unsaved_id);
+    try testing.expect(filesExist(&t, unsaved_id));
+    unsaved.close();
+    try testing.expect(!filesExist(&t, unsaved_id));
+
+    const saved = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    _ = try saved.ensureFilesPath();
+    try saved.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const saved_id = try testing.allocator.dupe(u8, saved.id());
+    defer testing.allocator.free(saved_id);
+    saved.close();
+    try testing.expect(filesExist(&t, saved_id));
+
+    // A first write that landed although the adapter never saw it succeed:
+    // its turn may point into the folder, so the folder stays.
+    const landed = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    _ = try landed.ensureFilesPath();
+    _ = try landed.handle.append(&.{ .turn_started, .turn_committed });
+    const landed_id = try testing.allocator.dupe(u8, landed.id());
+    defer testing.allocator.free(landed_id);
+    landed.close();
+    try testing.expect(filesExist(&t, landed_id));
+}
+
+test "recover copies side files and folders, never a link, and says when it left one out" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    const io = io_mod.getIo();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    {
+        var files = try std.Io.Dir.openDirAbsolute(io, try s.ensureFilesPath(), .{});
+        defer files.close(io);
+        try files.writeFile(io, .{ .sub_path = "top.txt", .data = "top", .flags = .{ .permissions = .fromMode(0o600) } });
+        var nested = try io_mod.openOrCreateVerifiedPrivateDirFromDir(files, "nested");
+        defer nested.close();
+        try nested.dir.writeFile(io, .{ .sub_path = "inner.txt", .data = "inner", .flags = .{ .permissions = .fromMode(0o600) } });
+        try files.symLink(io, "/etc/hosts", "link", .{});
+    }
+    try s.commitTurn(assistantTurn("q", "a"), types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    var recovered = try recover(&t.store, testing.allocator, id);
+    defer recovered.deinit(testing.allocator);
+    try testing.expect(!recovered.files_complete);
+    try testing.expectEqual(@as(usize, 1), recovered.history_len);
+    const copy = try std.fs.path.join(testing.allocator, &.{ ".fx", files_dir_name, recovered.id });
+    defer testing.allocator.free(copy);
+    var dir = try t.tmp.dir.openDir(io, copy, .{});
+    defer dir.close(io);
+    const top = try dir.readFileAlloc(io, "top.txt", testing.allocator, .limited(64));
+    defer testing.allocator.free(top);
+    try testing.expectEqualStrings("top", top);
+    const inner = try dir.readFileAlloc(io, "nested/inner.txt", testing.allocator, .limited(64));
+    defer testing.allocator.free(inner);
+    try testing.expectEqualStrings("inner", inner);
+    const stat = try dir.statFile(io, "nested/inner.txt", .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    try testing.expectError(error.FileNotFound, dir.access(io, "link", .{ .follow_symlinks = false }));
+
+    // The copy is a root session of its own; the source is unchanged.
+    var copied = try readSession(&t.store, testing.allocator, recovered.id);
+    defer copied.deinit(testing.allocator);
+    try testing.expectEqualStrings("q", copied.state.history[0].assistant.user.text);
+    try testing.expectError(error.SessionNotFound, recover(&t.store, testing.allocator, "NoSuchSession1"));
 }
 
 test "only the adapter imports the session manager" {

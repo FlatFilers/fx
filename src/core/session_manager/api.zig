@@ -137,6 +137,23 @@ pub const ImportOptions = struct {
     created_ms: u64,
 };
 
+/// A saved session as `peek` reads it. Owns everything; free with `deinit`.
+pub const Peeked = struct {
+    role: Role,
+    /// A child's parent; null for a root.
+    parent: ?[]u8 = null,
+    workspace: []u8,
+    /// With `created_ms` and `updated_ms` set, as `Session.state` sets them.
+    state: State,
+
+    pub fn deinit(p: *Peeked, gpa: std.mem.Allocator) void {
+        if (p.parent) |value| gpa.free(value);
+        gpa.free(p.workspace);
+        p.state.deinit(gpa);
+        p.* = undefined;
+    }
+};
+
 pub const Manager = struct {
     gpa: std.mem.Allocator,
     root_path: []u8,
@@ -364,6 +381,28 @@ pub const Manager = struct {
     }
 
     /// A blob's bytes, checked against its hash. The caller frees them.
+    /// A saved session's state, folded without its lock as the catalog
+    /// reads it: line 1, the newest snapshot, then the tail (D37). A torn
+    /// tail is left as it is, and a child needs no parent to be read.
+    pub fn peek(m: *Manager, gpa: std.mem.Allocator, id: []const u8) OpenError!Peeked {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        var summary = try session_mod.readSummary(&m.env, id);
+        defer summary.deinit(m.gpa);
+        var state = try summary.state.clone(gpa);
+        errdefer state.deinit(gpa);
+        state.created_ms = summary.created_ms;
+        state.updated_ms = summary.updated_ms;
+        const workspace = try gpa.dupe(u8, summary.identity.workspace);
+        errdefer gpa.free(workspace);
+        return .{
+            .role = summary.identity.role,
+            .parent = if (summary.identity.parent) |parent| try gpa.dupe(u8, parent) else null,
+            .workspace = workspace,
+            .state = state,
+        };
+    }
+
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
