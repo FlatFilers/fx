@@ -38,6 +38,7 @@ pub fn highlight(
     var styled: std.ArrayList(u8) = .empty;
     errdefer styled.deinit(alloc);
     const palette = paletteForTheme(theme);
+    const settings = profile.settings;
     if (base) |base_style| try styled.appendSlice(alloc, base_style);
     // A theme can disable syntax highlighting entirely; the span then keeps
     // only the caller's base, byte-identical to a token-free source.
@@ -49,30 +50,30 @@ pub fn highlight(
     var index: usize = 0;
     // Command-position state, used only by command_words profiles (shell):
     // the next word is a command name unless a token says otherwise.
-    var command_position = profile.command_words;
+    var command_position = settings.command_words;
     while (index < source.len) {
         const byte = source[index];
         if (byte == '\n') {
             try styled.append(alloc, '\n');
-            command_position = profile.command_words;
+            command_position = settings.command_words;
             index += 1;
             continue;
         }
-        if (blockCommentEnd(source, index, profile.block_comment)) |end| {
+        if (blockCommentEnd(source, index, settings.block_comment)) |end| {
             try appendStyled(alloc, &styled, palette.comment_style, source[index..end], base);
             command_position = false;
             index = end;
             continue;
         }
-        if (lineCommentEnd(source, index, profile.line_comments)) |end| {
+        if (lineCommentEnd(source, index, settings.line_comments)) |end| {
             try appendStyled(alloc, &styled, palette.comment_style, source[index..end], base);
             command_position = false;
             index = end;
             continue;
         }
-        if (isQuote(byte, profile.quotes)) {
+        if (isQuote(byte, settings.quotes)) {
             const end = quotedEnd(source, index);
-            if (byte == '"' and profile.dollar_vars) {
+            if (byte == '"' and settings.dollar_vars) {
                 try appendDoubleQuoted(alloc, &styled, palette, source[index..end], base);
             } else {
                 try appendStyled(alloc, &styled, palette.string_style, source[index..end], base);
@@ -85,7 +86,7 @@ pub fn highlight(
             const end = numberEnd(source, index);
             // Shell: bare number arguments stay plain (a run id is not a
             // literal); only file descriptors glued to a redirect color.
-            if (profile.bare_numbers or fdContext(source, index, end)) {
+            if (settings.bare_numbers or fdContext(source, index, end)) {
                 try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
             } else {
                 try styled.appendSlice(alloc, source[index..end]);
@@ -94,7 +95,7 @@ pub fn highlight(
             index = end;
             continue;
         }
-        if (profile.dollar_vars and byte == '$') {
+        if (settings.dollar_vars and byte == '$') {
             // Command substitution reopens command position for its contents.
             if (index + 1 < source.len and source[index + 1] == '(') {
                 try appendStyled(alloc, &styled, palette.operator_style, "$(", base);
@@ -109,22 +110,22 @@ pub fn highlight(
                 continue;
             }
         }
-        if (profile.dollar_vars and byte == '~' and tildeStart(source, index, profile.operators)) {
+        if (settings.dollar_vars and byte == '~' and tildeStart(source, index, settings.shell_operators)) {
             try appendStyled(alloc, &styled, palette.variable_style, "~", base);
             command_position = false;
             index += 1;
             continue;
         }
-        if (profile.dash_flags and byte == '-') {
-            if (flagEnd(source, index, profile.operators)) |end| {
+        if (settings.dash_flags and byte == '-') {
+            if (flagEnd(source, index, settings.shell_operators)) |end| {
                 try appendStyled(alloc, &styled, palette.number_style, source[index..end], base);
                 command_position = false;
                 index = end;
                 continue;
             }
         }
-        if (isOperatorChar(byte, profile.operators)) {
-            const end = operatorRunEnd(source, index, profile.operators);
+        if (isOperatorChar(byte, settings.shell_operators)) {
+            const end = operatorRunEnd(source, index, settings.shell_operators);
             const run = source[index..end];
             try appendStyled(alloc, &styled, palette.operator_style, run, base);
             // Redirect targets are paths, not commands; `2>&1`-style runs too.
@@ -133,7 +134,7 @@ pub fn highlight(
             index = end;
             continue;
         }
-        if (profile.command_words and byte == '`') {
+        if (settings.command_words and byte == '`') {
             // Backticks parse as code; their contents reopen command position.
             try styled.append(alloc, byte);
             command_position = true;
@@ -147,7 +148,7 @@ pub fn highlight(
             // /dev/null keeps "null" plain.
             const after_separator = index > 0 and source[index - 1] == '/';
             var styled_word = false;
-            if (profile.command_words) {
+            if (settings.command_words) {
                 if (command_position and !after_separator) {
                     // Control keywords read as keywords; other command words
                     // as functions, matching the grammar's scopes.
@@ -160,10 +161,10 @@ pub fn highlight(
                 }
             } else if (!after_separator and (profile.keywords.len > 0 or profile.literals.len > 0)) {
                 const token_hash = languages.packedWordHash(token);
-                if (inPackedList(token, token_hash, profile.keywords, profile.keyword_case)) {
+                if (inPackedList(token, token_hash, profile.keywords, settings.keyword_case)) {
                     try appendStyled(alloc, &styled, palette.keyword_style, token, base);
                     styled_word = true;
-                } else if (inPackedList(token, token_hash, profile.literals, profile.keyword_case)) {
+                } else if (inPackedList(token, token_hash, profile.literals, settings.keyword_case)) {
                     try appendStyled(alloc, &styled, palette.number_style, token, base);
                     styled_word = true;
                 }
@@ -171,7 +172,7 @@ pub fn highlight(
             if (!styled_word) try styled.appendSlice(alloc, token);
             // Control keywords are followed by the command they govern; an
             // ordinary command word is followed by its arguments.
-            if (profile.command_words) {
+            if (settings.command_words) {
                 command_position = styled_word and command_position and
                     inList(token, &command_prefixes, .sensitive);
             }
@@ -199,10 +200,10 @@ fn fdContext(source: []const u8, start: usize, end: usize) bool {
 }
 
 /// A tilde opens a home path at a word boundary when a path or name follows.
-fn tildeStart(source: []const u8, index: usize, operators: []const u8) bool {
+fn tildeStart(source: []const u8, index: usize, shell_operators: bool) bool {
     if (index > 0) {
         const prev = source[index - 1];
-        if (!std.ascii.isWhitespace(prev) and !isOperatorChar(prev, operators) and prev != '(' and prev != '`') return false;
+        if (!std.ascii.isWhitespace(prev) and !isOperatorChar(prev, shell_operators) and prev != '(' and prev != '`') return false;
     }
     const next = index + 1;
     return next < source.len and
@@ -296,27 +297,54 @@ pub fn highlightDiff(
     return styled.toOwnedSlice(alloc);
 }
 
-fn blockCommentEnd(source: []const u8, index: usize, block_comment: ?languages.BlockComment) ?usize {
-    const comment = block_comment orelse return null;
-    if (!std.mem.startsWith(u8, source[index..], comment.start)) return null;
-    const content_start = index + comment.start.len;
-    const close_start = std.mem.indexOfPos(u8, source, content_start, comment.end) orelse return source.len;
-    return close_start + comment.end.len;
+fn blockCommentEnd(source: []const u8, index: usize, kind: languages.BlockComments) ?usize {
+    return switch (kind) {
+        .none => null,
+        .slash_star => delimitedCommentEnd(source, index, "/*", "*/"),
+        .html => delimitedCommentEnd(source, index, "<!--", "-->"),
+        .powershell => delimitedCommentEnd(source, index, "<#", "#>"),
+        .lua => delimitedCommentEnd(source, index, "--[[", "]]"),
+        .haskell => delimitedCommentEnd(source, index, "{-", "-}"),
+    };
 }
 
-fn lineCommentEnd(source: []const u8, index: usize, prefixes: []const []const u8) ?usize {
-    for (prefixes) |prefix| {
-        if (std.mem.startsWith(u8, source[index..], prefix)) return lineEnd(source, index);
-    }
-    return null;
+fn delimitedCommentEnd(source: []const u8, index: usize, start: []const u8, end: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, source[index..], start)) return null;
+    const content_start = index + start.len;
+    const close_start = std.mem.indexOfPos(u8, source, content_start, end) orelse return source.len;
+    return close_start + end.len;
+}
+
+fn lineCommentEnd(source: []const u8, index: usize, kind: languages.LineComments) ?usize {
+    const matched = switch (kind) {
+        .none => false,
+        .slash => startsComment(source, index, "//"),
+        .hash => startsComment(source, index, "#"),
+        .dash => startsComment(source, index, "--"),
+        .slash_hash => startsComment(source, index, "//") or startsComment(source, index, "#"),
+        .hash_slash => startsComment(source, index, "#") or startsComment(source, index, "//"),
+        .hash_semicolon => startsComment(source, index, "#") or startsComment(source, index, ";"),
+    };
+    return if (matched) lineEnd(source, index) else null;
+}
+
+fn startsComment(source: []const u8, index: usize, prefix: []const u8) bool {
+    return std.mem.startsWith(u8, source[index..], prefix);
 }
 
 fn lineEnd(source: []const u8, start: usize) usize {
     return std.mem.indexOfScalarPos(u8, source, start, '\n') orelse source.len;
 }
 
-fn isQuote(byte: u8, quotes: []const u8) bool {
-    return std.mem.indexOfScalar(u8, quotes, byte) != null;
+fn isQuote(byte: u8, quotes: languages.Quotes) bool {
+    return switch (quotes) {
+        .none => false,
+        .double => byte == '"',
+        .double_single => byte == '"' or byte == '\'',
+        .shell => byte == '"' or byte == '\'' or byte == '`',
+        .double_backtick => byte == '"' or byte == '`',
+        .backtick => byte == '`',
+    };
 }
 
 fn quotedEnd(source: []const u8, start: usize) usize {
@@ -354,13 +382,13 @@ fn isIdentifierStart(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or byte == '_' or byte == '$';
 }
 
-fn isOperatorChar(byte: u8, operators: []const u8) bool {
-    return std.mem.findScalar(u8, operators, byte) != null;
+fn isOperatorChar(byte: u8, shell_operators: bool) bool {
+    return shell_operators and std.mem.findScalar(u8, "&|;<>*", byte) != null;
 }
 
-fn operatorRunEnd(source: []const u8, start: usize, operators: []const u8) usize {
+fn operatorRunEnd(source: []const u8, start: usize, shell_operators: bool) usize {
     var end = start;
-    while (end < source.len and isOperatorChar(source[end], operators)) end += 1;
+    while (end < source.len and isOperatorChar(source[end], shell_operators)) end += 1;
     return end;
 }
 
@@ -390,10 +418,10 @@ fn dollarVarEndWithin(source: []const u8, start: usize, limit: usize) ?usize {
 /// A dash opens a flag token only at a word boundary (after whitespace, an
 /// operator, or the start) with a letter, digit, or second dash next. Dashes
 /// inside words, like date suffixes in paths, stay plain.
-fn flagEnd(source: []const u8, start: usize, operators: []const u8) ?usize {
+fn flagEnd(source: []const u8, start: usize, shell_operators: bool) ?usize {
     if (start > 0) {
         const prev = source[start - 1];
-        if (!std.ascii.isWhitespace(prev) and !isOperatorChar(prev, operators)) return null;
+        if (!std.ascii.isWhitespace(prev) and !isOperatorChar(prev, shell_operators)) return null;
     }
     const next = start + 1;
     if (next >= source.len) return null;

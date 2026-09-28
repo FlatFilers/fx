@@ -2,7 +2,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const KeywordCase = enum {
+pub const KeywordCase = enum(u1) {
     sensitive,
     ascii_insensitive,
 };
@@ -12,7 +12,7 @@ pub const BlockComment = struct {
     end: []const u8,
 };
 
-pub const Detection = enum {
+pub const Detection = enum(u4) {
     none,
     typescript_assertion,
     json,
@@ -25,7 +25,50 @@ pub const Detection = enum {
     diff_patch,
 };
 
-pub const Profile = struct {
+pub const LineComments = enum(u3) {
+    none,
+    slash,
+    hash,
+    dash,
+    slash_hash,
+    hash_slash,
+    hash_semicolon,
+};
+
+pub const BlockComments = enum(u3) {
+    none,
+    slash_star,
+    html,
+    powershell,
+    lua,
+    haskell,
+};
+
+pub const Quotes = enum(u3) {
+    none,
+    double,
+    double_single,
+    shell,
+    double_backtick,
+    backtick,
+};
+
+pub const Settings = packed struct(u32) {
+    line_comments: LineComments = .none,
+    block_comment: BlockComments = .none,
+    quotes: Quotes = .none,
+    shell_operators: bool = false,
+    dollar_vars: bool = false,
+    dash_flags: bool = false,
+    command_words: bool = false,
+    bare_numbers: bool = true,
+    diff_lines: bool = false,
+    keyword_case: KeywordCase = .sensitive,
+    detection: Detection = .none,
+    _padding: u12 = 0,
+};
+
+const SourceProfile = struct {
     label: []const u8,
     aliases: []const []const u8,
     line_comments: []const []const u8 = &.{},
@@ -53,6 +96,139 @@ pub const Profile = struct {
     keyword_case: KeywordCase = .sensitive,
     detection: Detection = .none,
 };
+
+pub const Profile = struct {
+    aliases: []const u8,
+    keywords: []const u8 = "",
+    literals: []const u8 = "",
+    settings: Settings = .{},
+
+    pub fn label(self: *const Profile) []const u8 {
+        const len = self.aliases[0];
+        return self.aliases[1..][0..len];
+    }
+
+    fn aliasIterator(self: *const Profile) AliasIterator {
+        return .{ .bytes = self.aliases };
+    }
+
+    pub fn rendersDiffLines(self: *const Profile) bool {
+        return self.settings.diff_lines;
+    }
+};
+
+const AliasIterator = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+
+    fn next(self: *AliasIterator) ?[]const u8 {
+        if (self.offset == self.bytes.len) return null;
+        const len = self.bytes[self.offset];
+        self.offset += 1;
+        const alias = self.bytes[self.offset..][0..len];
+        self.offset += len;
+        return alias;
+    }
+};
+
+fn packedAliasesLen(comptime profile: SourceProfile) usize {
+    comptime var len: usize = 1 + profile.label.len;
+    comptime var found_label = false;
+    inline for (profile.aliases) |alias| {
+        if (alias.len > std.math.maxInt(u8)) @compileError("syntax alias is too long");
+        if (std.mem.eql(u8, profile.label, alias)) {
+            found_label = true;
+        } else {
+            len += 1 + alias.len;
+        }
+    }
+    if (!found_label) @compileError("syntax profile label must be one of its aliases: " ++ profile.label);
+    return len;
+}
+
+fn packAliases(comptime profile: SourceProfile) [packedAliasesLen(profile)]u8 {
+    var result: [packedAliasesLen(profile)]u8 = undefined;
+    comptime var offset: usize = 0;
+    result[offset] = @intCast(profile.label.len);
+    offset += 1;
+    @memcpy(result[offset..][0..profile.label.len], profile.label);
+    offset += profile.label.len;
+    inline for (profile.aliases) |alias| {
+        if (std.mem.eql(u8, profile.label, alias)) continue;
+        result[offset] = @intCast(alias.len);
+        offset += 1;
+        @memcpy(result[offset..][0..alias.len], alias);
+        offset += alias.len;
+    }
+    return result;
+}
+
+fn lineComments(comptime prefixes: []const []const u8) LineComments {
+    if (prefixes.len == 0) return .none;
+    if (prefixes.len == 1) {
+        if (std.mem.eql(u8, prefixes[0], "//")) return .slash;
+        if (std.mem.eql(u8, prefixes[0], "#")) return .hash;
+        if (std.mem.eql(u8, prefixes[0], "--")) return .dash;
+    }
+    if (prefixes.len == 2) {
+        if (std.mem.eql(u8, prefixes[0], "//") and std.mem.eql(u8, prefixes[1], "#")) return .slash_hash;
+        if (std.mem.eql(u8, prefixes[0], "#") and std.mem.eql(u8, prefixes[1], "//")) return .hash_slash;
+        if (std.mem.eql(u8, prefixes[0], "#") and std.mem.eql(u8, prefixes[1], ";")) return .hash_semicolon;
+    }
+    @compileError("unsupported syntax line-comment set");
+}
+
+fn blockComments(comptime maybe_comment: ?BlockComment) BlockComments {
+    const comment = maybe_comment orelse return .none;
+    if (std.mem.eql(u8, comment.start, "/*") and std.mem.eql(u8, comment.end, "*/")) return .slash_star;
+    if (std.mem.eql(u8, comment.start, "<!--") and std.mem.eql(u8, comment.end, "-->")) return .html;
+    if (std.mem.eql(u8, comment.start, "<#") and std.mem.eql(u8, comment.end, "#>")) return .powershell;
+    if (std.mem.eql(u8, comment.start, "--[[") and std.mem.eql(u8, comment.end, "]]")) return .lua;
+    if (std.mem.eql(u8, comment.start, "{-") and std.mem.eql(u8, comment.end, "-}")) return .haskell;
+    @compileError("unsupported syntax block-comment pair");
+}
+
+fn quotes(comptime bytes: []const u8) Quotes {
+    if (std.mem.eql(u8, bytes, "")) return .none;
+    if (std.mem.eql(u8, bytes, "\"")) return .double;
+    if (std.mem.eql(u8, bytes, "\"'")) return .double_single;
+    if (std.mem.eql(u8, bytes, "\"'`")) return .shell;
+    if (std.mem.eql(u8, bytes, "\"`")) return .double_backtick;
+    if (std.mem.eql(u8, bytes, "`")) return .backtick;
+    @compileError("unsupported syntax quote set");
+}
+
+fn shellOperators(comptime bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    if (std.mem.eql(u8, bytes, "&|;<>*")) return true;
+    @compileError("unsupported syntax operator set");
+}
+
+fn compactProfiles(comptime source: anytype) [source.len]Profile {
+    @setEvalBranchQuota(100_000);
+    var result: [source.len]Profile = undefined;
+    inline for (source, 0..) |profile, index| {
+        result[index] = .{
+            .aliases = &packAliases(profile),
+            .keywords = profile.keywords,
+            .literals = profile.literals,
+            .settings = .{
+                .line_comments = lineComments(profile.line_comments),
+                .block_comment = blockComments(profile.block_comment),
+                .quotes = quotes(profile.quotes),
+                .shell_operators = shellOperators(profile.operators),
+                .dollar_vars = profile.dollar_vars,
+                .dash_flags = profile.dash_flags,
+                .command_words = profile.command_words,
+                .bare_numbers = profile.bare_numbers,
+                .diff_lines = profile.diff_lines,
+                .keyword_case = profile.keyword_case,
+                .detection = profile.detection,
+            },
+        };
+    }
+    return result;
+}
 
 const double_quote = &[_]u8{'"'};
 const double_single_quotes = &[_]u8{ '"', '\'' };
@@ -110,7 +286,7 @@ test "packed syntax words retain exact hashes and boundaries" {
     }
 }
 
-const profiles = [_]Profile{
+const source_profiles = [_]SourceProfile{
     .{
         .label = "zig",
         .aliases = &.{"zig"},
@@ -444,9 +620,12 @@ const profiles = [_]Profile{
     },
 };
 
+const profiles = compactProfiles(source_profiles);
+
 pub fn resolve(label: []const u8) ?*const Profile {
     for (&profiles) |*profile| {
-        for (profile.aliases) |alias| {
+        var aliases = profile.aliasIterator();
+        while (aliases.next()) |alias| {
             if (std.ascii.eqlIgnoreCase(label, alias)) return profile;
         }
     }
@@ -455,7 +634,7 @@ pub fn resolve(label: []const u8) ?*const Profile {
 
 pub fn infer(alloc: Allocator, source: []const u8) ?*const Profile {
     for (&profiles) |*profile| {
-        if (matchesDetection(alloc, profile.detection, source)) return profile;
+        if (matchesDetection(alloc, profile.settings.detection, source)) return profile;
     }
     return null;
 }
@@ -569,7 +748,7 @@ test "TypeScript assertions infer the canonical TypeScript label" {
     const source =
         "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);";
 
-    try std.testing.expectEqualStrings("ts", infer(std.testing.allocator, source).?.label);
+    try std.testing.expectEqualStrings("ts", infer(std.testing.allocator, source).?.label());
     try std.testing.expect(infer(std.testing.allocator, "const value = 1;") == null);
     try std.testing.expect(infer(std.testing.allocator, "const value = {} as cleanupSignal;") == null);
 }
@@ -589,10 +768,10 @@ test "supported code fence labels resolve case insensitively" {
         .{ .label = "zsh", .profile = "sh" },
         .{ .label = "Shell", .profile = "sh" },
     };
-    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label);
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label());
     try std.testing.expect(resolve("") == null);
     // text resolves to a deliberate plain profile; rendering stays byte-identical.
-    try std.testing.expectEqualStrings("text", resolve("text").?.label);
+    try std.testing.expectEqualStrings("text", resolve("text").?.label());
 }
 
 test "expanded code fence labels resolve through the language registry" {
@@ -613,7 +792,7 @@ test "expanded code fence labels resolve through the language registry" {
         .{ .label = "hcl", .profile = "hcl" },               .{ .label = "terraform", .profile = "hcl" },
         .{ .label = "tf", .profile = "hcl" },
     };
-    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label);
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, resolve(case.label).?.label());
 }
 
 test "high-confidence source shapes infer registered profiles" {
@@ -628,16 +807,18 @@ test "high-confidence source shapes infer registered profiles" {
         .{ .source = "fn main() { println!(\"ready\"); }", .profile = "rust" },
     };
 
-    for (cases) |case| try std.testing.expectEqualStrings(case.profile, infer(alloc, case.source).?.label);
+    for (cases) |case| try std.testing.expectEqualStrings(case.profile, infer(alloc, case.source).?.label());
     try std.testing.expect(infer(alloc, "const value = 1;") == null);
     try std.testing.expect(infer(alloc, "title: ready") == null);
 }
 
 test "aliases do not collide across profiles" {
     for (profiles, 0..) |profile, profile_index| {
-        for (profile.aliases) |alias| {
+        var aliases = profile.aliasIterator();
+        while (aliases.next()) |alias| {
             for (profiles[profile_index + 1 ..]) |other| {
-                for (other.aliases) |other_alias| {
+                var other_aliases = other.aliasIterator();
+                while (other_aliases.next()) |other_alias| {
                     try std.testing.expect(!std.ascii.eqlIgnoreCase(alias, other_alias));
                 }
             }
@@ -668,13 +849,13 @@ test "resolve covers the added languages and aliases" {
     };
     for (cases) |case| {
         const profile = resolve(case.alias).?;
-        try std.testing.expectEqualStrings(case.label, profile.label);
+        try std.testing.expectEqualStrings(case.label, profile.label());
     }
 }
 
 test "infer detects diff patches without a fence label" {
     const alloc = std.testing.allocator;
     const profile = infer(alloc, "--- a/main.zig\n+++ b/main.zig\n@@ -1 +1 @@\n-old\n+new").?;
-    try std.testing.expectEqualStrings("diff", profile.label);
+    try std.testing.expectEqualStrings("diff", profile.label());
     try std.testing.expect(infer(alloc, "plain prose about --- things") == null);
 }

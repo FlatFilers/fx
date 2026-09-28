@@ -1106,11 +1106,11 @@ fn renderCodeBlockForTranscriptWithTheme(
     const language = if (block.language.len > 0)
         block.language
     else if (profile) |inferred|
-        inferred.label
+        inferred.label()
     else
         "";
     const styled_code = if (profile) |resolved|
-        if (resolved.diff_lines)
+        if (resolved.rendersDiffLines())
             try code_highlight.highlightDiff(alloc, block.code, theme, ui_render.diff_added_marker_style, ui_render.diff_removed_marker_style)
         else
             try code_highlight.highlight(alloc, block.code, resolved, theme, null)
