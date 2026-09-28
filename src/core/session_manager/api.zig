@@ -58,16 +58,18 @@ pub const max_blob_bytes = session_mod.max_blob_bytes;
 pub const max_value_bytes: usize = log_mod.max_line_bytes - 64 * 1024;
 const max_text_bytes = 4096;
 
-pub const OpenError = error{ InvalidArgument, NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, InvalidForkPoint, Exists, Io, OutOfMemory };
-pub const AppendError = error{ InvalidArgument, InvalidTransition, SessionClosed, TooLarge, Io, OutOfMemory };
-pub const CloseError = error{ Io, OutOfMemory };
-pub const ReadError = error{ InvalidArgument, NotFound, Io, OutOfMemory };
-pub const SessionReadError = error{ InvalidArgument, SessionClosed, Io, OutOfMemory };
-pub const BlobError = error{ InvalidArgument, NotFound, Corrupt, Io, OutOfMemory };
-pub const ListError = error{ Busy, Io, OutOfMemory };
-pub const DeleteError = error{ InvalidArgument, NotFound, Busy, Io, OutOfMemory };
-pub const VerifyError = error{ InvalidArgument, NotFound, Io, OutOfMemory };
-pub const RebuildError = error{ Busy, Io, OutOfMemory };
+/// An I/O failure with its OS cause when known, `Io` otherwise (D29).
+pub const IoFault = storage.IoFault;
+pub const OpenError = error{ InvalidArgument, NotFound, Busy, ChildSession, Corrupt, UnsupportedVersion, InvalidForkPoint, Exists, OutOfMemory } || storage.IoFault;
+pub const AppendError = error{ InvalidArgument, InvalidTransition, SessionClosed, TooLarge, OutOfMemory } || storage.IoFault;
+pub const CloseError = error{OutOfMemory} || storage.IoFault;
+pub const ReadError = error{ InvalidArgument, NotFound, OutOfMemory } || storage.IoFault;
+pub const SessionReadError = error{ InvalidArgument, SessionClosed, OutOfMemory } || storage.IoFault;
+pub const BlobError = error{ InvalidArgument, NotFound, Corrupt, OutOfMemory } || storage.IoFault;
+pub const ListError = error{ Busy, OutOfMemory } || storage.IoFault;
+pub const DeleteError = error{ InvalidArgument, NotFound, Busy, OutOfMemory } || storage.IoFault;
+pub const VerifyError = error{ InvalidArgument, NotFound, OutOfMemory } || storage.IoFault;
+pub const RebuildError = error{ Busy, OutOfMemory } || storage.IoFault;
 
 pub const Backend = enum { posix };
 
@@ -190,12 +192,12 @@ pub const Manager = struct {
         if (storage.hooks) m.env.s.fault = fault;
     }
 
-    fn ready(m: *Manager) error{Io}!void {
+    fn ready(m: *Manager) storage.IoFault!void {
         const io = m.env.s.io;
         m.root_mutex.lockUncancelable(io);
         defer m.root_mutex.unlock(io);
         if (m.root_open) return;
-        m.env.root = m.env.s.openRoot(m.root_path) catch return error.Io;
+        m.env.root = m.env.s.openRoot(m.root_path) catch |io_err| return storage.ioFault(io_err);
         m.root_open = true;
     }
 
@@ -258,7 +260,8 @@ pub const Manager = struct {
             .parent = options.parent,
             .lock_wait_ms = options.lock_wait_ms,
         }) catch |err| return switch (err) {
-            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.Io, error.OutOfMemory => |e| e,
+            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.OutOfMemory => |e| e,
+            else => |io_err| storage.ioFault(io_err),
         };
         m.catalog().opened(inner.id(), options.host, m.nowMs()) catch m.indexStale(inner.id());
         return .{ .manager = m, .inner = inner };
@@ -267,8 +270,8 @@ pub const Manager = struct {
     fn resolve(m: *Manager, workspace: []const u8, target: catalog_mod.Target) OpenError!?[]u8 {
         return m.catalog().resolve(m.gpa, workspace, target) catch |err| switch (err) {
             error.Busy => error.Busy,
-            error.Io => error.Io,
             error.OutOfMemory => error.OutOfMemory,
+            else => |io_err| storage.ioFault(io_err),
         };
     }
 
@@ -285,7 +288,8 @@ pub const Manager = struct {
             .workspace = options.workspace,
             .host = options.host,
         }) catch |err| return switch (err) {
-            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.Io, error.OutOfMemory => |e| e,
+            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
+            else => |io_err| storage.ioFault(io_err),
         };
         const session: Session = .{ .manager = m, .inner = inner };
         session.updateIndexAs(.published);
@@ -302,12 +306,12 @@ pub const Manager = struct {
         try ready(m);
         if (m.env.s.stat(m.env.root, options.id)) |_| return error.Exists else |err| switch (err) {
             error.NotFound => {},
-            else => return error.Io,
+            else => |io_err| return storage.ioFault(io_err),
         }
         const deleted = m.catalog().isDeleted(m.gpa, options.id) catch |err| return switch (err) {
             error.Busy => error.Busy,
-            error.Io => error.Io,
             error.OutOfMemory => error.OutOfMemory,
+            else => |io_err| storage.ioFault(io_err),
         };
         if (deleted) return error.Exists;
         const inner = try session_mod.openNew(&m.env, .{
@@ -378,8 +382,9 @@ pub const Manager = struct {
         try checkId(id);
         try ready(m);
         return session_mod.verifySession(&m.env, id) catch |err| switch (err) {
-            error.NotFound, error.Io, error.OutOfMemory => |e| e,
+            error.NotFound, error.OutOfMemory => |e| e,
             error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion => error.Io,
+            else => |io_err| storage.ioFault(io_err),
         };
     }
 
@@ -445,7 +450,7 @@ pub const Session = struct {
     pub fn close(s: Session) CloseError!void {
         const was_live = s.inner.closeReport() catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.Io,
+            else => |io_err| storage.ioFault(io_err),
         };
         if (was_live) s.updateIndex();
     }

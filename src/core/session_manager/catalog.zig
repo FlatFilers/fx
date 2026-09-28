@@ -212,7 +212,7 @@ pub const Index = struct {
 // ---------------------------------------------------------------------------
 // Effectful shell
 
-pub const Error = error{ Busy, Io, OutOfMemory };
+pub const Error = error{ Busy, OutOfMemory } || storage.IoFault;
 
 pub const Filter = union(enum) { all, workspace: []const u8 };
 
@@ -383,7 +383,7 @@ pub const Catalog = struct {
         const arena = fresh.arena.allocator();
         var sessions: u64 = 0;
         var listing = s.list(env.root);
-        while (listing.next() catch return error.Io) |entry| {
+        while (listing.next() catch |io_err| return storage.ioFault(io_err)) |entry| {
             if (entry.kind != .directory or !schema.validId(entry.name)) continue;
             const id = try arena.dupe(u8, entry.name);
             var summary = session_mod.readSummary(env, id) catch |err| switch (err) {
@@ -420,7 +420,7 @@ pub const Catalog = struct {
         const trash = s.openDir(cat.env.root, ".trash") catch return;
         defer s.closeDir(trash);
         var listing = s.list(trash);
-        while (listing.next() catch return error.Io) |entry| {
+        while (listing.next() catch |io_err| return storage.ioFault(io_err)) |entry| {
             if (!schema.validId(entry.name)) continue;
             const id = try fresh.arena.allocator().dupe(u8, entry.name);
             try fresh.apply(.{ .put = .{ .id = id, .role = .root, .host = .app, .workspace = "/w", .created_ms = 0, .updated_ms = 0, .turns = 0 } });
@@ -442,15 +442,15 @@ pub const Catalog = struct {
         const lock = try cat.acquireIndexLock();
         defer cat.releaseIndexLock(lock);
         const file = s.openFile(env.root, index_name, .read_write) catch |err| switch (err) {
-            error.NotFound => s.createFile(env.root, index_name) catch return error.Io,
-            else => return error.Io,
+            error.NotFound => s.createFile(env.root, index_name) catch |io_err| return storage.ioFault(io_err),
+            else => |io_err| return storage.ioFault(io_err),
         };
         defer s.closeDerived(file);
-        const len = s.length(file) catch return error.Io;
+        const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
         // A crash may have left half a line; never glue a record onto it.
-        const end = log_mod.lastLineEnd(s, file, len) catch return error.Io;
-        if (end != len) s.setLength(file, end) catch return error.Io;
-        s.writeAt(file, line.items, end) catch return error.Io;
+        const end = log_mod.lastLineEnd(s, file, len) catch |io_err| return storage.ioFault(io_err);
+        if (end != len) s.setLength(file, end) catch |io_err| return storage.ioFault(io_err);
+        s.writeAt(file, line.items, end) catch |io_err| return storage.ioFault(io_err);
         if (end + line.items.len > env.options.index_compact_bytes) {
             const bytes = try cat.readIndex(gpa);
             defer gpa.free(bytes);
@@ -482,14 +482,14 @@ pub const Catalog = struct {
         }
         s.deleteFile(env.root, index_tmp_name) catch |err| switch (err) {
             error.NotFound => {},
-            else => return error.Io,
+            else => |io_err| return storage.ioFault(io_err),
         };
-        const file = s.createFile(env.root, index_tmp_name) catch return error.Io;
+        const file = s.createFile(env.root, index_tmp_name) catch |io_err| return storage.ioFault(io_err);
         defer s.closeFile(file);
-        if (bytes.items.len > 0) s.writeAt(file, bytes.items, 0) catch return error.Io;
-        s.sync(file) catch return error.Io;
-        s.rename(env.root, index_tmp_name, env.root, index_name) catch return error.Io;
-        s.syncDir(env.root) catch return error.Io;
+        if (bytes.items.len > 0) s.writeAt(file, bytes.items, 0) catch |io_err| return storage.ioFault(io_err);
+        s.sync(file) catch |io_err| return storage.ioFault(io_err);
+        s.rename(env.root, index_tmp_name, env.root, index_name) catch |io_err| return storage.ioFault(io_err);
+        s.syncDir(env.root) catch |io_err| return storage.ioFault(io_err);
     }
 
     /// The whole index file; empty when there is none. Caller owns it.
@@ -497,14 +497,14 @@ pub const Catalog = struct {
         const s = cat.env.s;
         const file = s.openFile(cat.env.root, index_name, .read_only) catch |err| return switch (err) {
             error.NotFound => try gpa.alloc(u8, 0),
-            else => error.Io,
+            else => |io_err| storage.ioFault(io_err),
         };
         defer s.closeFile(file);
-        const len = s.length(file) catch return error.Io;
+        const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
         var bytes: std.ArrayList(u8) = .empty;
         errdefer bytes.deinit(gpa);
         try bytes.resize(gpa, @intCast(len));
-        const n = s.readAt(file, bytes.items, 0) catch return error.Io;
+        const n = s.readAt(file, bytes.items, 0) catch |io_err| return storage.ioFault(io_err);
         // Shorter only if a writer cut a torn tail meanwhile.
         bytes.shrinkRetainingCapacity(n);
         return bytes.toOwnedSlice(gpa);
@@ -519,16 +519,16 @@ pub const Catalog = struct {
             const opened_file = s.openFile(env.root, lock_name, .read_write) catch |err| switch (err) {
                 error.NotFound => s.createFile(env.root, lock_name) catch |create_err| switch (create_err) {
                     // Another process created it first.
-                    error.AlreadyExists => s.openFile(env.root, lock_name, .read_write) catch return error.Io,
-                    else => return error.Io,
+                    error.AlreadyExists => s.openFile(env.root, lock_name, .read_write) catch |io_err| return storage.ioFault(io_err),
+                    else => |io_err| return storage.ioFault(io_err),
                 },
-                else => return error.Io,
+                else => |io_err| return storage.ioFault(io_err),
             };
             cat.lock.file = opened_file;
             break :blk opened_file;
         };
         var waited: u64 = 0;
-        while (!(s.tryLock(file) catch return error.Io)) {
+        while (!(s.tryLock(file) catch |io_err| return storage.ioFault(io_err))) {
             if (waited >= env.options.lock_wait_ms) return error.Busy;
             s.io.sleep(.fromMilliseconds(5), .awake) catch return error.Busy;
             waited += 5;
@@ -550,7 +550,7 @@ pub const Catalog = struct {
         const s = cat.env.s;
         const present = if (s.stat(cat.env.root, id)) |st| st.kind == .directory else |err| switch (err) {
             error.NotFound => false,
-            else => return error.Io,
+            else => |io_err| return storage.ioFault(io_err),
         };
         if (present) return true;
         try cat.del(id, nowMs(cat.env));
@@ -586,7 +586,7 @@ pub const Catalog = struct {
         for ([_][]const u8{ ".trash", ".tmp" }) |folder| {
             const dir = s.openDir(env.root, folder) catch |err| switch (err) {
                 error.NotFound => continue,
-                else => return error.Io,
+                else => |io_err| return storage.ioFault(io_err),
             };
             defer s.closeDir(dir);
             var names: std.ArrayList([]u8) = .empty;
@@ -595,7 +595,7 @@ pub const Catalog = struct {
                 names.deinit(env.gpa);
             }
             var listing = s.list(dir);
-            while (listing.next() catch return error.Io) |entry| {
+            while (listing.next() catch |io_err| return storage.ioFault(io_err)) |entry| {
                 try names.append(env.gpa, try env.gpa.dupe(u8, entry.name));
             }
             for (names.items) |name| {
@@ -604,7 +604,7 @@ pub const Catalog = struct {
                     const st = s.stat(dir, name) catch continue;
                     if (now - st.mtime_ms < sweep_after_ms) continue;
                 }
-                s.deleteTree(dir, name) catch return error.Io;
+                s.deleteTree(dir, name) catch |io_err| return storage.ioFault(io_err);
                 swept += 1;
             }
         }

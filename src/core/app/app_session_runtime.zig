@@ -3426,7 +3426,7 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = app.session_persistence.v2 orelse return;
-            try v2.appendProgress(progress.user, progress.execution);
+            try v2.appendProgress(progress.user, progress.execution, progress.running_calls);
         }
 
         pub fn commitRuntimePreferences(

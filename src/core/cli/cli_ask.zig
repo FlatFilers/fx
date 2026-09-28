@@ -3253,7 +3253,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
         try v2.prepareTurn(&prepared);
         v2.commitTurn(prepared, ctx.session.languageSnapshot()) catch |err| {
             // A failed write may still have reached the log: keep its images.
-            if (err == error.Io) ctx.prompt_snapshot_committed = true;
+            if (session_adapter.writeMayHaveLanded(err)) ctx.prompt_snapshot_committed = true;
             return err;
         };
         ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
@@ -3337,7 +3337,7 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const v2 = ctx.v2 orelse return;
-    v2.appendProgress(progress.user, progress.execution) catch |err| {
+    v2.appendProgress(progress.user, progress.execution, progress.running_calls) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
         return;
     };

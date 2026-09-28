@@ -27,6 +27,9 @@ pub const Fault = struct {
     next_write: ?WritePlan = null,
     /// One-shot: the next sync fails, so durability is unknown.
     fail_next_sync: bool = false,
+    /// What a planned write failure or a failed sync reports: `Io` unless
+    /// a test names an OS cause (D29).
+    fail_error: storage.Error = error.Io,
     /// Written files, keyed by inode, each with a private duplicate handle so
     /// a power loss can cut it after its owner has closed or renamed it.
     files: std.ArrayList(Tracked) = .empty,

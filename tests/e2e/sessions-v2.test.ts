@@ -122,11 +122,21 @@ function expectWholeLog(fixture: Fixture, id: string) {
 
 /// Every tool call the model is sent has its result: an unpaired call is
 /// rejected by providers.
+/// The tool calls and tool results in a Gateway request's prompt.
+function promptToolParts(body: string) {
+  const prompt: any[] = JSON.parse(body).prompt ?? [];
+  const parts: any[] = prompt.flatMap((message) => (Array.isArray(message.content) ? message.content : []));
+  return {
+    calls: parts.filter((part) => part.type === "tool-call"),
+    results: parts.filter((part) => part.type === "tool-result"),
+  };
+}
+
 function expectPairedToolCalls(body: string) {
-  const input: any[] = JSON.parse(body).input ?? [];
-  const calls = input.filter((item) => item.type === "function_call").map((item) => item.call_id);
-  const results = new Set(input.filter((item) => item.type === "function_call_output").map((item) => item.call_id));
-  for (const call of calls) expect(results.has(call)).toBe(true);
+  const { calls, results } = promptToolParts(body);
+  expect(calls.length).toBeGreaterThan(0);
+  const answered = new Set(results.map((part) => part.toolCallId));
+  for (const call of calls) expect(answered.has(call.toolCallId)).toBe(true);
 }
 
 /// Waits until the log contains `needle`, or fails after `timeoutMs`.
@@ -372,7 +382,7 @@ test("fx ask killed in the middle of a turn resumes with that turn interrupted",
   }
 }, TIMEOUT * 3);
 
-test("a kill while a tool runs keeps the finished tools and pairs every call", async () => {
+test("a kill while a tool runs keeps the finished tool and answers the running one", async () => {
   const fixture = createFixture("fx-v2-kill-tool-");
   let slowServed: () => void = () => {};
   const slowStarted = new Promise<void>((resolve) => (slowServed = resolve));
@@ -392,7 +402,8 @@ test("a kill while a tool runs keeps the finished tools and pairs every call", a
 
     const run = spawnAsk(fixture, gateway, ["--resume-id", id, "Run two tools."]);
     await slowStarted;
-    await Bun.sleep(500);
+    // The call is saved before it runs (D28).
+    await waitForLog(fixture, id, "v2-slow-2");
     run.child.kill("SIGKILL");
     await run.exited;
 
@@ -402,11 +413,17 @@ test("a kill while a tool runs keeps the finished tools and pairs every call", a
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_TOOL_KILL");
     const body = gateway.requests.at(-1)!.body;
     expect(body).toContain("BEFORE_TOOL_KILL");
-    // The finished tool survives the crash; the running one is not replayed
-    // unpaired.
+    // The finished tool survives the crash, and the running one comes back
+    // answered as possibly run, so every call keeps a result.
     expect(body).toContain("FIRST_TOOL_OUTPUT_5521");
     expectPairedToolCalls(body);
+    const { calls, results } = promptToolParts(body);
+    expect(calls.map((part) => part.toolCallId)).toEqual(["v2-fast-1", "v2-slow-2"]);
+    const slow = results.find((part) => part.toolCallId === "v2-slow-2");
+    expect(slow?.output?.type).toBe("error-text");
+    expect(slow?.output?.value).toContain("may have partly run");
     const lines = logLines(fixture, id);
+    expect(lines.filter((line) => line.kind === "item" && line.type === "tool_running").length).toBe(2);
     expect(lines.filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
     expectWholeLog(fixture, id);
     expectNoV1Sessions(fixture);
@@ -547,7 +564,8 @@ test("a read-only session folder fails cleanly and resumes once writable", async
 
     const refused = await ask(fixture, gateway, ["--resume-id", id, "While read-only."]);
     expect(refused.code).toBe(1);
-    expect(JSON.parse(refused.stdout).error).toBe("Io");
+    // The OS cause, not a bare `Io` (D29).
+    expect(JSON.parse(refused.stdout).error).toBe("AccessDenied");
     expect(gateway.requests.length).toBe(1);
     expect(readFileSync(join(folder(), "log.jsonl")).equals(before)).toBe(true);
 
@@ -585,7 +603,7 @@ test("a full disk fails the turn cleanly and the session resumes after", async (
     const full = await askWithSizeLimit(fixture, gateway, blocks, ["--resume-id", id, "The disk is full."]);
     // The answer was shown, but the turn could not be saved.
     expect(full.code).toBe(1);
-    expect(JSON.parse(full.stdout).error).toBe("Io");
+    expect(JSON.parse(full.stdout).error).toBe("FileTooBig");
 
     const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the full disk."]);
     expect(resumed.code).toBe(0);

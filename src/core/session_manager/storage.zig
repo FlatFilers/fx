@@ -31,11 +31,32 @@ pub const Error = error{
     Refused,
     /// Disk full or quota exhausted.
     NoSpace,
+    /// The file system is mounted read-only.
+    ReadOnly,
+    /// A file-size limit (RLIMIT_FSIZE) was reached.
+    TooBig,
     /// Any other failure. After a failed write or sync, durability is unknown.
     Io,
     /// The calling task was canceled; the operation may be partly done.
     Canceled,
 };
+
+/// I/O failures as the API reports them (D29): the OS cause when it is
+/// known, `Io` otherwise. After a failed write or sync, durability is
+/// unknown whichever it is.
+pub const IoFault = error{ Io, NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig };
+
+/// Keeps the cause of a storage failure, and of one already classified;
+/// anything else is `Io`.
+pub fn ioFault(err: anyerror) IoFault {
+    return switch (err) {
+        error.NoSpace, error.NoSpaceLeft => error.NoSpaceLeft,
+        error.Refused, error.AccessDenied => error.AccessDenied,
+        error.ReadOnly, error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+        error.TooBig, error.FileTooBig => error.FileTooBig,
+        else => error.Io,
+    };
+}
 
 /// A folder opened for listing (`openDir`, `openRoot`). Linux opens any
 /// other folder with `O_PATH`, which `syncDir` cannot sync (EBADF).
@@ -202,7 +223,10 @@ pub const Storage = struct {
             return translate(err);
         switch (outcome) {
             .complete => {},
-            .fail => return error.Io,
+            .fail => {
+                if (hooks) if (s.fault) |f| return f.fail_error;
+                return error.Io;
+            },
             .die => {
                 if (hooks) if (s.fault) |f| f.kill();
                 return error.Io;
@@ -214,7 +238,7 @@ pub const Storage = struct {
     pub fn sync(s: Storage, file: File) Error!void {
         try s.alive();
         try s.mutate();
-        if (hooks) if (s.fault) |f| if (f.takeSyncFailure()) return error.Io;
+        if (hooks) if (s.fault) |f| if (f.takeSyncFailure()) return f.fail_error;
         file.handle.sync(s.io) catch |err| return translate(err);
         if (hooks) if (s.fault) |f| try f.noteSync(s, file);
     }
@@ -357,6 +381,8 @@ fn translate(err: anyerror) Error {
         error.BadPathName,
         => error.Refused,
         error.NoSpaceLeft, error.DiskQuota => error.NoSpace,
+        error.ReadOnlyFileSystem => error.ReadOnly,
+        error.FileTooBig => error.TooBig,
         error.Canceled => error.Canceled,
         else => error.Io,
     };
@@ -369,6 +395,20 @@ const testing = std.testing;
 
 fn testRoot(tmp: *testing.TmpDir) Dir {
     return .{ .handle = tmp.dir };
+}
+
+test "an I/O failure keeps its OS cause, and only unknown ones become Io (D29)" {
+    try testing.expectEqual(error.NoSpaceLeft, ioFault(translate(error.NoSpaceLeft)));
+    try testing.expectEqual(error.NoSpaceLeft, ioFault(translate(error.DiskQuota)));
+    try testing.expectEqual(error.AccessDenied, ioFault(translate(error.AccessDenied)));
+    try testing.expectEqual(error.AccessDenied, ioFault(translate(error.PermissionDenied)));
+    try testing.expectEqual(error.ReadOnlyFileSystem, ioFault(translate(error.ReadOnlyFileSystem)));
+    try testing.expectEqual(error.FileTooBig, ioFault(translate(error.FileTooBig)));
+    try testing.expectEqual(error.Io, ioFault(translate(error.InputOutput)));
+    // Classified once, it stays classified through every layer above.
+    inline for (.{ error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig, error.Io }) |kind| {
+        try testing.expectEqual(kind, ioFault(ioFault(kind)));
+    }
 }
 
 test "folders are 0700 and files are 0600" {

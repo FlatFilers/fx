@@ -107,6 +107,24 @@ test "init touches nothing on disk" {
     root.close(io);
 }
 
+test "a read-only session folder fails with AccessDenied, not Io (D29)" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const s = try f.manager.openNew(.{ .workspace = "/w", .host = .app });
+    _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+    const id = try gpa.dupe(u8, s.id());
+    defer gpa.free(id);
+    s.release();
+    var root = try f.dir();
+    defer root.close(io);
+    var folder = try root.openDir(io, id, .{});
+    defer folder.close(io);
+    try folder.setFilePermissions(io, "log.jsonl", .fromMode(0o400), .{});
+    defer folder.setFilePermissions(io, "log.jsonl", .fromMode(0o600), .{}) catch {};
+    try testing.expectError(error.AccessDenied, f.manager.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app }));
+}
+
 test "a session's whole life through the API" {
     var f: Fixture = undefined;
     try f.init();

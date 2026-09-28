@@ -479,6 +479,38 @@ test "a torn tail is cut once and a damaged middle refuses to resume, each repor
     try testing.expectEqual(@as(usize, 1), page.entries.len);
 }
 
+test "a failed write or sync reports its OS cause once, then the session stays failed" {
+    if (!hooks) return error.SkipZigTest;
+    var t: TestEnv = undefined;
+    t.init(.{});
+    defer t.deinit();
+
+    // A full disk on a log write (D29).
+    const s = try newRoot(&t);
+    _ = try s.append(&.{ .turn_started, item, .turn_committed });
+    const id = try gpa.dupe(u8, s.id());
+    defer gpa.free(id);
+    t.fault.fail_error = error.NoSpace;
+    t.fault.next_write = .{ .keep = 0, .then = .fail };
+    try testing.expectError(error.NoSpaceLeft, s.append(&.{.turn_started}));
+    // Durability is unknown after a failed write, so nothing more is written.
+    try testing.expectError(error.Io, s.append(&.{.turn_started}));
+    try closeAndDestroy(s);
+    try expectKinds(&t, id, &.{ .session_created, .turn_started, .item, .turn_committed });
+
+    // A read-only file system on the sync that ends a turn.
+    const r = try resumeRoot(&t, id);
+    _ = try r.append(&.{ .turn_started, item });
+    t.fault.fail_error = error.ReadOnly;
+    t.fault.fail_next_sync = true;
+    try testing.expectError(error.ReadOnlyFileSystem, r.append(&.{.turn_committed}));
+    try testing.expectError(error.Io, r.append(&.{.turn_started}));
+    try closeAndDestroy(r);
+    // The close does not sync again: the failed sync's bytes stay unknown.
+    try testing.expectEqual(@as(usize, 1), t.fault.closed_unsynced);
+    t.fault.closed_unsynced = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Blobs, fork, children, delete (plan checkpoint 4)
 
