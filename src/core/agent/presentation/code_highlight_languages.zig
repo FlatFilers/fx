@@ -25,14 +25,13 @@ pub const Detection = enum(u4) {
     diff_patch,
 };
 
-pub const LineComments = enum(u3) {
-    none,
-    slash,
-    hash,
-    dash,
-    slash_hash,
-    hash_slash,
-    hash_semicolon,
+pub const LineComments = enum(u4) {
+    none = 0,
+    slash = 1,
+    hash = 2,
+    dash = 4,
+    slash_hash = 3,
+    hash_semicolon = 10,
 };
 
 pub const BlockComments = enum(u3) {
@@ -45,12 +44,12 @@ pub const BlockComments = enum(u3) {
 };
 
 pub const Quotes = enum(u3) {
-    none,
-    double,
-    double_single,
-    shell,
-    double_backtick,
-    backtick,
+    none = 0,
+    double = 1,
+    double_single = 3,
+    shell = 7,
+    double_backtick = 5,
+    backtick = 4,
 };
 
 pub const Settings = packed struct(u32) {
@@ -65,7 +64,7 @@ pub const Settings = packed struct(u32) {
     diff_lines: bool = false,
     keyword_case: KeywordCase = .sensitive,
     detection: Detection = .none,
-    _padding: u12 = 0,
+    _padding: u11 = 0,
 };
 
 const SourceProfile = struct {
@@ -172,7 +171,7 @@ fn lineComments(comptime prefixes: []const []const u8) LineComments {
     }
     if (prefixes.len == 2) {
         if (std.mem.eql(u8, prefixes[0], "//") and std.mem.eql(u8, prefixes[1], "#")) return .slash_hash;
-        if (std.mem.eql(u8, prefixes[0], "#") and std.mem.eql(u8, prefixes[1], "//")) return .hash_slash;
+        if (std.mem.eql(u8, prefixes[0], "#") and std.mem.eql(u8, prefixes[1], "//")) return .slash_hash;
         if (std.mem.eql(u8, prefixes[0], "#") and std.mem.eql(u8, prefixes[1], ";")) return .hash_semicolon;
     }
     @compileError("unsupported syntax line-comment set");
@@ -239,25 +238,16 @@ fn packedWordsLen(comptime words: anytype) usize {
     comptime var len: usize = 0;
     inline for (words) |word| {
         if (word.len > std.math.maxInt(u8)) @compileError("syntax word is too long");
-        len += @sizeOf(u32) + 1 + word.len;
+        len += 1 + word.len;
     }
     return len;
 }
 
-/// This is only a lookup filter. Callers compare exact bytes after a match.
-pub fn packedWordHash(word: []const u8) u32 {
-    var hash: u32 = 2166136261;
-    for (word) |byte| hash = (hash ^ std.ascii.toLower(byte)) *% 16777619;
-    return hash;
-}
-
-fn packWords(comptime words: anytype) [packedWordsLen(words)]u8 {
+pub fn packWords(comptime words: anytype) [packedWordsLen(words)]u8 {
     @setEvalBranchQuota(100_000);
     var result: [packedWordsLen(words)]u8 = undefined;
     comptime var offset: usize = 0;
     inline for (words) |word| {
-        std.mem.writeInt(u32, result[offset..][0..@sizeOf(u32)], packedWordHash(word), .little);
-        offset += @sizeOf(u32);
         result[offset] = word.len;
         offset += 1;
         @memcpy(result[offset..][0..word.len], word);
@@ -266,19 +256,16 @@ fn packWords(comptime words: anytype) [packedWordsLen(words)]u8 {
     return result;
 }
 
-test "packed syntax words retain exact hashes and boundaries" {
+test "packed syntax words retain exact boundaries" {
     for (profiles) |profile| {
         for ([_][]const u8{ profile.keywords, profile.literals }) |words| {
             var offset: usize = 0;
             while (offset < words.len) {
-                const hash = std.mem.readInt(u32, words[offset..][0..@sizeOf(u32)], .little);
-                offset += @sizeOf(u32);
                 const len = words[offset];
                 offset += 1;
                 const end = offset + len;
                 try std.testing.expect(end <= words.len);
                 try std.testing.expect(len > 0);
-                try std.testing.expectEqual(hash, packedWordHash(words[offset..end]));
                 offset = end;
             }
             try std.testing.expectEqual(words.len, offset);

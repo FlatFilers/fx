@@ -152,7 +152,7 @@ pub fn highlight(
                 if (command_position and !after_separator) {
                     // Control keywords read as keywords; other command words
                     // as functions, matching the grammar's scopes.
-                    const style = if (inList(token, &command_prefixes, .sensitive))
+                    const style = if (inPackedList(token, command_prefixes, .sensitive))
                         palette.keyword_style
                     else
                         palette.function_style;
@@ -160,11 +160,10 @@ pub fn highlight(
                     styled_word = true;
                 }
             } else if (!after_separator and (profile.keywords.len > 0 or profile.literals.len > 0)) {
-                const token_hash = languages.packedWordHash(token);
-                if (inPackedList(token, token_hash, profile.keywords, settings.keyword_case)) {
+                if (inPackedList(token, profile.keywords, settings.keyword_case)) {
                     try appendStyled(alloc, &styled, palette.keyword_style, token, base);
                     styled_word = true;
-                } else if (inPackedList(token, token_hash, profile.literals, settings.keyword_case)) {
+                } else if (inPackedList(token, profile.literals, settings.keyword_case)) {
                     try appendStyled(alloc, &styled, palette.number_style, token, base);
                     styled_word = true;
                 }
@@ -174,7 +173,7 @@ pub fn highlight(
             // ordinary command word is followed by its arguments.
             if (settings.command_words) {
                 command_position = styled_word and command_position and
-                    inList(token, &command_prefixes, .sensitive);
+                    inPackedList(token, command_prefixes, .sensitive);
             }
             index = end;
             continue;
@@ -188,7 +187,7 @@ pub fn highlight(
 }
 
 /// Control keywords after which the next word is again a command.
-const command_prefixes = [_][]const u8{ "if", "then", "elif", "else", "while", "until", "do" };
+const command_prefixes = &languages.packWords(.{ "if", "then", "elif", "else", "while", "until", "do" });
 
 /// File descriptors glued to a redirect keep the number color when bare
 /// number arguments stay plain: the 2 in `2>` and the 1 in `>&1`.
@@ -316,15 +315,11 @@ fn delimitedCommentEnd(source: []const u8, index: usize, start: []const u8, end:
 }
 
 fn lineCommentEnd(source: []const u8, index: usize, kind: languages.LineComments) ?usize {
-    const matched = switch (kind) {
-        .none => false,
-        .slash => startsComment(source, index, "//"),
-        .hash => startsComment(source, index, "#"),
-        .dash => startsComment(source, index, "--"),
-        .slash_hash => startsComment(source, index, "//") or startsComment(source, index, "#"),
-        .hash_slash => startsComment(source, index, "#") or startsComment(source, index, "//"),
-        .hash_semicolon => startsComment(source, index, "#") or startsComment(source, index, ";"),
-    };
+    const mask = @intFromEnum(kind);
+    const matched = (mask & 1 != 0 and startsComment(source, index, "//")) or
+        (mask & 2 != 0 and startsComment(source, index, "#")) or
+        (mask & 4 != 0 and startsComment(source, index, "--")) or
+        (mask & 8 != 0 and startsComment(source, index, ";"));
     return if (matched) lineEnd(source, index) else null;
 }
 
@@ -337,14 +332,13 @@ fn lineEnd(source: []const u8, start: usize) usize {
 }
 
 fn isQuote(byte: u8, quotes: languages.Quotes) bool {
-    return switch (quotes) {
-        .none => false,
-        .double => byte == '"',
-        .double_single => byte == '"' or byte == '\'',
-        .shell => byte == '"' or byte == '\'' or byte == '`',
-        .double_backtick => byte == '"' or byte == '`',
-        .backtick => byte == '`',
+    const bit: u3 = switch (byte) {
+        '"' => 1,
+        '\'' => 2,
+        '`' => 4,
+        else => 0,
     };
+    return @intFromEnum(quotes) & bit != 0;
 }
 
 fn quotedEnd(source: []const u8, start: usize) usize {
@@ -442,27 +436,14 @@ fn identifierEnd(source: []const u8, start: usize) usize {
     return index;
 }
 
-fn inList(token: []const u8, options: []const []const u8, keyword_case: languages.KeywordCase) bool {
-    for (options) |option| {
-        const matches = switch (keyword_case) {
-            .sensitive => std.mem.eql(u8, token, option),
-            .ascii_insensitive => std.ascii.eqlIgnoreCase(token, option),
-        };
-        if (matches) return true;
-    }
-    return false;
-}
-
-fn inPackedList(token: []const u8, target_hash: u32, options: []const u8, keyword_case: languages.KeywordCase) bool {
+fn inPackedList(token: []const u8, options: []const u8, keyword_case: languages.KeywordCase) bool {
     var offset: usize = 0;
     while (offset < options.len) {
-        const hash = std.mem.readInt(u32, options[offset..][0..@sizeOf(u32)], .little);
-        offset += @sizeOf(u32);
         const len = options[offset];
         offset += 1;
         const end = offset + len;
         const option = options[offset..end];
-        if (hash == target_hash) {
+        if (token.len == len) {
             const matches = switch (keyword_case) {
                 .sensitive => std.mem.eql(u8, token, option),
                 .ascii_insensitive => std.ascii.eqlIgnoreCase(token, option),
