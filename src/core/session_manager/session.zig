@@ -923,6 +923,9 @@ pub const ResumeOptions = struct {
     host: schema.Host,
     /// Required to resume a child session.
     parent: ?[]const u8 = null,
+    /// How long to wait for the flock before Busy; null uses the
+    /// environment's `lock_wait_ms` (D38).
+    lock_wait_ms: ?u64 = null,
 };
 
 /// Opens a published session for writing: the flock (else Busy after the
@@ -987,7 +990,7 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
         else => error.Io,
     };
     errdefer s.closeFile(lock);
-    if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock);
+    if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
 
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
@@ -1036,13 +1039,13 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     return .{ .dir = dir, .lock = lock, .log = opened.log, .loaded = loaded };
 }
 
-fn acquireLock(env: *const Env, lock: storage.File) OpenError!void {
+fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void {
     const io = env.s.io;
     const step_ms: u64 = 10;
     var waited: u64 = 0;
     while (true) {
         if (env.s.tryLock(lock) catch return error.Io) return;
-        if (waited >= env.options.lock_wait_ms) return error.Busy;
+        if (waited >= wait_ms) return error.Busy;
         io.sleep(.fromMilliseconds(@intCast(step_ms)), .awake) catch return error.Busy;
         waited += step_ms;
     }

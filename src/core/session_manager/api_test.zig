@@ -650,3 +650,33 @@ test "Session.read while another thread appends, and after close" {
     try testing.expectError(error.SessionClosed, s.read(gpa, .end, .backward, 10));
     s.release();
 }
+
+test "a resume sets its own wait for a held session, and none is Busy at once (D38)" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const m = f.manager;
+    const held = try m.openNew(.{ .workspace = "/w", .host = .app });
+    _ = try held.append(&.{ .turn_started, piece, .turn_committed });
+    const id = try gpa.dupe(u8, held.id());
+    defer gpa.free(id);
+    var released = false;
+    defer if (!released) held.release();
+
+    const Timed = struct {
+        fn busyAfterMs(manager: *api.Manager, session_id: []const u8, wait: ?u64) !i64 {
+            const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+            try testing.expectError(error.Busy, manager.openResume(.{ .target = .{ .id = session_id }, .workspace = "/w", .host = .app, .lock_wait_ms = wait }));
+            return std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+        }
+    };
+    // The fixture's manager waits 50 ms; each open's own wait wins.
+    try testing.expect(try Timed.busyAfterMs(m, id, 400) >= 400);
+    try testing.expect(try Timed.busyAfterMs(m, id, 0) < 400);
+    try testing.expect(try Timed.busyAfterMs(m, id, null) < 400);
+
+    held.release();
+    released = true;
+    const reopened = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app, .lock_wait_ms = 0 });
+    reopened.release();
+}

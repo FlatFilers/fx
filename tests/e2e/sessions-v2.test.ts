@@ -783,3 +783,47 @@ test.skipIf(!tmuxAvailable())("the picker lists v2 sessions, /rename sticks, and
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 6);
+
+test.skipIf(!tmuxAvailable())("the picker shows a session open in another fx as busy at once, and opens it once the owner quits", async () => {
+  const fixture = createFixture("fx-v2-app-picker-busy-");
+  const gateway = replyToLatest([["Hold this session open.", "PICKER_BUSY_SAVED"]]);
+  const busy = "This session is open in another fx. Close it there, then press enter to retry.";
+  let contender: TmuxSession | null = null;
+  try {
+    const owner = await startApp(fixture, gateway, []);
+    await owner.session.sendText("Hold this session open.");
+    await owner.session.waitForText("PICKER_BUSY_SAVED", TIMEOUT);
+    const id = onlySession(fixture);
+
+    const contenderStderr = join(fixture.root, "contender-stderr.log");
+    writeFileSync(contenderStderr, "");
+    contender = await TmuxSession.create({
+      cmd: `${FX_BIN} --sessions-v2 -r`,
+      cwd: fixture.workspace,
+      env: { ...env(fixture, gateway, false), NO_COLOR: "1" },
+      stderrPath: contenderStderr,
+    });
+    await contender.waitForPane((pane) => pane.includes("Hold this session open.") && pane.includes("enter resume"), TIMEOUT);
+    // v1's picker takes no lock wait, and neither does v2's (D38).
+    const pressed = Date.now();
+    await contender.sendKeys("Enter");
+    await contender.waitForPane((pane) => pane.includes(busy), 1_000);
+    expect(Date.now() - pressed).toBeLessThan(1_000);
+    expect(owner.session.isPaneAlive()).toBe(true);
+
+    await quitApp(owner);
+    await contender.sendKeys("Enter");
+    await contender.waitForComposer(TIMEOUT);
+    expect(await scrollbackContains(contender, "PICKER_BUSY_SAVED")).toContain("PICKER_BUSY_SAVED");
+    await contender.sendText("/quit");
+    expect(await contender.waitForSessionEnd()).toBe(true);
+    expect(readFileSync(contenderStderr, "utf8")).toBe("");
+    expect(onlySession(fixture)).toBe(id);
+    expectWholeLog(fixture, id);
+    expectNoV1Sessions(fixture);
+  } finally {
+    if (contender) await contender.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);

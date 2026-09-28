@@ -108,6 +108,10 @@ pub const ResumeOptions = struct {
     workspace: []const u8,
     host: Host,
     parent: ?[]const u8 = null,
+    /// How long this open waits for the session's writer lock before Busy;
+    /// null uses the manager's `lock_wait_ms`. A picker passes 0 so a
+    /// session open elsewhere shows as busy at once (D38).
+    lock_wait_ms: ?u64 = null,
 };
 
 pub const ForkOptions = struct {
@@ -252,6 +256,7 @@ pub const Manager = struct {
             .workspace = options.workspace,
             .host = options.host,
             .parent = options.parent,
+            .lock_wait_ms = options.lock_wait_ms,
         }) catch |err| return switch (err) {
             error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.Io, error.OutOfMemory => |e| e,
         };

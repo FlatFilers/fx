@@ -212,6 +212,17 @@ pub const Session = struct {
     }
 
     pub fn resumeSession(alloc: Allocator, store: *Store, target: Target, workspace: []const u8, host: Host) !*Session {
+        return resumeWaiting(alloc, store, target, workspace, host, null);
+    }
+
+    /// As `resumeSession`, but SessionBusy at once when another process has
+    /// the session open, for the session picker (D38).
+    pub fn resumeSessionWithoutWaiting(alloc: Allocator, store: *Store, target: Target, workspace: []const u8, host: Host) !*Session {
+        return resumeWaiting(alloc, store, target, workspace, host, 0);
+    }
+
+    /// `lock_wait_ms` null waits the manager's 2 s for the writer lock.
+    fn resumeWaiting(alloc: Allocator, store: *Store, target: Target, workspace: []const u8, host: Host, lock_wait_ms: ?u64) !*Session {
         const handle = store.manager.openResume(.{
             .target = switch (target) {
                 .id => |session_id| .{ .id = session_id },
@@ -220,6 +231,7 @@ pub const Session = struct {
             },
             .workspace = workspace,
             .host = host,
+            .lock_wait_ms = lock_wait_ms,
         }) catch |err| return resumeError(err, target);
         errdefer handle.release();
         const self = try init(alloc, store, handle, false);

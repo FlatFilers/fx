@@ -2214,7 +2214,9 @@ pub fn Runtime(comptime App: type) type {
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
             if (app.session_persistence.v2_store) |*v2_store| {
-                const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app);
+                // A session open in another fx shows as busy at once, as
+                // v1's picker does (D38).
+                const v2 = try session_adapter.Session.resumeSessionWithoutWaiting(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app);
                 var v2_owned = true;
                 errdefer if (v2_owned) v2.close();
                 try app.prepareLiveSessionResume();
