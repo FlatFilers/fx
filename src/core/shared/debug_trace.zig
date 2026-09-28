@@ -77,15 +77,204 @@ pub fn nextSubagentId() u64 {
 pub fn logf(scope: []const u8, comptime fmt: []const u8, args: anytype) void {
     var line: TraceLine = undefined;
     if (!line.begin(scope)) return;
-    line.print(fmt, args);
+    const erased = eraseTraceArgs(fmt, &args);
+    line.printErased(fmt, &erased);
     line.end();
 }
 
 pub fn eventf(scope: []const u8, event: []const u8, ctx: TraceContext, comptime fmt: []const u8, args: anytype) void {
     var line: TraceLine = undefined;
     if (!line.beginEvent(scope, event, ctx, fmt.len != 0)) return;
-    if (fmt.len != 0) line.print(fmt, args);
+    if (fmt.len != 0) {
+        const erased = eraseTraceArgs(fmt, &args);
+        line.printErased(fmt, &erased);
+    }
     line.end();
+}
+
+// Erase arguments only after a scope is enabled so disabled tracing stays
+// cheap while enabled calls share formatter code across all call sites.
+const TraceArg = union(enum) {
+    bytes: []const u8,
+    unsigned: u64,
+    signed: i64,
+    floating: f64,
+    boolean: bool,
+    null,
+    custom: Custom,
+
+    const Custom = struct {
+        const WriteFn = *const fn (*const anyopaque, *std.Io.Writer) std.Io.Writer.Error!void;
+
+        value: *const anyopaque,
+        write: WriteFn,
+    };
+};
+
+fn countTraceArgs(comptime fmt: []const u8) usize {
+    @setEvalBranchQuota(100_000);
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < fmt.len) {
+        if (fmt[index] == '{') {
+            if (index + 1 < fmt.len and fmt[index + 1] == '{') {
+                index += 2;
+                continue;
+            }
+            const end = std.mem.findScalarPos(u8, fmt, index + 1, '}') orelse
+                @compileError("unterminated trace format placeholder");
+            count += 1;
+            index = end + 1;
+            continue;
+        }
+        if (fmt[index] == '}') {
+            if (index + 1 >= fmt.len or fmt[index + 1] != '}')
+                @compileError("unescaped trace format closing brace");
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    return count;
+}
+
+fn traceFormatSpecs(comptime fmt: []const u8) [countTraceArgs(fmt)][]const u8 {
+    @setEvalBranchQuota(100_000);
+    var result: [countTraceArgs(fmt)][]const u8 = undefined;
+    var result_index: usize = 0;
+    var index: usize = 0;
+    while (index < fmt.len) {
+        if (fmt[index] != '{') {
+            index += 1;
+            continue;
+        }
+        if (index + 1 < fmt.len and fmt[index + 1] == '{') {
+            index += 2;
+            continue;
+        }
+        const end = std.mem.findScalarPos(u8, fmt, index + 1, '}').?;
+        result[result_index] = fmt[index + 1 .. end];
+        result_index += 1;
+        index = end + 1;
+    }
+    return result;
+}
+
+inline fn eraseTraceArgs(comptime fmt: []const u8, args: anytype) [countTraceArgs(fmt)]TraceArg {
+    @setEvalBranchQuota(100_000);
+    const specs = comptime traceFormatSpecs(fmt);
+    const arg_count = std.meta.fields(@TypeOf(args.*)).len;
+    if (arg_count != specs.len) @compileError("trace format argument count mismatch");
+
+    var result: [specs.len]TraceArg = undefined;
+    inline for (specs, 0..) |spec, index| {
+        const value = args.*[index];
+        if (comptime std.mem.eql(u8, spec, "s")) {
+            result[index] = .{ .bytes = traceBytes(value, &args.*[index]) };
+        } else if (comptime std.mem.eql(u8, spec, "d")) {
+            result[index] = traceNumber(value);
+        } else if (comptime std.mem.eql(u8, spec, "t")) {
+            result[index] = .{ .bytes = @tagName(value) };
+        } else if (comptime spec.len == 0) {
+            result[index] = traceDefault(value);
+        } else if (comptime std.mem.eql(u8, spec, "x")) {
+            result[index] = traceHex(value);
+        } else if (comptime std.mem.eql(u8, spec, "d:.3")) {
+            result[index] = .{ .floating = @floatCast(value) };
+        } else if (comptime std.mem.eql(u8, spec, "?d")) {
+            result[index] = traceOptionalNumber(value);
+        } else if (comptime std.mem.eql(u8, spec, "any") or std.mem.eql(u8, spec, "f")) {
+            const T = @TypeOf(value);
+            result[index] = .{ .custom = .{
+                .value = @ptrCast(&args.*[index]),
+                .write = traceCustomWriter(T, spec),
+            } };
+        } else {
+            @compileError("unsupported trace format specifier: " ++ spec);
+        }
+    }
+    return result;
+}
+
+inline fn traceBytes(value: anytype, value_ptr: anytype) []const u8 {
+    const T = @TypeOf(value);
+    return switch (@typeInfo(T)) {
+        .array => |array| if (array.child == u8)
+            value_ptr.*[0..]
+        else
+            @compileError("{s} trace arguments must contain bytes"),
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => if (pointer.child == u8)
+                value
+            else
+                @compileError("{s} trace arguments must contain bytes"),
+            .one => switch (@typeInfo(pointer.child)) {
+                .array => |array| if (array.child == u8)
+                    value[0..]
+                else
+                    @compileError("{s} trace arguments must contain bytes"),
+                else => @compileError("{s} trace arguments must contain bytes"),
+            },
+            else => @compileError("{s} trace arguments must be bounded"),
+        },
+        else => @compileError("{s} trace arguments must contain bytes"),
+    };
+}
+
+inline fn traceNumber(value: anytype) TraceArg {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .comptime_int => if (value < 0)
+            .{ .signed = value }
+        else
+            .{ .unsigned = value },
+        .int => |integer| if (integer.signedness == .signed)
+            .{ .signed = @intCast(value) }
+        else
+            .{ .unsigned = @intCast(value) },
+        .float, .comptime_float => .{ .floating = @floatCast(value) },
+        else => @compileError("{d} trace arguments must be numeric"),
+    };
+}
+
+inline fn traceDefault(value: anytype) TraceArg {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .bool => .{ .boolean = value },
+        .int, .comptime_int, .float, .comptime_float => traceNumber(value),
+        else => @compileError("{} trace arguments must be booleans or numbers"),
+    };
+}
+
+inline fn traceHex(value: anytype) TraceArg {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .comptime_int => .{ .unsigned = value },
+        .int => .{ .unsigned = @intCast(value) },
+        else => @compileError("{x} trace arguments must be integers"),
+    };
+}
+
+inline fn traceOptionalNumber(value: anytype) TraceArg {
+    const optional = @typeInfo(@TypeOf(value)).optional;
+    return if (value) |number|
+        traceNumber(number)
+    else switch (@typeInfo(optional.child)) {
+        .int, .comptime_int => .null,
+        else => @compileError("{?d} trace arguments must be optional integers"),
+    };
+}
+
+fn traceCustomWriter(comptime T: type, comptime spec: []const u8) TraceArg.Custom.WriteFn {
+    return struct {
+        fn write(value: *const anyopaque, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            const typed: *const T = @ptrCast(@alignCast(value));
+            if (comptime std.mem.eql(u8, spec, "any")) {
+                try writer.print("{any}", .{typed.*});
+            } else if (comptime std.mem.eql(u8, spec, "f")) {
+                try writer.print("{f}", .{typed.*});
+            } else {
+                unreachable;
+            }
+        }
+    }.write;
 }
 
 // Keep generic trace wrappers small by centralizing line assembly here.
@@ -120,9 +309,9 @@ const TraceLine = struct {
         if (has_message) try line.out.writer.writeByte(' ');
     }
 
-    fn print(line: *TraceLine, comptime fmt: []const u8, args: anytype) void {
+    noinline fn printErased(line: *TraceLine, fmt: []const u8, args: []const TraceArg) void {
         if (line.failed) return;
-        line.out.writer.print(fmt, args) catch {
+        writeErasedFormat(&line.out.writer, fmt, args) catch {
             line.failed = true;
         };
     }
@@ -137,6 +326,67 @@ const TraceLine = struct {
         writeLine(safe.written());
     }
 };
+
+fn writeErasedFormat(writer: *std.Io.Writer, fmt: []const u8, args: []const TraceArg) !void {
+    var arg_index: usize = 0;
+    var literal_start: usize = 0;
+    var index: usize = 0;
+    while (index < fmt.len) {
+        if (fmt[index] == '{') {
+            if (index + 1 < fmt.len and fmt[index + 1] == '{') {
+                try writer.writeAll(fmt[literal_start..index]);
+                try writer.writeByte('{');
+                index += 2;
+                literal_start = index;
+                continue;
+            }
+            try writer.writeAll(fmt[literal_start..index]);
+            const end = std.mem.findScalarPos(u8, fmt, index + 1, '}') orelse
+                return error.InvalidTraceFormat;
+            if (arg_index >= args.len) return error.InvalidTraceFormat;
+            try writeTraceArg(writer, fmt[index + 1 .. end], args[arg_index]);
+            arg_index += 1;
+            index = end + 1;
+            literal_start = index;
+            continue;
+        }
+        if (fmt[index] == '}') {
+            if (index + 1 >= fmt.len or fmt[index + 1] != '}') return error.InvalidTraceFormat;
+            try writer.writeAll(fmt[literal_start..index]);
+            try writer.writeByte('}');
+            index += 2;
+            literal_start = index;
+            continue;
+        }
+        index += 1;
+    }
+    try writer.writeAll(fmt[literal_start..]);
+    if (arg_index != args.len) return error.InvalidTraceFormat;
+}
+
+fn writeTraceArg(writer: *std.Io.Writer, spec: []const u8, arg: TraceArg) !void {
+    switch (arg) {
+        .bytes => |value| try writer.writeAll(value),
+        .unsigned => |value| {
+            if (std.mem.eql(u8, spec, "x")) {
+                try writer.print("{x}", .{value});
+            } else {
+                try writer.print("{d}", .{value});
+            }
+        },
+        .signed => |value| try writer.print("{d}", .{value}),
+        .floating => |value| {
+            if (std.mem.eql(u8, spec, "d:.3")) {
+                try writer.print("{d:.3}", .{value});
+            } else {
+                try writer.print("{d}", .{value});
+            }
+        },
+        .boolean => |value| try writer.writeAll(if (value) "true" else "false"),
+        .null => try writer.writeAll("null"),
+        .custom => |custom| try custom.write(custom.value, writer),
+    }
+}
 
 fn writeTerminalSafeTraceLine(writer: *std.Io.Writer, raw: []const u8) !void {
     const marker = "...";
@@ -583,6 +833,48 @@ test "trace logger filters scopes and writes structured events" {
     try std.testing.expect(std.mem.find(u8, trace, "[agent] human line") != null);
     try std.testing.expect(std.mem.find(u8, trace, "[worker] filtered line") == null);
     try std.testing.expect(std.mem.find(u8, trace, "[tool] event=execution_start turn_id=7 step_id=11 name=read_file") != null);
+}
+
+test "trace formatting matches the standard formatter" {
+    const TestTag = enum { ready };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(alloc, tmp);
+    defer alloc.free(root);
+    const path = try tmpPath(alloc, root, "format-trace.log");
+    defer alloc.free(path);
+
+    const fmt = "string={s} signed={d} unsigned={d} tag={t} bool={} any={any} hex={x} custom={f} precise={d:.3} optional={?d} braces={{last={s}}}";
+    var any_value: ?u8 = null;
+    any_value = 3;
+    var custom_value = std.zig.fmtString("");
+    custom_value = std.zig.fmtString("a b");
+    const args = .{
+        "text",
+        @as(i32, -7),
+        @as(u16, 9),
+        TestTag.ready,
+        true,
+        any_value,
+        @as(u32, 0x2a),
+        custom_value,
+        @as(f64, 0.1254),
+        @as(?usize, null),
+        "tail",
+    };
+    var expected: std.Io.Writer.Allocating = .init(alloc);
+    defer expected.deinit();
+    try expected.writer.print(fmt, args);
+
+    resetForTest();
+    defer resetForTest();
+    try configureForTest(alloc, path);
+    logf("test", fmt, args);
+
+    const trace = try readFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, expected.written()) != null);
 }
 
 test "trace id generators reset for tests" {
