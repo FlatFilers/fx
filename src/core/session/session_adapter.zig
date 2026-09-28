@@ -298,9 +298,34 @@ pub const Session = struct {
     // -- turns ---------------------------------------------------------------
 
     /// Stores the turn's tool results and images as side files and gives
-    /// them handles, as v1 does at commit.
+    /// them handles, as v1 does at commit. A result whose file the stream
+    /// already wrote (`withResultFiles`) keeps it, unwritten a second time.
     pub fn prepareTurn(self: *Session, turn: *types.HistoryTurn) !void {
+        try self.reuseStreamedFiles(turn);
         try session_log.externalizeConversationTurnResults(self.alloc, turn, try self.childCapability());
+    }
+
+    fn reuseStreamedFiles(self: *Session, turn: *types.HistoryTurn) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.stored_results.count() == 0) return;
+        const execution = switch (turn.*) {
+            .assistant => |*entry| &entry.execution,
+            .interrupted => |*entry| &entry.execution,
+            .compacted_summary => return,
+        };
+        for (execution.tool_steps) |step| for (step.tool_results) |*result| {
+            if (result.output_handle != null) continue;
+            const stored = self.stored_results.get(result.tool_call_id) orelse continue;
+            // The name holds the content's hash, so a match means the same bytes.
+            const handle = try result_store.makeHandle(self.alloc, result.tool_call_id, result.tool_name, result.output);
+            if (!std.mem.eql(u8, handle, stored)) {
+                self.alloc.free(handle);
+                continue;
+            }
+            result.output_handle = handle;
+            result.stored_output_bytes = result.output.len;
+        };
     }
 
     /// Appends a finished turn: the pieces not streamed yet, then its end,
@@ -1220,13 +1245,20 @@ test "a tool result backed only by its command replay streams as it commits" {
     const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
     try s.appendProgress(user, execution);
     try s.appendProgress(user, execution);
+    const streamed = s.stored_results.get("call-1").?;
+    const written = try (try s.childCapability()).stat(.tool_results, streamed);
     // The commit gets the agent's own turn, still without a result file;
     // preparing it fills in the handle and preview.
     try testing.expectEqual(@as(?[]u8, null), results[0].output_handle);
+    try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
     var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("done"), .execution = execution } };
     try s.prepareTurn(&turn);
     defer testing.allocator.free(results[0].output_handle.?);
     defer testing.allocator.free(results[0].preview.?);
+    // The same file, not written again.
+    try testing.expectEqualStrings(streamed, results[0].output_handle.?);
+    const after = try (try s.childCapability()).stat(.tool_results, streamed);
+    try testing.expectEqual(written.modified_at_ns, after.modified_at_ns);
     try s.commitTurn(turn, types.ConversationLanguage.default());
     const id = try testing.allocator.dupe(u8, s.id());
     defer testing.allocator.free(id);

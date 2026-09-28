@@ -674,7 +674,9 @@ pub fn previewText(alloc: Allocator, text: []const u8, max_bytes: usize) ![]u8 {
     return try alloc.dupe(u8, text_utils.utf8PrefixByBytes(text, max_bytes));
 }
 
-fn makeHandle(alloc: Allocator, tool_call_id: []const u8, tool_name: []const u8, text: []const u8) ![]u8 {
+/// The handle `storeLargeResultManaged` gives `text`: the name holds the call
+/// and a hash of the content, so the same bytes always get the same name.
+pub fn makeHandle(alloc: Allocator, tool_call_id: []const u8, tool_name: []const u8, text: []const u8) ![]u8 {
     var content_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(text, &content_digest, .{});
     const content_hex = std.fmt.bytesToHex(content_digest[0..8].*, .lower);
