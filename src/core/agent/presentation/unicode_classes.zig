@@ -15,7 +15,24 @@
 
 const std = @import("std");
 
-const Range = struct { first: u21, last: u21 };
+const SourceRange = struct { first: u21, last: u21 };
+
+const Range = packed struct(u32) {
+    first: u21,
+    span: u10,
+    _padding: u1 = 0,
+};
+
+fn compactRanges(comptime source: anytype) [source.len]Range {
+    var result: [source.len]Range = undefined;
+    inline for (source, 0..) |range, index| {
+        if (range.last < range.first) @compileError("Unicode range is reversed");
+        const span = range.last - range.first;
+        if (span > std.math.maxInt(u10)) @compileError("Unicode range span does not fit u10");
+        result[index] = .{ .first = range.first, .span = @intCast(span) };
+    }
+    return result;
+}
 
 /// CommonMark punctuation: any code point in general category P* or S*.
 pub fn isPunctuationOrSymbol(cp: u21) bool {
@@ -38,7 +55,7 @@ fn containsCodepoint(ranges: []const Range, cp: u21) bool {
         const range = ranges[mid];
         if (cp < range.first) {
             hi = mid;
-        } else if (cp > range.last) {
+        } else if (cp - range.first > range.span) {
             lo = mid + 1;
         } else {
             return true;
@@ -47,7 +64,7 @@ fn containsCodepoint(ranges: []const Range, cp: u21) bool {
     return false;
 }
 
-const space_ranges = [_]Range{
+const space_source_ranges = [_]SourceRange{
     .{ .first = 0x00A0, .last = 0x00A0 },
     .{ .first = 0x1680, .last = 0x1680 },
     .{ .first = 0x2000, .last = 0x200A },
@@ -56,7 +73,9 @@ const space_ranges = [_]Range{
     .{ .first = 0x3000, .last = 0x3000 },
 };
 
-const punctuation_ranges = [_]Range{
+const space_ranges = compactRanges(space_source_ranges);
+
+const punctuation_source_ranges = [_]SourceRange{
     .{ .first = 0x00A1, .last = 0x00A9 },
     .{ .first = 0x00AB, .last = 0x00AC },
     .{ .first = 0x00AE, .last = 0x00B1 },
@@ -409,6 +428,8 @@ const punctuation_ranges = [_]Range{
     .{ .first = 0x1FB94, .last = 0x1FBEF },
     .{ .first = 0x1FBFA, .last = 0x1FBFA },
 };
+
+const punctuation_ranges = compactRanges(punctuation_source_ranges);
 
 test "flanking classes follow Unicode general categories" {
     try std.testing.expect(isPunctuationOrSymbol(0x2014)); // em dash, Pd
