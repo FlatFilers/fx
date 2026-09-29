@@ -461,6 +461,31 @@ describe("configured providers", () => {
     }
   }, 12000);
 
+  test("a connection without a saved model runs from --model or FX_MODEL and rejects a blank FX_MODEL", async () => {
+    const f = fixture();
+    try {
+      delete (f.settings.models as Record<string, string>).local;
+      f.save();
+      const chatModels = () => f.requests.filter(request => request.path === "/v1/chat/completions").map(request => request.body.model);
+
+      const flag = await runFx(["ask", "--json", "--no-save", "--model", "flag-model", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      if (flag.code !== 0) throw new Error(flag.stdout + flag.stderr);
+      const env = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "  env-model  " }, timeoutMs: 10000 });
+      if (env.code !== 0) throw new Error(env.stdout + env.stderr);
+      expect(chatModels()).toEqual(["flag-model", "env-model"]);
+
+      const status = await runFx(["status", "--json"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "env-model" } });
+      expect(status.code).toBe(0);
+      expect(JSON.parse(status.stdout)).toMatchObject({ model: "env-model", model_origin: "FX_MODEL", model_source: "local" });
+
+      const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
+      expect(blank.code).toBe(1);
+      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(chatModels()).toHaveLength(2);
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
+
   test("redirects cannot forward credentials to another connection", async () => {
     const target = fixture();
     const f = fixture(() => new Response("redirect", { status: 307, headers: { location: `${target.settings.providers.local.base_url}/chat/completions` } }));

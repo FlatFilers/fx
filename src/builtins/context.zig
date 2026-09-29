@@ -3212,6 +3212,12 @@ test "gateway_system_prompt: source routing" {
 test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Reply in the same natural language as the user's latest message unless asked to switch.");
     try expectDefaultPromptContains("Keep responses short and practical.");
+    try expectDefaultPromptDoesNotContain("use markdown unless requested");
+    try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which fx renders in the terminal.");
+    try expectDefaultPromptContains("Use a table for comparisons or data with several attributes per item");
+    try expectDefaultPromptContains("fenced code blocks only for code, commands to run, or verbatim output");
+    try expectDefaultPromptContains("answer simple questions in plain sentences");
+    try expectDefaultPromptContains("Use bold sparingly, and never inside tables");
     try expectDefaultPromptContains("Before the first tool call in a tool-driven task, always send one brief user-visible update");
     try expectDefaultPromptContains("Never start the first tool silently.");
     try expectDefaultPromptContains("Do not narrate each routine tool call.");

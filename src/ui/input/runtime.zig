@@ -572,15 +572,77 @@ test "text edits undo and redo without snapshotting structured state" {
     try std.testing.expectEqualStrings("ab", runtime.edit_state.input.items);
 }
 
+pub const DeferredSessionInput = union(enum) {
+    byte: u8,
+    delivery_epoch,
+};
+
 pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
     deferred_terminal_input_source: ?DeferredTerminalInputSource = null,
+    deferred_session_input: std.ArrayList(DeferredSessionInput) = .empty,
+    deferred_session_input_index: usize = 0,
+    deferred_session_completed_end: usize = 0,
     native_clear_probe: native_clear_probe_runtime.Runtime = .{},
     terminal_action_decoder: terminal_action_decoder.Decoder = .{},
 
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
+        const dropped = self.discardDeferredSessionInput();
+        if (dropped > 0) debug_trace.logf("input", "deferred session input dropped bytes={d} reason=shutdown", .{dropped});
+        self.deferred_session_input.deinit(alloc);
         self.native_clear_probe.deinit(alloc);
+    }
+
+    pub fn hasDeferredSessionInput(self: *const Runtime) bool {
+        return self.deferred_session_input_index < self.deferred_session_input.items.len;
+    }
+
+    pub fn deferSessionInputByte(self: *Runtime, alloc: Allocator, byte: u8, limit: usize) !bool {
+        if (self.deferred_session_input.items.len - self.deferred_session_input_index >= limit) return false;
+        if (self.deferred_session_input_index > 0) {
+            const remaining = self.deferred_session_input.items[self.deferred_session_input_index..];
+            std.mem.copyForwards(DeferredSessionInput, self.deferred_session_input.items[0..remaining.len], remaining);
+            self.deferred_session_input.items.len = remaining.len;
+            self.deferred_session_completed_end -|= self.deferred_session_input_index;
+            self.deferred_session_input_index = 0;
+        }
+        try self.deferred_session_input.append(alloc, .{ .byte = byte });
+        return true;
+    }
+
+    pub fn markDeferredSessionDeliveryEpoch(self: *Runtime, alloc: Allocator) !void {
+        if (!self.hasDeferredSessionInput() or self.deferred_session_input.items[self.deferred_session_input.items.len - 1] == .delivery_epoch) return;
+        try self.deferred_session_input.append(alloc, .delivery_epoch);
+        self.deferred_session_completed_end = self.deferred_session_input.items.len;
+    }
+
+    pub fn allowCurrentDeferredSessionInputForReplay(self: *Runtime) void {
+        self.deferred_session_completed_end = self.deferred_session_input.items.len;
+    }
+
+    pub fn takeDeferredSessionInput(self: *Runtime) ?DeferredSessionInput {
+        if (self.deferred_session_input_index == self.deferred_session_input.items.len) {
+            self.deferred_session_input.clearRetainingCapacity();
+            self.deferred_session_input_index = 0;
+            self.deferred_session_completed_end = 0;
+            return null;
+        }
+        if (self.deferred_session_input_index >= self.deferred_session_completed_end) return null;
+        const item = self.deferred_session_input.items[self.deferred_session_input_index];
+        self.deferred_session_input_index += 1;
+        return item;
+    }
+
+    pub fn discardDeferredSessionInput(self: *Runtime) usize {
+        var dropped: usize = 0;
+        for (self.deferred_session_input.items[self.deferred_session_input_index..]) |item| {
+            if (item == .byte) dropped += 1;
+        }
+        self.deferred_session_input.clearRetainingCapacity();
+        self.deferred_session_input_index = 0;
+        self.deferred_session_completed_end = 0;
+        return dropped;
     }
 
     pub fn resetEscapeDecoder(self: *Runtime) void {
@@ -651,6 +713,25 @@ pub const Runtime = struct {
         };
     }
 };
+
+test "deferred session input preserves delivery epochs and enforces a byte limit" {
+    var runtime: Runtime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'a', 2));
+    try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'b', 2));
+    try std.testing.expect(!(try runtime.deferSessionInputByte(std.testing.allocator, 'c', 2)));
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
+    try runtime.markDeferredSessionDeliveryEpoch(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 'a'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expectEqual(@as(u8, 'b'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expect(runtime.takeDeferredSessionInput().? == .delivery_epoch);
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
+    try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'c', 2));
+    try runtime.markDeferredSessionDeliveryEpoch(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 'c'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expect(runtime.takeDeferredSessionInput().? == .delivery_epoch);
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
+}
 
 pub fn scanInputCursorVertical(
     input: *const InputRuntime,
@@ -2075,6 +2156,109 @@ test "input escape parser preserves modified arrow intent" {
     try expectEscapeAction("[57353;5u", moveEscape(.visual_down, false));
     try expectEscapeAction("[57353;9u", moveEscape(.draft_end, false));
     try expectEscapeAction("[1;4D", moveEscape(.word_left, true));
+}
+
+test "input escape parser maps kitty keypad keys to their main-row characters" {
+    // Kitty reports keypad keys as dedicated codes: KP_0..KP_9 = 57399-57408.
+    try expectEscapeAction("[57399u", .{ .remapped_byte = '0' });
+    try expectEscapeAction("[57408u", .{ .remapped_byte = '9' });
+    try expectEscapeAction("[57400;1u", .{ .remapped_byte = '1' });
+    // Num Lock (bit 7) is a lock state, not a modifier.
+    try expectEscapeAction("[57400;129u", .{ .remapped_byte = '1' });
+    try expectEscapeAction("[57409u", .{ .remapped_byte = '.' });
+    try expectEscapeAction("[57410u", .{ .remapped_byte = '/' });
+    try expectEscapeAction("[57411u", .{ .remapped_byte = '*' });
+    try expectEscapeAction("[57412u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57413u", .{ .remapped_byte = '+' });
+    try expectEscapeAction("[57415u", .{ .remapped_byte = '=' });
+    // Shift keeps the character; the main row has no text for the other
+    // modifiers, and Hyper/Meta must not start typing digits either.
+    try expectEscapeAction("[57412;2u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57410;3u", .ignore);
+    try expectEscapeAction("[57410;5u", .ignore);
+    try expectEscapeAction("[57412;9u", .ignore);
+    try expectEscapeAction("[57412;17u", .ignore);
+    try expectEscapeAction("[57412;33u", .ignore);
+    try expectEscapeAction("\x1b[57412u", .ignore);
+    try expectEscapeAction("\x1b[57412;2u", .ignore);
+}
+
+test "input escape parser keeps keypad Enter, navigation, and Delete contracts" {
+    try expectEscapeAction("[57414u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;5u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;2u", .insert_newline);
+    try expectEscapeAction("[57414;3u", .insert_newline);
+    try expectEscapeAction("[57419;1u", .cursor_up);
+    try expectEscapeAction("[57420;1u", .cursor_down);
+    try expectEscapeAction("[57417;1u", .cursor_left);
+    try expectEscapeAction("[57418;1u", .cursor_right);
+    try expectEscapeAction("[57423;1u", .home);
+    try expectEscapeAction("[57424;1u", .end);
+    try expectEscapeAction("[57419;2u", moveEscape(.visual_up, true));
+    try expectEscapeAction("[57417;5u", moveEscape(.word_left, false));
+    try expectEscapeAction("[57421u", .page_up);
+    try expectEscapeAction("[57422u", .page_down);
+    try expectEscapeAction("[57426u", .delete_next);
+    try expectEscapeAction("[3;1~", .delete_next);
+    try expectEscapeAction("[57426;2u", .ignore);
+    try expectEscapeAction("[3;2~", .ignore);
+    try expectEscapeAction("[57426;3u", .delete_word_right);
+    try expectEscapeAction("[3;3~", .delete_word_right);
+    try expectEscapeAction("[57426;5u", .delete_word_right);
+    try expectEscapeAction("[3;5~", .delete_word_right);
+    try expectEscapeAction("[57426;9u", .delete_to_line_end);
+    try expectEscapeAction("[3;9~", .delete_to_line_end);
+    // Keypad keys with no main-row equivalent stay unmapped.
+    try expectEscapeAction("[57416u", .ignore);
+    try expectEscapeAction("[57425u", .ignore);
+    try expectEscapeAction("[57427u", .ignore);
+}
+
+test "input escape parser resolves keypad keys reported with an event type" {
+    // Ghostty can append the Kitty event type as a colon-qualified modifier.
+    try expectEscapeAction("[57412;1:1u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57412;1:2u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57412;1:3u", .ignore);
+    // A multi-digit event type stays non-actionable instead of collapsing to
+    // its last digit.
+    try expectEscapeAction("[57412;1:12u", .ignore);
+    // A colon-qualified report with no event type is not a press.
+    try expectEscapeAction("[57412;1:0u", .ignore);
+    try expectEscapeAction("[57414;1:0u", .ignore);
+    try expectEscapeAction("[57410;1:1u", .{ .remapped_byte = '/' });
+    try expectEscapeAction("[57414;1:1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57419;1:1u", .cursor_up);
+}
+
+test "input escape parser decodes application-keypad SS3 keys" {
+    // A terminal left in keypad application mode reports `ESC O <byte>`.
+    try expectEscapeAction("Op", .{ .remapped_byte = '0' });
+    try expectEscapeAction("Oq", .{ .remapped_byte = '1' });
+    try expectEscapeAction("Ox", .{ .remapped_byte = '8' });
+    try expectEscapeAction("Oy", .{ .remapped_byte = '9' });
+    try expectEscapeAction("Ol", .{ .remapped_byte = ',' });
+    try expectEscapeAction("On", .{ .remapped_byte = '.' });
+    try expectEscapeAction("Oj", .{ .remapped_byte = '*' });
+    try expectEscapeAction("Ok", .{ .remapped_byte = '+' });
+    try expectEscapeAction("Om", .{ .remapped_byte = '-' });
+    try expectEscapeAction("Oo", .{ .remapped_byte = '/' });
+    try expectEscapeAction("OM", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("OX", .{ .remapped_byte = '=' });
+    // Arrows, Home, and End keep their existing SS3 mapping.
+    try expectEscapeAction("OA", .cursor_up);
+    try expectEscapeAction("OB", .cursor_down);
+    try expectEscapeAction("OC", .cursor_right);
+    try expectEscapeAction("OD", .cursor_left);
+    try expectEscapeAction("OH", .home);
+    try expectEscapeAction("OF", .end);
+    // F1-F4 and the keypad bytes with no main-row equivalent stay unmapped.
+    try expectEscapeAction("OP", .ignore);
+    try expectEscapeAction("OQ", .ignore);
+    try expectEscapeAction("OR", .ignore);
+    try expectEscapeAction("OS", .ignore);
+    try expectEscapeAction("OE", .ignore);
+    try expectEscapeAction("OI", .ignore);
 }
 
 test "input escape parser preserves double escape meta behavior" {

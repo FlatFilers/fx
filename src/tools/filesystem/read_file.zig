@@ -4,6 +4,7 @@ const pathing = @import("../../core/workspace/pathing.zig");
 const read_tracker = @import("../../core/workspace/read_tracker.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const image_data = @import("../../core/images/image_data.zig");
+const png_downscale = @import("../../core/images/png_downscale.zig");
 const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
@@ -237,7 +238,19 @@ fn imageToolResult(
 ) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
     if (incomplete_read) return null;
     const mime_type = image_data.detectMediaTypeFromBytes(bytes) orelse return null;
-    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const dimensions = image_data.imageDimensions(bytes);
+    const oversized = if (dimensions) |size| size.exceedsModelLimit() else false;
+    const downscalable = png_downscale.supportsMediaType(mime_type);
+    // PNGs over the pixel limit are downscaled when the result enters history.
+    // One that is over the byte limit as well is downscaled here, so it fits
+    // the attach limit and its full size never enters tool memory.
+    const smaller = if (std.base64.standard.Encoder.calcSize(bytes.len) > image_data.max_encoded_image_bytes)
+        try png_downscale.downscaleOversized(ctx.allocator, mime_type, bytes)
+    else
+        null;
+    defer if (smaller) |copy| ctx.allocator.free(copy.png);
+    const attached = if (smaller) |copy| copy.png else bytes;
+    const encoded_len = std.base64.standard.Encoder.calcSize(attached.len);
     if (encoded_len > image_data.max_encoded_image_bytes) {
         tool_dispatch.reportToolResultMemory(ctx, .{
             .model_view_covers_full_file = false,
@@ -248,9 +261,26 @@ fn imageToolResult(
             .{ rel, mime_type, file_size, max_attach_image_bytes },
         ) };
     }
+    // Other formats cannot be downscaled, so they are reported instead.
+    if (oversized and !downscalable) {
+        tool_dispatch.reportToolResultMemory(ctx, .{
+            .model_view_covers_full_file = false,
+        });
+        return .{ .success = try std.fmt.allocPrint(
+            ctx.allocator,
+            "<path>{s}</path>\n<content>image not attached: {s} is {d}x{d} pixels, over the {d}-pixel limit per side, and only PNG images are downscaled automatically. Save a copy at most {d} pixels per side to a new file without changing this one, then read the copy.</content>",
+            .{ rel, mime_type, dimensions.?.width, dimensions.?.height, image_data.max_image_dimension, image_data.max_image_dimension },
+        ) };
+    }
+    var text: std.Io.Writer.Allocating = .init(ctx.allocator);
+    errdefer text.deinit();
+    if (smaller) |copy| {
+        image_data.writeDownscaledNotice(&text.writer, dimensions.?, .{ .width = copy.width, .height = copy.height }) catch return error.OutOfMemory;
+    }
+    text.writer.print("<path>{s}</path>\n<content>image attached ({s}, {d} bytes)</content>", .{ rel, mime_type, file_size }) catch return error.OutOfMemory;
     const encoded = try ctx.allocator.alloc(u8, encoded_len);
     errdefer ctx.allocator.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    _ = std.base64.standard.Encoder.encode(encoded, attached);
     const owned_mime = try ctx.allocator.dupe(u8, mime_type);
     errdefer ctx.allocator.free(owned_mime);
     const images = try ctx.allocator.alloc(core_types.ToolImage, 1);
@@ -260,11 +290,7 @@ fn imageToolResult(
         .model_view_covers_full_file = true,
     });
     return .{ .rich = .{
-        .text = try std.fmt.allocPrint(
-            ctx.allocator,
-            "<path>{s}</path>\n<content>image attached ({s}, {d} bytes)</content>",
-            .{ rel, mime_type, file_size },
-        ),
+        .text = try text.toOwnedSlice(),
         .images = images,
         .is_error = false,
     } };
@@ -783,6 +809,89 @@ test "read_file reports images over the attach limit without pixels" {
     try std.testing.expect(std.mem.find(u8, result.body, "image not attached") != null);
     try std.testing.expectEqual(@as(usize, 0), result.images.len);
     try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+fn writeTestPngHeader(dir: std.Io.Dir, name: []const u8, width: u32, height: u32) !void {
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = &image_data.testPngHeader(width, height) });
+}
+
+test "read_file attaches oversized PNG images for downscaling" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestPngHeader(tmp.dir, "frame.png", 3420, 2224);
+    const path = try tmpPath(std.testing.allocator, tmp, "frame.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/png") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+}
+
+test "read_file withholds non-PNG images over the model pixel limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "photo.jpg", .data = &image_data.testJpeg(4032, 3024) });
+    const path = try tmpPath(std.testing.allocator, tmp, "photo.jpg");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image not attached: image/jpeg is 4032x3024 pixels, over the 2000-pixel limit per side, and only PNG images are downscaled automatically. Save a copy at most 2000 pixels per side to a new file without changing this one, then read the copy.") != null);
+    try std.testing.expectEqual(@as(usize, 0), result.images.len);
+    try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+test "read_file downscales a PNG over both the byte and pixel limits" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
+    defer alloc.free(png);
+    const padded = try png_downscale.testPaddedPng(alloc, png, image_data.max_encoded_image_bytes);
+    defer alloc.free(padded);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "padded.png", .data = padded });
+    const path = try tmpPath(alloc, tmp, "padded.png");
+    defer alloc.free(path);
+    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    defer alloc.free(args);
+
+    const result = try dispatchReadFile(alloc, args);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.startsWith(u8, result.body, "[Image downscaled from 2400x8 to 2000x7 pixels"));
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/png") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqual(
+        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
+        image_data.encodedImageDimensions(result.images[0].data),
+    );
+}
+
+test "read_file attaches an image exactly at the model pixel limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestPngHeader(tmp.dir, "edge.png", image_data.max_image_dimension, image_data.max_image_dimension);
+    const path = try tmpPath(std.testing.allocator, tmp, "edge.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/png") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
 }
 
 test "read_file reports start_line beyond file length" {

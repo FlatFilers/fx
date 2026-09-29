@@ -35,6 +35,12 @@ const MARKDOWN =
   "- first item\n- second item\n\n---\n\n" +
   "| Name | Value |\n| --- | --- |\n| one | two |\n\n" +
   "```zig\nconst answer: u8 = 42;\n```\n";
+const WIDE_TABLE =
+  "| # | Choice | Direct consequences |\n" +
+  "|---|---|---|\n" +
+  "| 1 | **Change:** on reopen, an unfinished turn gets `turn_interrupted{reason: crash}`; it's never cut | " +
+  "`recovery.json` and `recovery.asked` go away. The adapter handles a turn that ends in a tool call with no result |\n" +
+  "| 8 | **Keep:** forks start only at turn boundaries (or turn 0) | Mid-turn forks deferred |\n";
 
 const roots: string[] = [];
 const gateways: Array<{ stop(): void }> = [];
@@ -523,6 +529,45 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "inline code URL keeps its full target across wrapped transcript rows",
+    async () => {
+      const root = createRoot();
+      const url = "http://localhost:3210/bench?run=https://github.com/vercel/e/actions/runs/36247033515";
+      const gateway = startFakeGateway([fakeGatewayFinalText(`Open \`${url}.\`\n`)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 82,
+        height: 24,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.sendText("Show the URL.");
+      await session.waitForText("3515.", TIMEOUT);
+      const pane = await session.captureFullScrollback();
+      const rows = pane.split("\n").filter((row) => row.includes("localhost:") || row.includes("3515."));
+      expect(rows).toHaveLength(2);
+      const escaped = await session.captureFullScrollbackEscapes();
+      const target = `\x1b]8;id=fx-1;${url}\x1b\\`;
+      const linkedRows = escaped.split("\n").filter((row) => row.includes(target));
+      expect(linkedRows).toHaveLength(2);
+      expect(linkedRows[0]).toContain("localhost:");
+      expect(linkedRows[1]).toContain("3515\x1b]8;;\x1b\\.");
+      expect(escaped).not.toContain(`\x1b]8;;${url}.\x1b\\`);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(gateway.requestCount()).toBe(1);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "--no-color keeps the TTY layout without fx styles or hyperlinks",
     async () => {
       const root = createRoot();
@@ -591,6 +636,45 @@ describe("fx ask presentation", () => {
       const escaped = await session.captureFullScrollbackEscapes();
       expect(escaped).toContain("\x1b[38;5;238mconst\x1b[39m");
       expect(escaped).not.toContain("\x1b[38;5;252mconst\x1b[39m");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY tables wider than the pane wrap cells inside the grid",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([fakeGatewayFinalText(WIDE_TABLE)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--no-save", "Render the wide table fixture."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 72,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      const grid = scrollback
+        .split("\n")
+        .map((line) => line.trimEnd())
+        .filter((line) => /^\s*[┌│├└]/.test(line));
+      expect(grid[0]).toMatch(/^\s*┌───┬─+┬─+┐$/);
+      expect(grid.at(-1)).toMatch(/^\s*└───┴─+┴─+┘$/);
+      expect(new Set(grid.map((line) => line.length)).size).toBe(1);
+      expect(grid.some((line) => /^\s*│ 1 │ Change:/.test(line))).toBe(true);
+      expect(grid.some((line) => /^\s*│   │ \S/.test(line))).toBe(true);
+      expect(scrollback).not.toContain("Choice: ");
+      expect(scrollback).not.toContain("Direct consequences: ");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,

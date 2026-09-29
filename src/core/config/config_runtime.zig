@@ -79,8 +79,12 @@ pub const Settings = struct {
     notification_max: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
+    /// Owned absolute directories whose contents symlinked skills may resolve
+    /// into. Profile-only; a later layer replaces the whole list. Freed in deinit.
+    skill_symlink_authorities: ?[][]u8 = null,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
+        if (self.skill_symlink_authorities) |paths| freeStringSlice(alloc, paths);
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
@@ -208,6 +212,7 @@ pub const ConfigDiagnosticCause = enum {
     retired_skill_match_fuzzy,
     invalid_context_limits,
     invalid_additional_directories,
+    invalid_skill_symlink_authorities,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -242,7 +247,16 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
             .{workspace_access.max_additional_directories},
         );
     }
+    if (diagnostic.cause == .invalid_skill_symlink_authorities) {
+        try writer.print(
+            "; skill_symlink_authorities must be an array of at most {d} absolute directory paths without .. components",
+            .{max_skill_symlink_authorities},
+        );
+    }
 }
+
+/// Upper bound on profile `skill_symlink_authorities` entries.
+const max_skill_symlink_authorities: usize = 32;
 
 pub const DetailedSettings = struct {
     settings: Settings,
@@ -279,6 +293,50 @@ pub fn providerEnvOverride() ?[]const u8 {
     const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
     if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
     return raw;
+}
+
+/// Trimmed FX_MODEL, or null when unset or blank. Borrows process environment storage.
+pub fn modelEnvOverride() ?[]const u8 {
+    const raw = io_mod.getenv("FX_MODEL") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+pub const ModelSelectionError = error{
+    CodexModelNotSelected,
+    GrokModelNotSelected,
+    ConfiguredModelNotSelected,
+};
+
+/// Chooses the provider and the model it persists as its preference. A saved
+/// model wins; Gateway falls back to `default_model`; providers without a
+/// built-in default accept `run_model` (--model or FX_MODEL) for this run.
+/// The result borrows from its arguments.
+pub fn selectProviderModel(
+    default_model: []const u8,
+    settings: *const Settings,
+    provider_override: ?model_provider.ProviderId,
+    run_model: ?[]const u8,
+) ModelSelectionError!model_provider.ProviderSelection {
+    const provider = provider_override orelse settings.provider orelse .gateway;
+    const model = settings.models.get(provider) orelse switch (provider) {
+        .gateway => default_model,
+        .codex => run_model orelse return error.CodexModelNotSelected,
+        .grok => run_model orelse return error.GrokModelNotSelected,
+        .configured => run_model orelse return error.ConfiguredModelNotSelected,
+    };
+    return .{ .provider = provider, .model = model };
+}
+
+/// User-facing guidance for a `ModelSelectionError`, or null for any other error.
+pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
+    const for_this_run = "or set a model for this run with --model or FX_MODEL";
+    return switch (err) {
+        error.CodexModelNotSelected => "no Codex model is selected; run `fx provider codex` to choose one, " ++ for_this_run,
+        error.GrokModelNotSelected => "no Grok model is selected; run `fx provider grok` to choose one, " ++ for_this_run,
+        error.ConfiguredModelNotSelected => "no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, " ++ for_this_run,
+        else => null,
+    };
 }
 
 fn resolve_provider_selection(settings: *Settings) !void {
@@ -565,17 +623,15 @@ fn loadMergedSettingsDetailedWithOptionalHome(
 
     try resolve_provider_selection(&settings);
     if (providerEnvOverride() != null) sources.provider = .process_override;
-    if (io_mod.getenv("FX_MODEL")) |model_override| {
-        if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
-            sources.models.set(override_provider, .process_override) catch |err| switch (err) {
-                error.TooManyModelPreferences => debug_trace.logf(
-                    "config",
-                    "dropping process model override provenance provider={s}: provenance table holds at most {d} provider names",
-                    .{ override_provider.label(), model_preferences.max_preferences },
-                ),
-            };
-        }
+    if (modelEnvOverride() != null) {
+        const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
+        sources.models.set(override_provider, .process_override) catch |err| switch (err) {
+            error.TooManyModelPreferences => debug_trace.logf(
+                "config",
+                "dropping process model override provenance provider={s}: provenance table holds at most {d} provider names",
+                .{ override_provider.label(), model_preferences.max_preferences },
+            ),
+        };
     }
     if (io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
         switch (parseProviderOrderList(alloc, order_override)) {
@@ -777,6 +833,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "yolo_acknowledged",
         "permission",
         "additional_directories",
+        "skill_symlink_authorities",
     }) |profile_key| {
         if (std.mem.eql(u8, key, profile_key)) return true;
     }
@@ -943,6 +1000,7 @@ fn diagnosticCauseForParseError(err: anyerror) ConfigDiagnosticCause {
         error.UnknownContextLimit,
         error.InvalidContextLimitValue,
         => .invalid_context_limits,
+        error.InvalidSkillSymlinkAuthorities => .invalid_skill_symlink_authorities,
         else => .malformed_settings,
     };
 }
@@ -1687,6 +1745,12 @@ fn parseProfileOnlyFields(
         settings.startup_scrollback = value.bool;
     }
 
+    if (root.object.get("skill_symlink_authorities")) |value| {
+        const paths = try parseSkillSymlinkAuthorities(alloc, value);
+        if (settings.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
+        settings.skill_symlink_authorities = paths;
+    }
+
     if (root.object.get("prompt_history")) |prompt_history_value| {
         if (prompt_history_value != .object) return error.InvalidPromptHistoryType;
         if (prompt_history_value.object.get("enabled")) |enabled| {
@@ -1748,6 +1812,42 @@ fn parseProfileOnlyFields(
         settings.permission_rules = try parsePermissionConfig(alloc, value);
         settings.has_permission_rules = true;
     }
+}
+
+/// Parses `skill_symlink_authorities` into caller-owned path copies. Every
+/// entry must be an absolute path without `..` components so a typo cannot
+/// silently widen or narrow the directories skills may resolve into.
+fn parseSkillSymlinkAuthorities(alloc: Allocator, value: std.json.Value) ![][]u8 {
+    if (value != .array) return error.InvalidSkillSymlinkAuthorities;
+    const items = value.array.items;
+    if (items.len > max_skill_symlink_authorities) return error.InvalidSkillSymlinkAuthorities;
+    for (items) |item| {
+        if (item != .string or
+            !std.fs.path.isAbsolute(item.string) or
+            pathHasDotDotComponent(item.string))
+        {
+            return error.InvalidSkillSymlinkAuthorities;
+        }
+    }
+    const paths = try alloc.alloc([]u8, items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (paths[0..filled]) |path| alloc.free(path);
+        alloc.free(paths);
+    }
+    for (items) |item| {
+        paths[filled] = try alloc.dupe(u8, item.string);
+        filled += 1;
+    }
+    return paths;
+}
+
+fn pathHasDotDotComponent(path: []const u8) bool {
+    var it = std.fs.path.componentIterator(path);
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component.name, "..")) return true;
+    }
+    return false;
 }
 
 fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.Value) !void {
@@ -1846,6 +1946,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         incoming.theme = null;
     }
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
+    if (incoming.skill_symlink_authorities) |value| {
+        if (target.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
+        target.skill_symlink_authorities = value;
+        incoming.skill_symlink_authorities = null;
+    }
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
     if (incoming.review_model) |value| {
@@ -2614,6 +2719,104 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
     const json = try serializeJsonObject(std.testing.allocator, parsed.value);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"startup_scrollback\":false") != null);
+}
+
+test "skill_symlink_authorities parses replaces on merge and rejects invalid entries" {
+    const alloc = std.testing.allocator;
+
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.skill_symlink_authorities == null);
+
+    var first = try parseSettingsJson(alloc, "{\"skill_symlink_authorities\":[\"/Applications/Codiff.app/Contents/Resources/app/codex/skills\",\"/nix/store\"]}");
+    defer first.deinit(alloc);
+    const parsed_paths = first.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 2), parsed_paths.len);
+    try std.testing.expectEqualStrings("/Applications/Codiff.app/Contents/Resources/app/codex/skills", parsed_paths[0]);
+    try std.testing.expectEqualStrings("/nix/store", parsed_paths[1]);
+
+    var second = try parseSettingsJson(alloc, "{\"skill_symlink_authorities\":[]}");
+    defer second.deinit(alloc);
+    try mergeSettings(&first, &second, alloc);
+    try std.testing.expectEqual(@as(usize, 0), first.skill_symlink_authorities.?.len);
+
+    inline for (&.{
+        "{\"skill_symlink_authorities\":\"/nix/store\"}",
+        "{\"skill_symlink_authorities\":[7]}",
+        "{\"skill_symlink_authorities\":[\"relative/skills\"]}",
+        "{\"skill_symlink_authorities\":[\"/opt/../etc\"]}",
+    }) |json| {
+        try std.testing.expectError(error.InvalidSkillSymlinkAuthorities, parseSettingsJson(alloc, json));
+    }
+}
+
+test "skill_symlink_authorities is profile-only and workspace overrides replace the global list" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "project-only");
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const project_only_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "project-only");
+    defer alloc.free(project_only_root);
+
+    const user_settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"skill_symlink_authorities\":[\"/opt/global-skills\"],\"workspaces\":{{\"{s}\":{{\"skill_symlink_authorities\":[\"/opt/workspace-skills\"]}}}}}}",
+        .{workspace_root},
+    );
+    defer alloc.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"skill_symlink_authorities\":[\"/opt/project-skills\"]}");
+    try writeFixtureFile(tmp.dir, "project-only/.fx.json", "{\"skill_symlink_authorities\":[\"/opt/project-skills\"]}");
+
+    var workspace = try loadMergedSettingsFromHome(alloc, home_root, workspace_root);
+    defer workspace.deinit(alloc);
+    const workspace_paths = workspace.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 1), workspace_paths.len);
+    try std.testing.expectEqualStrings("/opt/workspace-skills", workspace_paths[0]);
+
+    // A committed project file must never grant filesystem authority.
+    var project_only = try loadMergedSettingsFromHome(alloc, home_root, project_only_root);
+    defer project_only.deinit(alloc);
+    const project_only_paths = project_only.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 1), project_only_paths.len);
+    try std.testing.expectEqualStrings("/opt/global-skills", project_only_paths[0]);
+}
+
+test "invalid skill_symlink_authorities reports a specific diagnostic" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_symlink_authorities\":[\"relative/skills\"]}");
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+    try std.testing.expect(detailed.settings.skill_symlink_authorities == null);
+    var found = false;
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.layer != .user) continue;
+        if (diagnostic.cause != .invalid_skill_symlink_authorities) continue;
+        found = true;
+        var buffer: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writeDiagnosticMetadata(&writer, diagnostic);
+        try std.testing.expect(std.mem.find(u8, writer.buffered(), "skill_symlink_authorities must be an array") != null);
+    }
+    try std.testing.expect(found);
 }
 
 test "collapse tool calls parses merges and rejects invalid types" {
@@ -4385,4 +4588,91 @@ test "auto compaction percent is a profile setting between 10 and 80" {
     var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"auto_compact_percent\":50}", .project);
     defer project.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u8, null), project.auto_compact_percent);
+}
+
+test "selectProviderModel chooses only its provider-scoped model" {
+    var gateway_settings = Settings{ .provider = .gateway };
+    defer gateway_settings.deinit(std.testing.allocator);
+    try gateway_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
+    try gateway_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
+    const gateway = try selectProviderModel("default/model", &gateway_settings, null, null);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
+    try std.testing.expectEqualStrings("gateway/model", gateway.model);
+
+    var codex_settings = Settings{ .provider = .codex };
+    defer codex_settings.deinit(std.testing.allocator);
+    try codex_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
+    try codex_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
+    const codex = try selectProviderModel("default/model", &codex_settings, null, null);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
+    try std.testing.expectEqualStrings("gpt-model", codex.model);
+
+    const missing_codex = Settings{ .provider = .codex };
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        selectProviderModel("default/model", &missing_codex, null, null),
+    );
+
+    var grok_settings = Settings{ .provider = .grok };
+    defer grok_settings.deinit(std.testing.allocator);
+    try grok_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
+    const grok = try selectProviderModel("default/model", &grok_settings, null, null);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
+    try std.testing.expectEqualStrings("grok-model", grok.model);
+
+    // A launch --provider override selects that provider and its saved model.
+    try gateway_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
+    const overridden = try selectProviderModel("default/model", &gateway_settings, .grok, null);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, overridden.provider);
+    try std.testing.expectEqualStrings("grok-model", overridden.model);
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        selectProviderModel("default/model", &grok_settings, .codex, null),
+    );
+    const overridden_gateway = try selectProviderModel("default/model", &codex_settings, .gateway, null);
+    try std.testing.expectEqualStrings("gateway/model", overridden_gateway.model);
+}
+
+test "selectProviderModel accepts the run model when the provider has none saved" {
+    // FX_PROVIDER=codex FX_MODEL=... in a profile that never saved a Codex model.
+    const missing_codex = Settings{ .provider = .codex };
+    const env_codex = try selectProviderModel("default/model", &missing_codex, null, "gpt-env");
+    try std.testing.expectEqual(model_provider.ProviderId.codex, env_codex.provider);
+    try std.testing.expectEqualStrings("gpt-env", env_codex.model);
+
+    const missing_grok = Settings{ .provider = .grok };
+    const env_grok = try selectProviderModel("default/model", &missing_grok, null, "grok-env");
+    try std.testing.expectEqualStrings("grok-env", env_grok.model);
+
+    // FX_PROVIDER=local names a custom connection, which has no default either.
+    const missing_local = Settings{ .provider = model_provider.parse("local").? };
+    try std.testing.expectError(error.ConfiguredModelNotSelected, selectProviderModel("default/model", &missing_local, null, null));
+    const env_local = try selectProviderModel("default/model", &missing_local, null, "local-env");
+    try std.testing.expectEqualStrings("local-env", env_local.model);
+
+    // --provider codex with FX_MODEL from a Gateway-only profile.
+    const gateway_only = Settings{ .provider = .gateway };
+    const launched = try selectProviderModel("default/model", &gateway_only, .codex, "gpt-env");
+    try std.testing.expectEqual(model_provider.ProviderId.codex, launched.provider);
+    try std.testing.expectEqualStrings("gpt-env", launched.model);
+
+    // A saved model remains the persisted preference; FX_MODEL applies on top of it later.
+    var saved_codex = Settings{ .provider = .codex };
+    defer saved_codex.deinit(std.testing.allocator);
+    try saved_codex.models.putCopy(std.testing.allocator, .codex, "gpt-saved");
+    const saved = try selectProviderModel("default/model", &saved_codex, null, "gpt-env");
+    try std.testing.expectEqualStrings("gpt-saved", saved.model);
+
+    // Gateway keeps its compiled default as the persisted preference.
+    const gateway = try selectProviderModel("default/model", &gateway_only, null, "gpt-env");
+    try std.testing.expectEqualStrings("default/model", gateway.model);
+}
+
+test "modelNotSelectedMessage names the provider and both ways to recover" {
+    const codex = modelNotSelectedMessage(error.CodexModelNotSelected).?;
+    try std.testing.expect(std.mem.find(u8, codex, "`fx provider codex`") != null);
+    try std.testing.expect(std.mem.find(u8, codex, "--model or FX_MODEL") != null);
+    try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.GrokModelNotSelected).?, "`fx provider grok`") != null);
+    try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.ConfiguredModelNotSelected).?, "\"models\" in ~/.fx/settings.json") != null);
+    try std.testing.expect(modelNotSelectedMessage(error.OutOfMemory) == null);
 }

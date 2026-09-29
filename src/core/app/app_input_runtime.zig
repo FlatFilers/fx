@@ -691,6 +691,53 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        pub fn handleTerminalByteAcrossSessionTransition(
+            app: *App,
+            byte: u8,
+            input_limits: paste_framing.InputLimits,
+            max_prompt_history: usize,
+        ) !void {
+            const session_rt = app_session_runtime.Runtime(App);
+            defer session_rt.finishDeferredSessionInputReplay(app);
+            while (true) {
+                if (app.session_persistence.pending_live_session_policy != null or
+                    app.terminal_input_runtime.hasDeferredSessionInput())
+                {
+                    if (try app.terminal_input_runtime.deferSessionInputByte(app.alloc, byte, input_limits.composer_bytes)) return;
+                    if (app.session_persistence.pending_live_session_policy != null) {
+                        try session_rt.cancelPendingLiveSessionForInputLimit(app);
+                    }
+                    app.terminal_input_runtime.allowCurrentDeferredSessionInputForReplay();
+                }
+                _ = try flushDeferredSessionInput(app, input_limits, max_prompt_history);
+                if (app.should_exit) return;
+                if (app.session_persistence.pending_live_session_policy == null and
+                    !app.terminal_input_runtime.hasDeferredSessionInput()) break;
+            }
+            try handleTerminalByteWithLimits(app, byte, input_limits, max_prompt_history);
+        }
+
+        pub fn flushDeferredSessionInput(
+            app: *App,
+            input_limits: paste_framing.InputLimits,
+            max_prompt_history: usize,
+        ) !bool {
+            var delivered = false;
+            while (!app.should_exit and app.session_persistence.pending_live_session_policy == null) {
+                const item = app.terminal_input_runtime.takeDeferredSessionInput() orelse break;
+                delivered = true;
+                switch (item) {
+                    .byte => |byte| try handleTerminalByteWithLimits(app, byte, input_limits, max_prompt_history),
+                    .delivery_epoch => try settleTerminalPasteDeliveryEpochWithLimits(app, input_limits),
+                }
+            }
+            if (app.should_exit) {
+                const dropped = app.terminal_input_runtime.discardDeferredSessionInput();
+                if (dropped > 0) debug_trace.logf("input", "deferred session input dropped bytes={d} reason=quit", .{dropped});
+            }
+            return delivered;
+        }
+
         pub fn handleTerminalByte(app: *App, byte: u8, max_input_len: usize, max_prompt_history: usize) !void {
             return handleTerminalByteWithLimits(
                 app,

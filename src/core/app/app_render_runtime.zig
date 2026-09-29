@@ -898,6 +898,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn flushRequestedFrame(app: *App) !void {
+            if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
+                if (app.shell.sessionScrollbackHandoffPending()) return;
+            }
             if (app.shell.terminal_dimensions_invalid or app.shell.layout.rows == 0 or app.shell.layout.cols == 0) return;
             const has_resize_lifecycle =
                 @hasField(@TypeOf(app.shell), "pending_resize_observation");

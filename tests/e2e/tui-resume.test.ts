@@ -508,14 +508,65 @@ function hasSemanticSymbol(
   return text.includes("\ud83d\udc69");
 }
 
+// `fx replay --frames` draws each captured row between `|` edges.
+function semanticTextLines(text: string): string[] {
+  return text.split("\n").map((line) => {
+    const plain = stripAnsi(line);
+    return plain.length > 1 && plain.startsWith("|") && plain.endsWith("|") ? plain.slice(1, -1) : plain;
+  });
+}
+
+function semanticCells(line: string): string[] {
+  return line.split("│").slice(1, -1).map((cell) => cell.trim());
+}
+
+function findSemanticRowLines(
+  lines: string[],
+  row: SemanticRow,
+  observation: SemanticObservation,
+): number[] {
+  return lines.flatMap((line, index) =>
+    semanticCells(line)[0] === row.type && hasSemanticSymbol(line, row, observation) ? [index] : []
+  );
+}
+
+// Joins a row's description with the lines it wraps onto, skipping the
+// full-transcript viewer chrome between captured pages.
+function wrappedSemanticDescription(lines: string[], index: number): string {
+  const parts = [semanticCells(lines[index]!).at(-1) ?? ""];
+  for (let next = index + 1; next < lines.length; next += 1) {
+    const trimmed = lines[next]!.trim();
+    if (!/^[│├└┌]/.test(trimmed)) continue;
+    const cells = semanticCells(lines[next]!);
+    if (!trimmed.startsWith("│") || cells.length !== 3 || cells[0] !== "") break;
+    parts.push(cells[2]!);
+  }
+  return parts.filter((part) => part !== "").join(" ");
+}
+
+function semanticRowHasDescription(lines: string[], index: number, row: SemanticRow): boolean {
+  return lines[index]!.includes(row.description) ||
+    wrappedSemanticDescription(lines, index) === row.description;
+}
+
+function semanticHeaderColumns(lines: string[]): number[][] {
+  return lines
+    .filter((line) => {
+      const cells = semanticCells(line);
+      return cells[0] === "Type" && cells[1] === "Symbol" && cells[2] === "Description";
+    })
+    .map(physicalBorderColumns)
+    .filter((columns) => columns.length === 4);
+}
+
 function expectSemanticTableRows(
   text: string,
   observation: SemanticObservation,
 ): void {
+  const lines = semanticTextLines(text);
   for (const row of SEMANTIC_TABLE_ROWS) {
-    expect(text).toContain(row.type);
-    expect(text).toContain(row.description);
-    expect(hasSemanticSymbol(text, row, observation)).toBe(true);
+    const rowLines = findSemanticRowLines(lines, row, observation);
+    expect(rowLines.some((index) => semanticRowHasDescription(lines, index, row))).toBe(true);
   }
   expect(text).not.toContain("| Type | Symbol | Description |");
 }
@@ -574,53 +625,33 @@ function expectAlignedSemanticTable(
   }
 }
 
-function findPaginatedSemanticFieldLines(
-  lines: string[],
-  row: SemanticRow,
-  observation: SemanticObservation,
-): { symbolLine: string | undefined; descriptionLine: string | undefined } {
-  const symbolLine = lines.find((line) =>
-    line.includes("│Symbol:") && hasSemanticSymbol(line, row, observation)
-  );
-  const descriptionLine = lines.find((line) =>
-    line.includes("│Description:") && line.includes(row.description)
-  );
-  return { symbolLine, descriptionLine };
-}
-
-function expectAlignedSemanticCards(
+// A narrow table stays a grid: every row keeps a rendered header's borders,
+// and descriptions wider than their column continue on wrapped lines.
+// Replay output holds frames at more than one width, so a row is matched
+// against every rendered header rather than the nearest one above it.
+function expectAlignedWrappedSemanticTable(
   text: string,
   observation: SemanticObservation,
 ): void {
-  const lines = text.split("\n").map(stripAnsi);
-  let expectedColumns: number[] | undefined;
+  const lines = semanticTextLines(text);
+  const headers = semanticHeaderColumns(lines);
+  expect(headers.length).toBeGreaterThan(0);
+  let wrappedRows = 0;
 
   for (const row of SEMANTIC_TABLE_ROWS) {
-    const { symbolLine, descriptionLine } = findPaginatedSemanticFieldLines(
-      lines,
-      row,
-      observation,
+    const aligned = findSemanticRowLines(lines, row, observation).filter((index) =>
+      semanticRowHasDescription(lines, index, row) &&
+      headers.some((expectedColumns) => semanticColumnsMatch(
+        row,
+        expectedColumns,
+        physicalBorderColumns(lines[index]!),
+        observation,
+      ))
     );
-    expect(symbolLine).toBeDefined();
-    expect(descriptionLine).toBeDefined();
-    expect(hasSemanticSymbol(symbolLine!, row, observation)).toBe(true);
-
-    const symbolColumns = physicalBorderColumns(symbolLine!);
-    const descriptionColumns = physicalBorderColumns(descriptionLine!);
-    expect(symbolColumns).toHaveLength(2);
-    expect(descriptionColumns).toHaveLength(2);
-    expect(semanticColumnsMatch(
-      row,
-      descriptionColumns,
-      symbolColumns,
-      observation,
-    )).toBe(true);
-    if (expectedColumns) {
-      expect(descriptionColumns).toEqual(expectedColumns);
-    } else {
-      expectedColumns = descriptionColumns;
-    }
+    expect(aligned.length).toBeGreaterThan(0);
+    if (aligned.some((index) => !lines[index]!.includes(row.description))) wrappedRows += 1;
   }
+  expect(wrappedRows).toBeGreaterThan(0);
 }
 
 test("Linux tmux fallbacks preserve exact ASCII and replay alignment", () => {
@@ -724,23 +755,23 @@ test("Linux tmux fallbacks preserve exact ASCII and replay alignment", () => {
   )).toBe(false);
 });
 
-test("paginated semantic field lookup matches values across split cards", () => {
-  const tag = SEMANTIC_TABLE_ROWS.find((row) => row.type === "Tag")!;
+test("wrapped semantic rows join descriptions across full-transcript pages", () => {
+  const vs15 = SEMANTIC_TABLE_ROWS.find((row) => row.type === "VS15")!;
   const lines = [
-    "│Type: Previous",
-    "│Symbol: WRONG",
-    "│Description: RGI tag flag",
-    "│Type: Tag",
-    `│Symbol: ${TAG_FLAG_SYMBOL}`,
-    "│wrapped detail one",
-    "│wrapped detail two",
-    "│wrapped detail three",
-    "│Description: Previous row",
+    "  │ Type      │ Symbol │ Description     │",
+    "  ├───────────┼────────┼─────────────────┤",
+    `  │ VS15      │ ${vs15.symbol}      │ Text            │`,
+    "",
+    "┃ full detail · ctrl+o close · pgup/pgdn …",
+    "",
+    "  │           │        │ presentation    │",
+    "  ├───────────┼────────┼─────────────────┤",
+    "  │ Wide VS15 │ x      │ Wide text       │",
   ];
-  expect(findPaginatedSemanticFieldLines(lines, tag, "tmux")).toEqual({
-    symbolLine: `│Symbol: ${TAG_FLAG_SYMBOL}`,
-    descriptionLine: "│Description: RGI tag flag",
-  });
+  expect(findSemanticRowLines(lines, vs15, "replay")).toEqual([2]);
+  expect(wrappedSemanticDescription(lines, 2)).toBe("Text presentation");
+  expect(semanticRowHasDescription(lines, 2, vs15)).toBe(true);
+  expect(semanticHeaderColumns(lines)).toEqual([physicalBorderColumns(lines[0]!)]);
 });
 
 async function waitForChangedPane(
@@ -771,7 +802,8 @@ async function collectFullTranscriptPages(
     pages.push(pane);
     previous = pane;
   }
-  return pages.join("\n");
+  // Paging starts at the bottom and moves up, so reverse into document order.
+  return pages.reverse().join("\n");
 }
 
 function expectRenderedMarkdown(
@@ -5397,7 +5429,7 @@ test.skipIf(!tmuxAvailable())(
       await Bun.sleep(250);
       const narrowFullTranscript = await collectFullTranscriptPages(active);
       expectSemanticTableRows(narrowFullTranscript, "tmux");
-      expectAlignedSemanticCards(narrowFullTranscript, "tmux");
+      expectAlignedWrappedSemanticTable(narrowFullTranscript, "tmux");
       await active.sendKeys("Escape");
       await active.waitForComposer(TIMEOUT);
       await active.sendText("/quit");
@@ -5414,7 +5446,7 @@ test.skipIf(!tmuxAvailable())(
       expect(liveReplay.stdout).toContain("json_ready");
       expect(liveReplay.stdout).toContain("render_ready");
       expectSemanticTableRows(liveReplay.stdout, "replay");
-      expectAlignedSemanticCards(liveReplay.stdout, "replay");
+      expectAlignedWrappedSemanticTable(liveReplay.stdout, "replay");
 
       const resumedMarkdownGateway = startFakeGateway([]);
       gateways.push(resumedMarkdownGateway);
@@ -5441,7 +5473,7 @@ test.skipIf(!tmuxAvailable())(
       expectInferredTypeScriptCodeBlock(resumedFullTranscript);
       expectExpandedCodeProfiles(resumedFullTranscript);
       expectSemanticTableRows(resumedFullTranscript, "tmux");
-      expectAlignedSemanticCards(resumedFullTranscript, "tmux");
+      expectAlignedWrappedSemanticTable(resumedFullTranscript, "tmux");
       await active.sendKeys("Escape");
       await active.waitForComposer(TIMEOUT);
       expect(active.isPaneAlive()).toBe(true);
@@ -5459,7 +5491,7 @@ test.skipIf(!tmuxAvailable())(
       expect(resumedReplay.stdout).toContain("json_ready");
       expect(resumedReplay.stdout).toContain("render_ready");
       expectSemanticTableRows(resumedReplay.stdout, "replay");
-      expectAlignedSemanticCards(resumedReplay.stdout, "replay");
+      expectAlignedWrappedSemanticTable(resumedReplay.stdout, "replay");
 
       const toolHome = join(root, "tool-home");
       const toolWorkspace = join(root, "tool-workspace");

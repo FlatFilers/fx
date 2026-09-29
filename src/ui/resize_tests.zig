@@ -8243,6 +8243,195 @@ test "orphan command output does not leak into current compact rows" {
     try expectGridOccurrenceCount(&h, "dedupe-command-row", 0);
 }
 
+test "fresh session publishes the last visible transcript rows before clearing" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 60, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(60, 12);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "old 01\nold 02\nold 03\nold 04\nold 05\nold 06\n" ++
+            "old 07\nold 08\nold 09\nold 10\nold 11\n" ++
+            "workspace=/tmp/fx\nhistory_turns=0\nagent_step_limit=0\n",
+        true,
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try input.textReplacementState().replace(alloc, "/new");
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try expectGridContains(&h, "agent_step_limit=0");
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "agent_step_limit=0") == null);
+
+    try h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics);
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "agent_step_limit=0") != null);
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "Commands 1") == null);
+
+    h.shell.clearTranscript(alloc);
+    input.inputResetState().clearCurrent(alloc);
+    try h.shell.writeTranscript(alloc, &h.metrics, "new session header\n", true);
+    try shell_runtime.requestRedraw(&h.shell, &h.metrics, .replay_viewport);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try expectGridContains(&h, "new session header");
+    try expectGridOccurrenceCount(&h, "agent_step_limit=0", 0);
+}
+
+test "fresh session scrollback handoff releases pre-fx rows before the transcript" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(40, 12);
+    defer probe.deinit();
+
+    const pre_fx = "\x1b[1;1Hpre-fx first\r\npre-fx second";
+    try h.vt.feed(pre_fx);
+    try h.shell.shadow_vt.?.feed(pre_fx);
+    try probe.feed(pre_fx);
+    try h.shell.initViewport(&h.metrics, 5);
+    try h.shell.writeTranscript(alloc, &h.metrics, "owned first\nowned second\nowned last\n", true);
+    try h.renderTranscriptFrame();
+    try capturePhysicalFrame(&h, &probe);
+    try expectGridContains(&h, "pre-fx first");
+    try expectGridContains(&h, "owned last");
+
+    try h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics);
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "pre-fx first") != null);
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "owned last") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "owned last"));
+}
+
+test "fresh session handoff waits for an admitted resize" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old session visible\n", true);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const before = try h.file.length(io_mod.getIo());
+
+    h.shell.render_requests.observeResizeSignal(100, 100);
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffUnavailable,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    try std.testing.expectEqual(before, try h.file.length(io_mod.getIo()));
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old session visible") != null);
+}
+
+test "partial fresh session scrollback handoff does not duplicate committed rows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(40, 12);
+    defer probe.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old first\nold second\nold third\n", true);
+    try h.renderTranscriptFrame();
+    try capturePhysicalFrame(&h, &probe);
+
+    const PartialSink = struct {
+        file: std.Io.File,
+        writes: usize = 0,
+
+        fn write(ctx: *anyopaque, _: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.writes += 1;
+            const accepted = if (self.writes == 1)
+                (std.mem.findScalar(u8, bytes, '\n') orelse return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestMissingScroll } }) + 1
+            else
+                bytes.len;
+            self.file.writeStreamingAll(io_mod.getIo(), bytes[0..accepted]) catch |err| {
+                return .{ .partial = .{ .accepted_bytes = 0, .err = err } };
+            };
+            return if (self.writes == 1)
+                .{ .partial = .{ .accepted_bytes = accepted, .err = error.TestPartialFrame } }
+            else
+                .complete;
+        }
+    };
+    var sink = PartialSink{ .file = h.file };
+    h.shell.test_frame_sink = .{ .ctx = &sink, .write_frame = PartialSink.write };
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffIncomplete,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old first"));
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old third") != null);
+
+    try std.testing.expect(h.shell.sessionScrollbackHandoffPending());
+    h.shell.test_frame_sink = null;
+    try h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics);
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old first"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old third"));
+}
+
+test "resizing after a partial session handoff cancels without clearing transcript" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old session retained\n", true);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    h.shell.pending_session_scrollback_handoff = .{
+        .remaining_rows = 1,
+        .total_rows = 2,
+        .terminal_cols = 40,
+        .terminal_rows = 12,
+    };
+    h.shell.layout.cols = 39;
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffGeometryChanged,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    h.shell.cancelSessionScrollbackHandoff();
+    try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old session retained") != null);
+    try std.testing.expect(h.shell.render_requests.hasReason(.footer));
+}
+
+test "failed fresh session scrollback handoff keeps the old transcript" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old transcript still owned\n", true);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const FailSink = struct {
+        fn write(_: *anyopaque, _: *Metrics, _: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
+            return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestWriteFailure } };
+        }
+    };
+    var sink_context: u8 = 0;
+    h.shell.test_frame_sink = .{ .ctx = &sink_context, .write_frame = FailSink.write };
+    try std.testing.expectError(
+        error.TerminalSyncRecoveryFailed,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old transcript still owned") != null);
+    try std.testing.expectEqual(@as(usize, 1), h.shell.entries.items.len);
+}
+
 /// Test-only physical eviction observer, including automatic wraps.
 pub const PhysicalHistoryProbe = struct {
     grid: Grid,

@@ -10,6 +10,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const skill_runtime = @import("../skills/skill_runtime.zig");
 const shared_theme = @import("../shared/theme.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -300,12 +301,33 @@ pub const StartupState = struct {
     }
 };
 
+/// Where `fx status` found the selected model.
+pub const ModelOrigin = enum {
+    env,
+    settings,
+    default,
+
+    pub fn label(self: ModelOrigin) []const u8 {
+        return switch (self) {
+            .env => "FX_MODEL",
+            .settings => "settings",
+            .default => "default",
+        };
+    }
+
+    fn of(settings: *const config_runtime.Settings, provider: model_provider.ProviderId, env_model: ?[]const u8) ModelOrigin {
+        if (env_model != null) return .env;
+        return if (settings.models.get(provider) != null) .settings else .default;
+    }
+};
+
 pub const StartupStatus = struct {
     workspace_root: []u8,
     provider_endpoint: ?[]u8 = null,
     provider: model_provider.ProviderId = .gateway,
     selected_model: []const u8,
     owned_selected_model: ?[]u8 = null,
+    model_origin: ModelOrigin = .default,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: PermissionMode,
     agent_step_limit: usize,
@@ -346,6 +368,8 @@ pub const BootstrapConfig = struct {
     fx_version: []const u8 = "",
     /// Interactive launch `--provider` override; null keeps the configured provider.
     provider_override: ?model_provider.ProviderId = null,
+    /// Interactive launch `--model`; stands in for a provider without a saved model.
+    model_override: ?[]const u8 = null,
 };
 
 pub fn loadStartupState(
@@ -373,13 +397,27 @@ pub fn loadStartupStateWithAuthMode(
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
 ) !StartupState {
+    return loadStartupStateForRun(alloc, transport, secret_store, default_model, default_agent_step_limit, auth_mode, null);
+}
+
+/// `model_override` is the run's `--model`. It stands in for a provider without
+/// a saved model; callers still apply it over the selected or resumed model.
+pub fn loadStartupStateForRun(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+    model_override: ?[]const u8,
+) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null, model_override);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null, null);
 }
 
 pub fn loadEmbeddedStartupState(
@@ -388,6 +426,7 @@ pub fn loadEmbeddedStartupState(
     workspace_root: []const u8,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    model_override: ?[]const u8,
 ) !StartupState {
     const owned_workspace_root = try io_mod.realpathAlloc(alloc, workspace_root);
     return loadStartupStateFromOwnedWorkspace(
@@ -401,6 +440,7 @@ pub fn loadEmbeddedStartupState(
         home_dir,
         null,
         null,
+        model_override,
     );
 }
 
@@ -435,9 +475,10 @@ pub fn loadCatalogStartupStateWithAuthMode(
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
     provider_override: ?model_provider.ProviderId,
+    model_override: ?[]const u8,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override);
 }
 
 pub fn loadStartupStatus(
@@ -470,7 +511,8 @@ pub fn loadStartupStatusWithAuthMode(
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
 
-    const configured_selection = try configuredProviderSelection(default_model, settings, null);
+    const run_model = config_runtime.modelEnvOverride();
+    const configured_selection = try config_runtime.selectProviderModel(default_model, settings, null, run_model);
     const selected_model = try loadStartupStatusModel(alloc, configured_selection.model, null);
     errdefer if (selected_model.owned) |model| alloc.free(model);
 
@@ -497,6 +539,7 @@ pub fn loadStartupStatusWithAuthMode(
         .provider = configured_selection.provider,
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
+        .model_origin = ModelOrigin.of(settings, configured_selection.provider, run_model),
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
@@ -524,7 +567,7 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -540,6 +583,7 @@ fn loadStartupStateFromOwnedWorkspace(
     profile_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
     provider_override: ?model_provider.ProviderId,
+    model_override: ?[]const u8,
 ) !StartupState {
     var state = StartupState{
         .agent_step_limit = default_agent_step_limit,
@@ -575,6 +619,9 @@ fn loadStartupStateFromOwnedWorkspace(
         &.{},
         false,
     );
+    // Skill authority checks run across discovery, refresh, and the skill tool,
+    // so the profile setting is installed process-wide like the env var.
+    try skill_runtime.setConfiguredSymlinkAuthorities(settings.skill_symlink_authorities orelse &.{});
 
     // A launch --provider override must bind configured provider names against
     // the registry just like the settings and FX_PROVIDER paths do.
@@ -582,7 +629,8 @@ fn loadStartupStateFromOwnedWorkspace(
         try override.bind(settings.providers orelse .{})
     else
         null;
-    const configured_selection = try configuredProviderSelection(default_model, settings, bound_override);
+    const run_model = model_override orelse config_runtime.modelEnvOverride();
+    const configured_selection = try config_runtime.selectProviderModel(default_model, settings, bound_override, run_model);
     state.provider = configured_selection.provider;
     state.configured_providers = settings.providers orelse .{};
     settings.providers = null;
@@ -709,6 +757,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.default_agent_step_limit,
         cfg.auth_mode,
         cfg.provider_override,
+        cfg.model_override,
     );
     errdefer state.deinit(cfg.alloc);
 
@@ -1411,68 +1460,133 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
     );
 }
 
-fn configuredProviderSelection(
-    default_model: []const u8,
-    settings: *const config_runtime.Settings,
-    provider_override: ?model_provider.ProviderId,
-) !model_provider.ProviderSelection {
-    const provider = provider_override orelse settings.provider orelse .gateway;
-    const model = settings.models.get(provider) orelse switch (provider) {
-        .gateway => default_model,
-        .codex => return error.CodexModelNotSelected,
-        .grok => return error.GrokModelNotSelected,
-        .configured => io_mod.getenv("FX_MODEL") orelse return error.ConfiguredModelNotSelected,
-    };
-    return .{ .provider = provider, .model = model };
-}
-
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
-    const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
-    const trimmed = std.mem.trim(u8, model, " \t\r\n");
-    return if (trimmed.len > 0) trimmed else configured orelse default_model;
+    return config_runtime.modelEnvOverride() orelse configured orelse default_model;
 }
 
-test "startup provider chooses only its provider-scoped model" {
-    var gateway_settings = config_runtime.Settings{ .provider = .gateway };
-    defer gateway_settings.deinit(std.testing.allocator);
-    try gateway_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
-    try gateway_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
-    const gateway = try configuredProviderSelection("default/model", &gateway_settings, null);
-    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
-    try std.testing.expectEqualStrings("gateway/model", gateway.model);
+test "loadStartupState starts Codex from FX_PROVIDER and FX_MODEL without a saved model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
 
-    var codex_settings = config_runtime.Settings{ .provider = .codex };
-    defer codex_settings.deinit(std.testing.allocator);
-    try codex_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
-    try codex_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
-    const codex = try configuredProviderSelection("default/model", &codex_settings, null);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
-    try std.testing.expectEqualStrings("gpt-model", codex.model);
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "HOME", .value = home_root },
+        .{ .key = "FX_PROVIDER", .value = "codex" },
+        .{ .key = "FX_MODEL", .value = "  gpt-env  " },
+    });
+    defer env.deinit();
 
-    const missing_codex = config_runtime.Settings{ .provider = .codex };
+    var state = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default/model", 25);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, state.provider);
+    try std.testing.expectEqualStrings("gpt-env", state.selected_model);
+    try std.testing.expectEqualStrings("gpt-env", state.configured_model);
+    try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
+
+    // A blank FX_MODEL is no model at all, so the setup error still surfaces.
+    var blank_env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "HOME", .value = home_root },
+        .{ .key = "FX_PROVIDER", .value = "codex" },
+        .{ .key = "FX_MODEL", .value = " \t " },
+    });
+    defer blank_env.deinit();
     try std.testing.expectError(
         error.CodexModelNotSelected,
-        configuredProviderSelection("default/model", &missing_codex, null),
+        loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default/model", 25),
     );
+}
 
-    var grok_settings = config_runtime.Settings{ .provider = .grok };
-    defer grok_settings.deinit(std.testing.allocator);
-    try grok_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
-    const grok = try configuredProviderSelection("default/model", &grok_settings, null);
-    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
-    try std.testing.expectEqualStrings("grok-model", grok.model);
+test "loadStartupState seeds a provider without a saved model from the launch --model" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
 
-    // A launch --provider override selects that provider and its saved model.
-    try gateway_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
-    const overridden = try configuredProviderSelection("default/model", &gateway_settings, .grok);
-    try std.testing.expectEqual(model_provider.ProviderId.grok, overridden.provider);
-    try std.testing.expectEqualStrings("grok-model", overridden.model);
-    try std.testing.expectError(
-        error.CodexModelNotSelected,
-        configuredProviderSelection("default/model", &grok_settings, .codex),
+    var env = try TestEnv.install(alloc, &.{
+        .{ .key = "HOME", .value = home_root },
+        .{ .key = "FX_MODEL", .value = "gpt-env" },
+    });
+    defer env.deinit();
+
+    // fx --provider codex --model gpt-flag from a Gateway-only profile: the
+    // flag outranks FX_MODEL as the seeded preference; callers apply it last.
+    var state = try loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        try alloc.dupe(u8, workspace_root),
+        "default/model",
+        25,
+        .local,
+        null,
+        null,
+        .codex,
+        "gpt-flag",
     );
-    const overridden_gateway = try configuredProviderSelection("default/model", &codex_settings, .gateway);
-    try std.testing.expectEqualStrings("gateway/model", overridden_gateway.model);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, state.provider);
+    try std.testing.expectEqualStrings("gpt-flag", state.configured_model);
+}
+
+test "loadStartupStatus reports where the selected model came from" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+
+    {
+        var env = try TestEnv.install(alloc, &.{
+            .{ .key = "HOME", .value = home_root },
+            .{ .key = "FX_PROVIDER", .value = "codex" },
+            .{ .key = "FX_MODEL", .value = "gpt-env" },
+        });
+        defer env.deinit();
+        var status = try loadStartupStatusWithAuthMode(alloc, host.unavailable_secret_store, "default/model", 25, .host_managed);
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(model_provider.ProviderId.codex, status.provider);
+        try std.testing.expectEqualStrings("gpt-env", status.selected_model);
+        try std.testing.expectEqual(ModelOrigin.env, status.model_origin);
+    }
+    {
+        var env = try TestEnv.install(alloc, &.{
+            .{ .key = "HOME", .value = home_root },
+            .{ .key = "FX_PROVIDER", .value = "codex" },
+        });
+        defer env.deinit();
+        try std.testing.expectError(
+            error.CodexModelNotSelected,
+            loadStartupStatusWithAuthMode(alloc, host.unavailable_secret_store, "default/model", 25, .host_managed),
+        );
+    }
+    {
+        var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+        defer env.deinit();
+        var status = try loadStartupStatusWithAuthMode(alloc, host.unavailable_secret_store, "default/model", 25, .host_managed);
+        defer status.deinit(alloc);
+        try std.testing.expectEqualStrings("default/model", status.selected_model);
+        try std.testing.expectEqual(ModelOrigin.default, status.model_origin);
+    }
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"provider\":\"codex\",\"models\":{\"codex\":\"gpt-saved\"}}\n");
+    {
+        var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+        defer env.deinit();
+        var status = try loadStartupStatusWithAuthMode(alloc, host.unavailable_secret_store, "default/model", 25, .host_managed);
+        defer status.deinit(alloc);
+        try std.testing.expectEqualStrings("gpt-saved", status.selected_model);
+        try std.testing.expectEqual(ModelOrigin.settings, status.model_origin);
+    }
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
@@ -1480,8 +1594,7 @@ fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]
 }
 
 fn hasProcessModelOverride() bool {
-    const model = io_mod.getenv("FX_MODEL") orelse return false;
-    return std.mem.trim(u8, model, " \t\r\n").len > 0;
+    return config_runtime.modelEnvOverride() != null;
 }
 
 fn loadStartupStatusModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) !StartupStatusModel {

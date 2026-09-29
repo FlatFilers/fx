@@ -612,16 +612,12 @@ pub fn executeHostToolCallAuthorized(
         request.call,
     );
     dispatch_ctx.execution_authority = request.authority;
-    var status_detail: ?[]u8 = null;
     const dispatched = try tool_dispatch.dispatchAuthorizedToolCall(
         dispatch_ctx,
         execution_ctx.tool_registry,
         request.call,
-        &status_detail,
     );
-    var result = toolExecutionResultFromDispatch(dispatched, .{});
-    result.status_detail = status_detail;
-    return result;
+    return toolExecutionResultFromDispatch(dispatched, .{});
 }
 
 fn rebindMcpAuthorityGeneration(
@@ -742,7 +738,6 @@ fn executeWorkspaceToolCallInner(
         dispatch_ctx,
         ctx.tool_registry,
         call,
-        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -751,7 +746,6 @@ fn executeWorkspaceToolCallInner(
     var execution = command_backend.completion orelse
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     return execution;
 }
 
@@ -895,7 +889,6 @@ fn executeRegisteredTool(
         dispatch_ctx,
         registry,
         call,
-        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -918,7 +911,6 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     if (mcp_call_status == .input_required or
         (execution.status == .failure and
             tool_mcp_feature_dispatch.isInputRequiredFailure(execution.model_output)))
@@ -980,7 +972,6 @@ fn executeRunCommandBackend(
 
 const DispatchMetadata = struct {
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
-    status_detail: ?[]u8 = null,
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
@@ -1012,7 +1003,6 @@ fn toolExecutionResultFromDispatch(
         .success => .{
             .model_content_kind = metadata.model_content_kind,
             .model_output = result.body,
-            .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
@@ -1023,7 +1013,6 @@ fn toolExecutionResultFromDispatch(
         .failure => .{
             .status = .failure,
             .model_output = result.body,
-            .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
@@ -2321,7 +2310,6 @@ const test_captured_shell = blk: {
     tool.call = callTestCapturedShell;
     tool.captured_command_fn = null;
     tool.process_local_fn = null;
-    tool.authorized_result_mapper = null;
     tool.reads_only_fn = testCapturedShellFalse;
     tool.irreversible_fn = testCapturedShellFalse;
     break :blk tool;

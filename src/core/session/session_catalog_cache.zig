@@ -22,9 +22,9 @@ const summary_codec = @import("session_summary_codec.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-// v5 drops the legacy ranking rows: every row, including stale schema-v3
-// projections, is one fingerprint-bound listing observation.
-const magic = "fx-resume-catalog-v5\n";
+// v6 stores the disposable row payload in a bounded binary encoding. Every
+// older format remains a cache miss and is rebuilt from canonical sessions.
+const magic = "fx-resume-catalog-v6\n";
 const file_name = ".resume-catalog";
 const max_bytes = 64 * 1024 * 1024;
 const max_records = 100_000;
@@ -89,10 +89,14 @@ const Summary = struct {
     /// that session without caching it.
     fn persistable(self: Summary) bool {
         if (self.created_at_ms < 0 or self.updated_at_ms < self.created_at_ms) return false;
+        if (!std.unicode.utf8ValidateSlice(self.language)) return false;
         _ = session.ConversationLanguage.fromSlice(self.language) catch return false;
         if (std.math.cast(usize, self.history_len) == null) return false;
+        for ([_]?[]const u8{ self.workspace_root, self.origin_workspace_root, self.title, self.preview }) |optional| {
+            if (optional) |value| if (!std.unicode.utf8ValidateSlice(value)) return false;
+        }
         if (self.title) |title| {
-            if (title.len > session_codec.max_session_title_bytes or !std.unicode.utf8ValidateSlice(title)) return false;
+            if (title.len > session_codec.max_session_title_bytes) return false;
         }
         for ([_]?[]const u8{ self.workspace_root, self.origin_workspace_root }) |root| {
             const path = root orelse continue;
@@ -121,7 +125,7 @@ const Summary = struct {
 
 const Row = struct {
     id: []const u8,
-    fingerprint: []const u8,
+    fingerprint: Fingerprint,
     value: union(enum) {
         visible: Summary,
         excluded: void,
@@ -131,12 +135,12 @@ const Row = struct {
 /// Owns parsed cache bytes. Reused entries are separately owned by the caller.
 pub const Loaded = struct {
     bytes: ?[]u8 = null,
-    parsed: ?std.json.Parsed([]Row) = null,
+    parsed: ?[]Row = null,
     index: std.StringHashMapUnmanaged(usize) = .empty,
 
     pub fn deinit(self: *Loaded, alloc: Allocator) void {
         self.index.deinit(alloc);
-        if (self.parsed) |*parsed| parsed.deinit();
+        if (self.parsed) |rows| alloc.free(rows);
         if (self.bytes) |bytes| alloc.free(bytes);
         self.* = .{};
     }
@@ -180,34 +184,28 @@ pub const Loaded = struct {
             if (read != end - offset) return error.InvalidCatalogCache;
             offset = end;
         }
-        if (bytes.len < magic.len + Sha256.digest_length or !std.mem.startsWith(u8, bytes, magic)) return error.InvalidCatalogCache;
+        if (bytes.len < magic.len + Sha256.digest_length + @sizeOf(u32) or !std.mem.startsWith(u8, bytes, magic)) return error.InvalidCatalogCache;
         const payload = bytes[magic.len + Sha256.digest_length ..];
         var digest: Fingerprint = undefined;
         Sha256.hash(payload, &digest, .{});
         if (!std.mem.eql(u8, &digest, bytes[magic.len..][0..Sha256.digest_length])) return error.InvalidCatalogCache;
-        const parsed = try std.json.parseFromSlice([]Row, alloc, payload, .{ .allocate = .alloc_if_needed, .ignore_unknown_fields = false, .max_value_len = max_bytes });
-        errdefer parsed.deinit();
-        if (parsed.value.len > max_records) return error.InvalidCatalogCache;
+        const rows = try decodeRows(alloc, payload, cancelled);
+        errdefer alloc.free(rows);
         var index: std.StringHashMapUnmanaged(usize) = .empty;
         errdefer index.deinit(alloc);
-        try index.ensureTotalCapacity(alloc, @intCast(parsed.value.len));
-        for (parsed.value, 0..) |row, i| {
+        try index.ensureTotalCapacity(alloc, @intCast(rows.len));
+        for (rows, 0..) |row, i| {
             if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
-            try session_layout.validateSessionId(row.id);
-            if (row.fingerprint.len != 64) return error.InvalidCatalogCache;
-            var fingerprint_bytes: Fingerprint = undefined;
-            _ = std.fmt.hexToBytes(&fingerprint_bytes, row.fingerprint) catch return error.InvalidCatalogCache;
-            if (row.value == .visible and !row.value.visible.persistable()) return error.InvalidCatalogCache;
             const entry = index.getOrPutAssumeCapacity(row.id);
             if (entry.found_existing) return error.InvalidCatalogCache;
             entry.value_ptr.* = i;
         }
-        return .{ .bytes = bytes, .parsed = parsed, .index = index };
+        return .{ .bytes = bytes, .parsed = rows, .index = index };
     }
 
     fn reuse(self: *const Loaded, alloc: Allocator, id: []const u8, fingerprint_value: Fingerprint) !?Entry {
         const position = self.index.get(id) orelse return null;
-        const row = self.parsed.?.value[position];
+        const row = self.parsed.?[position];
         if (!matches(row, fingerprint_value)) return null;
         return try cloneRow(alloc, row, fingerprint_value);
     }
@@ -222,8 +220,8 @@ pub const Loaded = struct {
             for (summaries.items) |*summary| summary.deinit(alloc);
             summaries.deinit(alloc);
         }
-        const parsed = self.parsed orelse return summaries;
-        for (parsed.value) |row| {
+        const rows = self.parsed orelse return summaries;
+        for (rows) |row| {
             const summary = switch (row.value) {
                 .visible => |*value| value,
                 .excluded => continue,
@@ -237,8 +235,7 @@ pub const Loaded = struct {
     }
 
     fn matches(row: Row, value: Fingerprint) bool {
-        const hex = std.fmt.bytesToHex(value, .lower);
-        return std.mem.eql(u8, row.fingerprint, &hex);
+        return std.mem.eql(u8, &row.fingerprint, &value);
     }
 
     fn cloneRow(alloc: Allocator, row: Row, value: Fingerprint) !Entry {
@@ -273,25 +270,24 @@ pub const Writer = struct {
         defer replaced.deinit(alloc);
         var payload: std.Io.Writer.Allocating = .init(alloc);
         defer payload.deinit();
-        payload.writer.writeByte('[') catch return error.OutOfMemory;
+        writeInt(&payload.writer, u32, 0) catch return error.OutOfMemory;
         var written: usize = 0;
         for (entries) |*entry| {
             if (cancelled.load(.acquire)) return error.Cancelled;
             const value = entry.fingerprint orelse continue;
             try replaced.put(alloc, entry.id(), {});
-            const hex = std.fmt.bytesToHex(value, .lower);
-            try writeRow(&payload, &written, .{ .id = entry.id(), .fingerprint = &hex, .value = switch (entry.value) {
+            try writeRow(&payload, &written, .{ .id = entry.id(), .fingerprint = value, .value = switch (entry.value) {
                 .visible => |*summary| .{ .visible = Summary.from(summary) },
                 .excluded => .excluded,
             } });
         }
-        if (previous.parsed) |parsed| for (parsed.value) |row| {
+        if (previous.parsed) |rows| for (rows) |row| {
             if (cancelled.load(.acquire)) return error.Cancelled;
             if (replaced.contains(row.id)) continue;
             const current = fingerprint(self.dir.dir, row.id) catch null;
             if (current) |stamp| if (Loaded.matches(row, stamp)) try writeRow(&payload, &written, row);
         };
-        payload.writer.writeByte(']') catch return error.OutOfMemory;
+        std.mem.writeInt(u32, payload.written()[0..@sizeOf(u32)], @intCast(written), .little);
         if (cancelled.load(.acquire)) return error.Cancelled;
         var digest: Fingerprint = undefined;
         Sha256.hash(payload.written(), &digest, .{});
@@ -306,11 +302,131 @@ pub const Writer = struct {
 
 fn writeRow(payload: *std.Io.Writer.Allocating, written: *usize, row: Row) !void {
     if (written.* == max_records) return error.CatalogCacheTooLarge;
-    if (written.* != 0) payload.writer.writeByte(',') catch return error.OutOfMemory;
-    // This writer is memory-only: WriteFailed means allocation exhaustion.
-    std.json.Stringify.value(row, .{}, &payload.writer) catch return error.OutOfMemory;
+    writeString(&payload.writer, row.id) catch return error.OutOfMemory;
+    payload.writer.writeAll(&row.fingerprint) catch return error.OutOfMemory;
+    switch (row.value) {
+        .excluded => payload.writer.writeByte(0) catch return error.OutOfMemory,
+        .visible => |summary| {
+            payload.writer.writeByte(1) catch return error.OutOfMemory;
+            var flags: u8 = 0;
+            if (summary.display_metadata_present) flags |= 1 << 0;
+            if (summary.has_checkpoint) flags |= 1 << 1;
+            if (summary.has_managed_children) flags |= 1 << 2;
+            payload.writer.writeByte(flags) catch return error.OutOfMemory;
+            writeInt(&payload.writer, i64, summary.created_at_ms) catch return error.OutOfMemory;
+            writeInt(&payload.writer, i64, summary.updated_at_ms) catch return error.OutOfMemory;
+            writeInt(&payload.writer, u64, summary.history_len) catch return error.OutOfMemory;
+            writeOptionalString(&payload.writer, summary.workspace_root) catch return error.OutOfMemory;
+            writeOptionalString(&payload.writer, summary.origin_workspace_root) catch return error.OutOfMemory;
+            writeOptionalString(&payload.writer, summary.title) catch return error.OutOfMemory;
+            writeOptionalString(&payload.writer, summary.preview) catch return error.OutOfMemory;
+            writeString(&payload.writer, summary.language) catch return error.OutOfMemory;
+        },
+    }
     written.* += 1;
-    if (payload.written().len > max_bytes - magic.len - Sha256.digest_length - 1) return error.CatalogCacheTooLarge;
+    if (payload.written().len > max_bytes - magic.len - Sha256.digest_length) return error.CatalogCacheTooLarge;
+}
+
+fn decodeRows(
+    alloc: Allocator,
+    payload: []const u8,
+    cancelled: ?*const std.atomic.Value(bool),
+) ![]Row {
+    var cursor = ByteCursor{ .bytes = payload };
+    const count = try cursor.readInt(u32);
+    if (count > max_records) return error.InvalidCatalogCache;
+    const rows = try alloc.alloc(Row, count);
+    errdefer alloc.free(rows);
+    for (rows) |*row| {
+        if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
+        const id = try cursor.readString();
+        session_layout.validateSessionId(id) catch return error.InvalidCatalogCache;
+        const raw_fingerprint = try cursor.take(@sizeOf(Fingerprint));
+        const fingerprint_value: Fingerprint = raw_fingerprint[0..@sizeOf(Fingerprint)].*;
+        const value: @FieldType(Row, "value") = switch (try cursor.readByte()) {
+            0 => .excluded,
+            1 => visible: {
+                const flags = try cursor.readByte();
+                if (flags & ~@as(u8, 0b111) != 0) return error.InvalidCatalogCache;
+                const summary = Summary{
+                    .display_metadata_present = flags & (1 << 0) != 0,
+                    .has_checkpoint = flags & (1 << 1) != 0,
+                    .has_managed_children = flags & (1 << 2) != 0,
+                    .created_at_ms = try cursor.readInt(i64),
+                    .updated_at_ms = try cursor.readInt(i64),
+                    .history_len = try cursor.readInt(u64),
+                    .workspace_root = try cursor.readOptionalString(),
+                    .origin_workspace_root = try cursor.readOptionalString(),
+                    .title = try cursor.readOptionalString(),
+                    .preview = try cursor.readOptionalString(),
+                    .language = try cursor.readString(),
+                };
+                if (!summary.persistable()) return error.InvalidCatalogCache;
+                break :visible .{ .visible = summary };
+            },
+            else => return error.InvalidCatalogCache,
+        };
+        row.* = .{ .id = id, .fingerprint = fingerprint_value, .value = value };
+    }
+    if (!cursor.done()) return error.InvalidCatalogCache;
+    return rows;
+}
+
+const ByteCursor = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+
+    fn take(self: *ByteCursor, len: usize) ![]const u8 {
+        const end = std.math.add(usize, self.offset, len) catch
+            return error.InvalidCatalogCache;
+        if (end > self.bytes.len) return error.InvalidCatalogCache;
+        const result = self.bytes[self.offset..end];
+        self.offset = end;
+        return result;
+    }
+
+    fn readByte(self: *ByteCursor) !u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn readInt(self: *ByteCursor, comptime T: type) !T {
+        const raw = try self.take(@sizeOf(T));
+        return std.mem.readInt(T, raw[0..@sizeOf(T)], .little);
+    }
+
+    fn readString(self: *ByteCursor) ![]const u8 {
+        return self.take(try self.readInt(u32));
+    }
+
+    fn readOptionalString(self: *ByteCursor) !?[]const u8 {
+        const len = try self.readInt(u32);
+        if (len == std.math.maxInt(u32)) return null;
+        return @as(?[]const u8, try self.take(len));
+    }
+
+    fn done(self: ByteCursor) bool {
+        return self.offset == self.bytes.len;
+    }
+};
+
+fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .little);
+    try writer.writeAll(&bytes);
+}
+
+fn writeString(writer: *std.Io.Writer, value: []const u8) !void {
+    const len = std.math.cast(u32, value.len) orelse return error.CatalogCacheTooLarge;
+    try writeInt(writer, u32, len);
+    try writer.writeAll(value);
+}
+
+fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    if (value) |bytes| {
+        try writeString(writer, bytes);
+    } else {
+        try writeInt(writer, u32, std.math.maxInt(u32));
+    }
 }
 
 /// Reports whether a persisted catalog exists, without parsing it. Callers use
@@ -1001,7 +1117,7 @@ test "catalog older versions cancellation and bounds are misses" {
     defer file.close(std.testing.io);
     // Every earlier format, including v4 files that still carry legacy
     // ranking rows, is ignored and rebuilt rather than partially trusted.
-    for ([_][]const u8{ "1", "2", "3", "4" }) |version| {
+    for ([_][]const u8{ "1", "2", "3", "4", "5" }) |version| {
         try file.writePositionalAll(std.testing.io, version, "fx-resume-catalog-v".len);
         var old_version = try Loaded.load(alloc, writer.dir, null);
         defer old_version.deinit(alloc);
@@ -1010,10 +1126,10 @@ test "catalog older versions cancellation and bounds are misses" {
     var payload: std.Io.Writer.Allocating = .init(alloc);
     defer payload.deinit();
     var written: usize = max_records;
-    try std.testing.expectError(error.CatalogCacheTooLarge, writeRow(&payload, &written, .{ .id = "id", .fingerprint = "", .value = .excluded }));
+    try std.testing.expectError(error.CatalogCacheTooLarge, writeRow(&payload, &written, .{ .id = "id", .fingerprint = @splat(0), .value = .excluded }));
 }
 
-test "catalog rows rejected when a v4 legacy ranking payload is relabelled v5" {
+test "catalog rows reject a v5 JSON payload relabelled v6" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

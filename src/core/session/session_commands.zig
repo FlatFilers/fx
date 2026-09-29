@@ -155,6 +155,7 @@ fn postCommitResolutionError(
             .retired_skill_match_fuzzy => return error.InvalidSettingsFormat,
             .invalid_context_limits => return error.InvalidSettingsFormat,
             .invalid_additional_directories => return error.InvalidSettingsFormat,
+            .invalid_skill_symlink_authorities => return error.InvalidSettingsFormat,
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,

@@ -158,12 +158,15 @@ pub fn highlight(
                     try appendStyled(alloc, &styled, style, token, base);
                     styled_word = true;
                 }
-            } else if (!after_separator and inList(token, profile.keywords, profile.keyword_case)) {
-                try appendStyled(alloc, &styled, palette.keyword_style, token, base);
-                styled_word = true;
-            } else if (!after_separator and inList(token, profile.literals, profile.keyword_case)) {
-                try appendStyled(alloc, &styled, palette.number_style, token, base);
-                styled_word = true;
+            } else if (!after_separator and (profile.keywords.len > 0 or profile.literals.len > 0)) {
+                const token_hash = languages.packedWordHash(token);
+                if (inPackedList(token, token_hash, profile.keywords, profile.keyword_case)) {
+                    try appendStyled(alloc, &styled, palette.keyword_style, token, base);
+                    styled_word = true;
+                } else if (inPackedList(token, token_hash, profile.literals, profile.keyword_case)) {
+                    try appendStyled(alloc, &styled, palette.number_style, token, base);
+                    styled_word = true;
+                }
             }
             if (!styled_word) try styled.appendSlice(alloc, token);
             // Control keywords are followed by the command they govern; an
@@ -418,6 +421,27 @@ fn inList(token: []const u8, options: []const []const u8, keyword_case: language
             .ascii_insensitive => std.ascii.eqlIgnoreCase(token, option),
         };
         if (matches) return true;
+    }
+    return false;
+}
+
+fn inPackedList(token: []const u8, target_hash: u32, options: []const u8, keyword_case: languages.KeywordCase) bool {
+    var offset: usize = 0;
+    while (offset < options.len) {
+        const hash = std.mem.readInt(u32, options[offset..][0..@sizeOf(u32)], .little);
+        offset += @sizeOf(u32);
+        const len = options[offset];
+        offset += 1;
+        const end = offset + len;
+        const option = options[offset..end];
+        if (hash == target_hash) {
+            const matches = switch (keyword_case) {
+                .sensitive => std.mem.eql(u8, token, option),
+                .ascii_insensitive => std.ascii.eqlIgnoreCase(token, option),
+            };
+            if (matches) return true;
+        }
+        offset = end;
     }
     return false;
 }

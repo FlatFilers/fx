@@ -354,6 +354,7 @@ pub fn Runtime(comptime App: type) type {
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
                 .provider_override = launch_overrides.provider,
+                .model_override = launch_overrides.model,
             });
             defer startup.deinit(app.alloc);
 

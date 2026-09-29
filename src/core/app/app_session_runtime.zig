@@ -58,6 +58,7 @@ const types = @import("../shared/types.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
+const operation_control = @import("../mcp/operation_control.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
@@ -68,6 +69,8 @@ const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
+const live_session_handoff_timeout_ms: u64 = 2_000;
+const live_session_worker_cancel_timeout_ms: u64 = 5_000;
 
 const RecoveryAutoContinue = enum {
     auto_continue,
@@ -113,6 +116,20 @@ const LiveSessionTransitionDecision = struct {
     action: LiveSessionTransitionAction,
 };
 
+const LiveSessionWait = union(enum) {
+    worker: u64,
+    geometry: u64,
+};
+
+const LiveSessionTimeout = enum { worker, geometry };
+
+fn liveSessionWaitTimeout(wait: LiveSessionWait, processing: bool, now_ms: u64) ?LiveSessionTimeout {
+    return switch (wait) {
+        .worker => |started| if (processing and now_ms -| started >= live_session_worker_cancel_timeout_ms) .worker else null,
+        .geometry => |started| if (!processing and now_ms -| started >= live_session_handoff_timeout_ms) .geometry else null,
+    };
+}
+
 fn decideLiveSessionTransition(
     cooperative: bool,
     processing: bool,
@@ -151,6 +168,15 @@ fn decideLiveSessionTransition(
                 .action = .none,
             },
     };
+}
+
+test "session wait deadlines distinguish worker cancellation from stalled geometry" {
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, null), liveSessionWaitTimeout(.{ .worker = 1_000 }, true, 5_999));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, .worker), liveSessionWaitTimeout(.{ .worker = 1_000 }, true, 6_000));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, null), liveSessionWaitTimeout(.{ .worker = 1_000 }, false, 10_000));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, null), liveSessionWaitTimeout(.{ .geometry = 1_000 }, true, 10_000));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, null), liveSessionWaitTimeout(.{ .geometry = 1_000 }, false, 2_999));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, .geometry), liveSessionWaitTimeout(.{ .geometry = 1_000 }, false, 3_000));
 }
 
 test "live session transition decision defers only active cooperative requests" {
@@ -1234,13 +1260,14 @@ pub const Persistence = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
+    pending_live_session_wait: ?LiveSessionWait = null,
     shutdown_failure: ?anyerror = null,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 24) {
+            if (std.meta.fields(Persistence).len != 25) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1268,6 +1295,7 @@ pub const Persistence = struct {
         storage.image_snapshot_temp_dir = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
+        storage.pending_live_session_wait = null;
         storage.shutdown_failure = null;
     }
 
@@ -1554,13 +1582,25 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             background_policy: BackgroundSessionPolicy,
         ) !void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "holdSessionTransition")) {
+                app.worker.holdSessionTransition();
+            }
+            errdefer {
+                app.session_persistence.pending_live_session_wait = null;
+                releaseLiveSessionTransitionHold(app);
+            }
             const previous_policy = app.session_persistence.pending_live_session_policy;
+            const processing = app.worker.isProcessing();
             const decision = decideLiveSessionTransition(
                 runtime_profile.allows(App, .cooperative_agent),
-                app.worker.isProcessing(),
+                processing,
                 previous_policy,
                 .{ .request = background_policy },
             );
+            if (previous_policy == null) {
+                const now = operation_control.monotonicMillis(io_mod.getIo());
+                app.session_persistence.pending_live_session_wait = if (processing) .{ .worker = now } else .{ .geometry = now };
+            }
             if (previous_policy) |previous| {
                 if (decision.pending_policy) |next| {
                     if (previous != next) {
@@ -1574,24 +1614,136 @@ pub fn Runtime(comptime App: type) type {
             }
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
-                .apply_now => |policy| try applyLiveSessionTransition(app, policy),
-                .cancel_and_defer => beginLiveSessionCancellation(app),
-                .none => {},
+                .apply_now => |policy| {
+                    if (!freshSessionResizeReady(app)) {
+                        app.session_persistence.pending_live_session_policy = policy;
+                        if (processing) app.worker.requestCancel();
+                        debug_trace.logf("session", "event=live_session_transition_deferred reason=resize_pending", .{});
+                        return;
+                    }
+                    applyLiveSessionTransition(app, policy) catch |err| {
+                        if (handleScrollbackHandoffError(app, policy, err)) return;
+                        return err;
+                    };
+                },
+                .cancel_and_defer => app.worker.requestCancel(),
+                .none => if (decision.pending_policy == null) {
+                    app.session_persistence.pending_live_session_wait = null;
+                    releaseLiveSessionTransitionHold(app);
+                },
                 .apply_pending => unreachable,
             }
         }
 
+        fn freshSessionResizeReady(app: *App) bool {
+            if (comptime @hasField(@TypeOf(app.shell), "has_committed_frame")) {
+                if (!app.shell.has_committed_frame) return true;
+            }
+            if (comptime @hasDecl(App, "admitPendingResizeSignal")) {
+                _ = app.admitPendingResizeSignal("session_handoff");
+            }
+            if (!shell_runtime.resizeLifecycleIdle(&app.shell)) return false;
+            if (comptime !host_target.is_wasm and @hasField(App, "terminal")) {
+                const actual = app.terminal.queryLayout(app.shell.layout.rows -| app.shell.layout.content_bottom) catch return false;
+                if (actual.cols != app.shell.layout.cols or actual.rows != app.shell.layout.rows) return false;
+            }
+            return true;
+        }
+
+        fn handleScrollbackHandoffError(app: *App, policy: BackgroundSessionPolicy, err: anyerror) bool {
+            switch (err) {
+                error.SessionScrollbackHandoffUnavailable,
+                error.SessionScrollbackHandoffIncomplete,
+                => {
+                    app.session_persistence.pending_live_session_policy = policy;
+                    debug_trace.logf("session", "event=live_session_transition_deferred reason=scrollback_handoff err={s}", .{@errorName(err)});
+                    return true;
+                },
+                error.SessionScrollbackHandoffGeometryChanged => {
+                    app.session_persistence.pending_live_session_policy = null;
+                    app.session_persistence.pending_live_session_wait = null;
+                    app.shell.cancelSessionScrollbackHandoff();
+                    releaseLiveSessionTransitionHold(app);
+                    debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
+                    if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        app.writeDomainNotice(.{
+                            .topic = "session",
+                            .tone = .warning,
+                            .body = "Session change cancelled after a terminal resize. The old session was kept; an active turn may have been cancelled. Retry the command.",
+                        }, true) catch |notice_err| {
+                            debug_trace.logf("session", "event=transition_cancel_notice_dropped err={s}", .{@errorName(notice_err)});
+                        };
+                    }
+                    return true;
+                },
+                else => return false,
+            }
+        }
+
+        pub fn cancelPendingLiveSessionForInputLimit(app: *App) !void {
+            try cancelPendingLiveSessionForInput(app, "deferred_input_limit", "Session change cancelled because input arrived faster than it could finish. Your input is still being delivered to the old session; retry the command.");
+        }
+
+        pub fn cancelPendingLiveSessionForTimeout(app: *App) !void {
+            try cancelPendingLiveSessionForInput(app, "resize_timeout", "Session change cancelled because the terminal resize did not settle. Continuing in the old session; retry the command.");
+        }
+
+        fn cancelPendingLiveSessionForWorkerTimeout(app: *App) !void {
+            try cancelPendingLiveSessionForInput(app, "worker_timeout", "Session change cancelled because the active turn did not stop. Continuing in the old session; retry the command.");
+        }
+
+        fn cancelPendingLiveSessionForInput(app: *App, reason: []const u8, notice: []const u8) !void {
+            if (app.session_persistence.pending_live_session_policy == null) return;
+            app.session_persistence.pending_live_session_policy = null;
+            app.session_persistence.pending_live_session_wait = null;
+            app.shell.cancelSessionScrollbackHandoff();
+            releaseLiveSessionTransitionHold(app);
+            debug_trace.logf("session", "event=live_session_transition_cancelled reason={s}", .{reason});
+            try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = notice }, true);
+        }
+
         pub fn settlePendingLiveSessionTransition(app: *App) !void {
+            if (app.session_persistence.pending_live_session_policy == null) return;
+            const processing = app.worker.isProcessing();
+            const now = operation_control.monotonicMillis(io_mod.getIo());
+            var wait = app.session_persistence.pending_live_session_wait orelse if (processing) LiveSessionWait{ .worker = now } else LiveSessionWait{ .geometry = now };
+            if (wait == .worker and !processing) wait = .{ .geometry = now };
+            app.session_persistence.pending_live_session_wait = wait;
+            if (liveSessionWaitTimeout(wait, processing, now)) |timeout| {
+                switch (timeout) {
+                    .worker => try cancelPendingLiveSessionForWorkerTimeout(app),
+                    .geometry => try cancelPendingLiveSessionForTimeout(app),
+                }
+                return;
+            }
+            errdefer {
+                app.session_persistence.pending_live_session_wait = null;
+                releaseLiveSessionTransitionHold(app);
+            }
             const decision = decideLiveSessionTransition(
                 runtime_profile.allows(App, .cooperative_agent),
-                app.worker.isProcessing(),
+                processing,
                 app.session_persistence.pending_live_session_policy,
                 .settle,
             );
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
                 .apply_pending => |policy| {
-                    applyIdleLiveSessionTransition(app, policy);
+                    if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
+                        if (app.shell.sessionScrollbackHandoffPending()) {
+                            if (comptime @hasDecl(App, "admitPendingResizeSignal")) {
+                                _ = app.admitPendingResizeSignal("session_handoff");
+                            }
+                            if (!shell_runtime.resizeLifecycleIdle(&app.shell)) {
+                                _ = handleScrollbackHandoffError(app, policy, error.SessionScrollbackHandoffGeometryChanged);
+                                return;
+                            }
+                        }
+                    }
+                    applyIdleLiveSessionTransition(app, policy, true) catch |err| {
+                        if (handleScrollbackHandoffError(app, policy, err)) return;
+                        return err;
+                    };
                     try installFreshLiveSession(app);
                 },
                 .none => {},
@@ -1603,18 +1755,43 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             background_policy: BackgroundSessionPolicy,
         ) !void {
-            try prepareLiveSessionTransition(app, background_policy);
+            try prepareLiveSessionTransition(app, background_policy, true);
             try installFreshLiveSession(app);
         }
 
         fn installFreshLiveSession(app: *App) !void {
+            defer {
+                app.session_persistence.pending_live_session_wait = null;
+                releaseLiveSessionTransitionHold(app);
+            }
             try beginFreshPersistedSession(app);
             enableSessionStores(app);
             try finishLiveSessionTransition(app);
         }
 
+        fn releaseLiveSessionTransitionHold(app: *App) void {
+            if (comptime @hasField(App, "terminal_input_runtime")) {
+                if (comptime @hasDecl(@TypeOf(app.terminal_input_runtime), "hasDeferredSessionInput") and
+                    @hasDecl(@TypeOf(app.terminal_input_runtime), "allowCurrentDeferredSessionInputForReplay"))
+                {
+                    if (app.terminal_input_runtime.hasDeferredSessionInput()) {
+                        app.terminal_input_runtime.allowCurrentDeferredSessionInputForReplay();
+                        return;
+                    }
+                }
+            }
+            if (comptime @hasDecl(@TypeOf(app.worker), "releaseSessionTransitionHold")) {
+                app.worker.releaseSessionTransitionHold();
+            }
+        }
+
+        pub fn finishDeferredSessionInputReplay(app: *App) void {
+            if (app.session_persistence.pending_live_session_policy != null) return;
+            releaseLiveSessionTransitionHold(app);
+        }
+
         pub fn prepareLiveSessionResume(app: *App) !void {
-            try prepareLiveSessionTransition(app, .stop_forget);
+            try prepareLiveSessionTransition(app, .stop_forget, false);
         }
 
         pub fn finishLiveSessionResume(app: *App) !void {
@@ -1625,10 +1802,15 @@ pub fn Runtime(comptime App: type) type {
         fn prepareLiveSessionTransition(
             app: *App,
             background_policy: BackgroundSessionPolicy,
+            preserve_scrollback: bool,
         ) !void {
-            beginLiveSessionCancellation(app);
+            if (preserve_scrollback) {
+                app.worker.requestCancel();
+            } else {
+                beginLiveSessionCancellation(app);
+            }
             app.worker.waitUntilIdle();
-            applyIdleLiveSessionTransition(app, background_policy);
+            try applyIdleLiveSessionTransition(app, background_policy, preserve_scrollback);
         }
 
         fn beginLiveSessionCancellation(app: *App) void {
@@ -1655,7 +1837,18 @@ pub fn Runtime(comptime App: type) type {
         fn applyIdleLiveSessionTransition(
             app: *App,
             background_policy: BackgroundSessionPolicy,
-        ) void {
+            preserve_scrollback: bool,
+        ) !void {
+            if (preserve_scrollback) {
+                if (comptime @hasField(App, "terminal")) {
+                    if (comptime @hasField(@TypeOf(app.terminal), "alternate_screen_owner")) {
+                        if (app.terminal.alternate_screen_owner != .none) return error.SessionScrollbackHandoffUnavailable;
+                    }
+                }
+                if (!freshSessionResizeReady(app)) return error.SessionScrollbackHandoffUnavailable;
+                try app.shell.commitVisibleTranscriptBeforeFreshSession(app.alloc, &app.metrics);
+                beginLiveSessionCancellation(app);
+            }
             retireLiveSessionCompaction(app);
             clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);

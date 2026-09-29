@@ -3290,9 +3290,9 @@ fn reconstructEngine(
         checkpoint_reason,
     );
     defer checkpoint.deinit(alloc);
-    if (checkpoint.envelope.engine_schema_revision !=
-        terminal_engine.checkpoint_schema_revision)
-    {
+    if (!terminal_engine.supportsCheckpointRevision(
+        checkpoint.envelope.engine_schema_revision,
+    )) {
         return replayFromStart(
             alloc,
             durable,
@@ -5210,6 +5210,22 @@ test "resize recovery never reflows raw output at final dimensions" {
     row.clearRetainingCapacity();
     try session.engine.rowTextTrimmed(1, &row);
     try std.testing.expectEqualStrings("abcd", row.items);
+
+    const legacy_payload = try alloc.dupe(u8, live_payload);
+    defer alloc.free(legacy_payload);
+    std.mem.writeInt(u16, legacy_payload[4..6], terminal_engine.checkpoint_schema_revision - 1, .little);
+    try session.durable.store_checkpoint(.{
+        .engine_schema_revision = terminal_engine.checkpoint_schema_revision - 1,
+        .applied_cursor = session.durable.output_cursor(),
+        .payload_len = @intCast(legacy_payload.len),
+        .checksum = contracts.checkpoint_checksum(legacy_payload),
+    }, legacy_payload, 5);
+    try std.testing.expect(!session.durable.record.raw_replay_exact);
+    var legacy_recovered = try reconstructEngine(alloc, &session.durable);
+    defer legacy_recovered.deinit();
+    const legacy_recovered_payload = try legacy_recovered.checkpointPayload(alloc);
+    defer alloc.free(legacy_recovered_payload);
+    try std.testing.expectEqualSlices(u8, live_payload, legacy_recovered_payload);
 
     try session.durable.store_checkpoint(.{
         .engine_schema_revision = terminal_engine.checkpoint_schema_revision + 1,

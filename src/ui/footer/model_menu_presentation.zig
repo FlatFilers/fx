@@ -397,6 +397,7 @@ fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16
 
 fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
     if (retryableFailureText(state.failure)) |text| return text;
+    if (state.from_profile_settings) return "Models from profile settings; explicit model IDs do not require catalog discovery.";
     if (state.private_models_hidden) {
         const reason = state.public_only_reason orelse return "Using the public model catalog.";
         return switch (reason) {
@@ -678,6 +679,32 @@ test "model menu places catalog note after an item gap and preserves the heading
     try std.testing.expect(std.mem.find(u8, status.items, "Note: Gateway catalog is authenticated with an API key") != null);
 }
 
+test "configured model menu identifies profile settings without Gateway sign-in" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("qwen2.5:0.5b"), .provider = "", .capabilities = .{} },
+    };
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+        .catalog_state = .{
+            .access_level = .public_only,
+            .public_only_reason = .no_credential,
+            .private_models_hidden = true,
+            .from_profile_settings = true,
+        },
+    };
+    const rows = menuRowCount(projection, 120, 10);
+    try std.testing.expectEqual(@as(u16, 5), rows);
+
+    var status = try composeModelMenuRow(alloc, projection, rows - 1, 120, rows);
+    defer status.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, status.items, "Models from profile settings; explicit model IDs do not require catalog discovery.") != null);
+    try std.testing.expect(std.mem.find(u8, status.items, "public model catalog") == null);
+    try std.testing.expect(std.mem.find(u8, status.items, "sign in") == null);
+}
+
 test "model menu status follows provenance and retryable failure precedence" {
     try std.testing.expectEqualStrings(
         "Gateway catalog: authenticated with fx login.",
@@ -693,6 +720,8 @@ test "model menu status follows provenance and retryable failure precedence" {
         .{ .state = .{ .public_only_reason = .fx_login_refresh_required, .private_models_hidden = true }, .expected = "Vercel sign-in must refresh before team-private models can load." },
         .{ .state = .{ .public_only_reason = .credential_refresh_failed, .private_models_hidden = true }, .expected = "Vercel sign-in refresh failed; using the public model catalog." },
         .{ .state = .{ .public_only_reason = .authenticated_credential_rejected, .private_models_hidden = true }, .expected = "Your Gateway credential was rejected; using the public model catalog." },
+        .{ .state = .{ .public_only_reason = .chatgpt_subscription, .private_models_hidden = true }, .expected = "Codex models require an authenticated Codex catalog." },
+        .{ .state = .{ .public_only_reason = .grok_subscription, .private_models_hidden = true }, .expected = "Grok models require an authenticated Grok catalog." },
         .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; retry /model." },
         .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /model." },
         .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /model." },

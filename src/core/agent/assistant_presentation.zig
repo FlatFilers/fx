@@ -985,22 +985,103 @@ test "angle email autolink applies the destination cap including mailto" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
 }
 
-test "bare URL remains literal in code and excluded boundaries" {
+test "standalone URL in code is linked while excluded boundaries stay literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
+    const id_before = link_id_counter;
     try processor.push(
         alloc,
         "`https://code.example` wordhttps://word.example <<https://angle.example>>\n",
         &out,
     );
-    try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mhttps://code.example\x1b[39m wordhttps://word.example <<https://angle.example>>\n",
-        out.items,
+    var expected_buf: [512]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "\x1b[38;5;245m\x1b]8;id=fx-{d};https://code.example\x1b\\https://code.example\x1b]8;;\x1b\\\x1b[39m wordhttps://word.example <<https://angle.example>>\n",
+        .{id_before},
     );
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "inline code URLs keep literal bytes and trailing punctuation outside links" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const id_before = link_id_counter;
+    try processor.push(alloc, "See `https://example.com/path_~*.` and `https://example.com/a\\_b`.\n", &out);
+    var expected_buf: [1024]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "See \x1b[38;5;245m\x1b]8;id=fx-{d};https://example.com/path_~*\x1b\\https://example.com/path_~*\x1b]8;;\x1b\\.\x1b[39m and " ++
+            "\x1b[38;5;245m\x1b]8;id=fx-{d};https://example.com/a\\_b\x1b\\https://example.com/a\\_b\x1b]8;;\x1b\\\x1b[39m.\n",
+        .{ id_before, id_before +% 1 },
+    );
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "inline code URLs preserve literal trailing URI punctuation" {
+    const alloc = std.testing.allocator;
+    const urls = [_][]const u8{
+        "https://example.com/a!",
+        "https://example.com/a?",
+        "https://example.com/a;",
+        "https://example.com/a:",
+        "https://example.com/a,",
+    };
+    for (urls) |url| {
+        var processor = MarkdownProcessor{};
+        defer processor.deinit(alloc);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        var input_buf: [128]u8 = undefined;
+        const input = try std.fmt.bufPrint(&input_buf, "Open `{s}`\n", .{url});
+        const id_before = link_id_counter;
+        try processor.push(alloc, input, &out);
+        var expected_buf: [256]u8 = undefined;
+        const expected = try std.fmt.bufPrint(
+            &expected_buf,
+            "Open \x1b[38;5;245m\x1b]8;id=fx-{d};{s}\x1b\\{s}\x1b]8;;\x1b\\\x1b[39m\n",
+            .{ id_before, url, url },
+        );
+        try std.testing.expectEqualStrings(expected, out.items);
+    }
+}
+
+test "non-URL and unsafe inline code stays literal" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "`not a URL`\n",
+        "`curl https://example.com`\n",
+        "`https://example.com more`\n",
+        "`http://`\n",
+        "`https://example.com\x07`\n",
+        "`<https://example.com>`\n",
+    };
+    for (cases) |input| {
+        var processor = MarkdownProcessor{};
+        defer processor.deinit(alloc);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try processor.push(alloc, input, &out);
+        try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
+    }
+
+    var oversized: [max_link_url_bytes + 1]u8 = undefined;
+    @memset(&oversized, 'a');
+    var input_buf: [max_link_url_bytes + 32]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf, "`https://{s}`\n", .{oversized[0..]});
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try processor.push(alloc, input, &out);
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 }
 

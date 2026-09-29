@@ -1836,18 +1836,20 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
                 workspace_root,
                 state.cfg.default_model,
                 state.cfg.default_agent_step_limit,
+                state.cfg.model_override,
             );
             startup.auth_mode = state.cfg.auth_mode;
             return startup;
         }
     }
-    return app_lifecycle.loadStartupStateWithAuthMode(
+    return app_lifecycle.loadStartupStateForRun(
         alloc,
         state.cfg.gateway_provider.oauth_transport,
         state.cfg.secret_store,
         state.cfg.default_model,
         state.cfg.default_agent_step_limit,
         state.cfg.auth_mode,
+        state.cfg.model_override,
     );
 }
 
@@ -1871,10 +1873,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     };
     defer request.deinit(alloc);
 
-    var startup = loadConfiguredStartupState(state, alloc) catch {
+    var startup = loadConfiguredStartupState(state, alloc) catch |err| {
+        const model_message = config_runtime.modelNotSelectedMessage(err);
         return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.internal_error,
-            .message = "Failed to load startup state",
+            .code = if (model_message != null) ErrorCode.invalid_request else ErrorCode.internal_error,
+            .message = model_message orelse "Failed to load startup state",
         });
     };
     defer startup.deinit(alloc);

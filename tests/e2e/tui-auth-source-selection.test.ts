@@ -2222,7 +2222,7 @@ tmuxTest(
     expect(signInScreen).not.toContain("Code   ");
     expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
     const signInEscapes = await session.capturePaneEscapes();
-    expect(signInEscapes).toContain(`\x1b]8;;${chatgptOauth.baseUrl}/oauth/authorize?`);
+    expect(signInEscapes).toContain(`\x1b]8;id=fx-codex-auth;${chatgptOauth.baseUrl}/oauth/authorize?`);
     expect(signInEscapes).toContain("\x1b]8;;\x1b\\");
     await session.sendKeys("C-c");
     await session.waitForComposer(TIMEOUT);
@@ -4109,6 +4109,219 @@ test(
     expect(logout.code).toBe(0);
     expect(logout.stdout).toContain("Signed out of Codex.");
     expect(existsSync(authPath)).toBe(false);
+  },
+  60_000,
+);
+
+function withoutSavedModelEnv(
+  testHome: string,
+  provider: "codex" | "grok",
+  providerEnv: Record<string, string>,
+): Record<string, string | undefined> {
+  return {
+    HOME: testHome,
+    AI_GATEWAY_API_KEY: undefined,
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_SKIP_ONBOARDING: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_NO_OPEN_BROWSER: "1",
+    FX_PROVIDER: provider,
+    FX_MODEL: undefined,
+    ...providerEnv,
+  };
+}
+
+function codexResponseModels(oauth: ReturnType<typeof startFakeChatGptOAuth>): Array<string | undefined> {
+  return oauth.requests
+    .filter((request) => request.path === "/chatgpt/responses")
+    .map((request) => (JSON.parse(request.body ?? "{}") as { model?: string }).model);
+}
+
+test("Codex runs from FX_MODEL or --model without a saved model and saves neither", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-run-model-"));
+  writeSeededChatGptLogin(home);
+  chatgptOauth = startFakeChatGptOAuth();
+  const env = withoutSavedModelEnv(home, "codex", chatgptOauth.env);
+
+  const status = await runFx(["status", "--json"], { env: { ...env, FX_MODEL: "gpt-5.6-luna" }, timeoutMs: TIMEOUT });
+  expect(status.code, `stdout: ${status.stdout}\nstderr: ${status.stderr}`).toBe(0);
+  expect(JSON.parse(status.stdout)).toMatchObject({ model: "gpt-5.6-luna", model_origin: "FX_MODEL" });
+
+  const envAsk = await runFx(["ask", "--json", "--no-save", "Answer directly."], {
+    env: { ...env, FX_MODEL: "gpt-5.6-luna" },
+    timeoutMs: TIMEOUT,
+  });
+  expect(envAsk.code, `stdout: ${envAsk.stdout}\nstderr: ${envAsk.stderr}`).toBe(0);
+  expect(envAsk.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+
+  const flagAsk = await runFx(["ask", "--json", "--no-save", "--model", "gpt-5.4-mini", "Answer directly."], {
+    env,
+    timeoutMs: TIMEOUT,
+  });
+  expect(flagAsk.code, `stdout: ${flagAsk.stdout}\nstderr: ${flagAsk.stderr}`).toBe(0);
+  expect(flagAsk.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+
+  expect(codexResponseModels(chatgptOauth)).toEqual(["gpt-5.6-luna", "gpt-5.4-mini"]);
+  expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
+});
+
+test("Codex without a model explains the fix and fx provider codex saves one", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-codex-missing-model-"));
+  writeSeededChatGptLogin(home);
+  chatgptOauth = startFakeChatGptOAuth();
+  const env = withoutSavedModelEnv(home, "codex", chatgptOauth.env);
+  const guidance = "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL";
+
+  const status = await runFx(["status"], { env, timeoutMs: TIMEOUT });
+  expect(status.code).toBe(1);
+  expect(status.stderr).toBe(`fx: ${guidance}\n`);
+
+  const ask = await runFx(["ask", "--no-save", "Answer directly."], { env, timeoutMs: TIMEOUT });
+  expect(ask.code).toBe(1);
+  expect(ask.stderr).toContain(`fx ask: ${guidance}`);
+
+  const askJson = await runFx(["ask", "--json", "--no-save", "Answer directly."], { env, timeoutMs: TIMEOUT });
+  expect(askJson.code).toBe(1);
+  expect((JSON.parse(askJson.stdout) as { error: string }).error).toBe("CodexModelNotSelected");
+  expect(codexResponseModels(chatgptOauth)).toEqual([]);
+
+  // FX_PROVIDER=codex makes Codex the selected provider, but it has no saved model yet.
+  const repair = await runFx(["provider", "codex"], { env, timeoutMs: TIMEOUT });
+  expect(repair.code, `stdout: ${repair.stdout}\nstderr: ${repair.stderr}`).toBe(0);
+  expect(repair.stdout).not.toContain("already selected");
+  const saved = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+  expect(saved.provider).toBe("codex");
+  expect(saved.models.codex).toBe("gpt-5.6-sol");
+
+  const repaired = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
+  expect(repaired.code, repaired.stderr).toBe(0);
+  expect(JSON.parse(repaired.stdout)).toMatchObject({ model: "gpt-5.6-sol", model_origin: "settings" });
+
+  const again = await runFx(["provider", "codex"], { env, timeoutMs: TIMEOUT });
+  expect(again.code).toBe(0);
+  expect(again.stdout).toContain("Codex is already selected.");
+});
+
+test("Grok runs from FX_MODEL or --model without a saved model and fx provider grok saves one", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-run-model-"));
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    const env = withoutSavedModelEnv(home, "grok", grok.env);
+    const responseModels = () => grok.requests
+      .filter((request) => request.path === "/v1/responses")
+      .map((request) => (JSON.parse(request.body ?? "{}") as { model?: string }).model);
+
+    const missing = await runFx(["status"], { env, timeoutMs: TIMEOUT });
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toBe("fx: no Grok model is selected; run `fx provider grok` to choose one, or set a model for this run with --model or FX_MODEL\n");
+
+    const status = await runFx(["status", "--json"], { env: { ...env, FX_MODEL: "grok-4.6" }, timeoutMs: TIMEOUT });
+    expect(status.code, status.stderr).toBe(0);
+    expect(JSON.parse(status.stdout)).toMatchObject({ model: "grok-4.6", model_origin: "FX_MODEL" });
+
+    const flagAsk = await runFx(["ask", "--json", "--no-save", "--model", "grok-4.6", "Answer directly."], { env, timeoutMs: TIMEOUT });
+    expect(flagAsk.code, `stdout: ${flagAsk.stdout}\nstderr: ${flagAsk.stderr}`).toBe(0);
+    expect(flagAsk.stdout).toContain("GROK_DIRECT_RESPONSE");
+    const envAsk = await runFx(["ask", "--json", "--no-save", "Answer directly."], { env: { ...env, FX_MODEL: "grok-4.20" }, timeoutMs: TIMEOUT });
+    expect(envAsk.code, `stdout: ${envAsk.stdout}\nstderr: ${envAsk.stderr}`).toBe(0);
+    expect(responseModels()).toEqual(["grok-4.6", "grok-4.20"]);
+    expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
+
+    const repair = await runFx(["provider", "grok"], { env, timeoutMs: TIMEOUT });
+    expect(repair.code, `stdout: ${repair.stdout}\nstderr: ${repair.stderr}`).toBe(0);
+    expect(repair.stdout).not.toContain("already selected");
+    const saved = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+    expect(saved.provider).toBe("grok");
+    expect(typeof saved.models.grok).toBe("string");
+    const repaired = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
+    expect(repaired.code, repaired.stderr).toBe(0);
+    expect(JSON.parse(repaired.stdout)).toMatchObject({ model: saved.models.grok, model_origin: "settings" });
+  } finally {
+    grok.stop();
+  }
+});
+
+tmuxTest(
+  "a Codex session started from FX_PROVIDER and FX_MODEL resumes from them alone",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-codex-env-resume-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    writeSeededChatGptLogin(home);
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const workspace = join(home, "workspace");
+    mkdirSync(workspace);
+    const env = { ...withoutSavedModelEnv(home, "codex", chatgptOauth.env), FX_MODEL: "gpt-5.6-luna" };
+
+    const first = await runFx(["ask", "--json", "Answer directly."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(first.code, `stdout: ${first.stdout}\nstderr: ${first.stderr}`).toBe(0);
+    const sessionId = (JSON.parse(first.stdout) as { session_id: string }).session_id;
+    const resumed = await runFx(["ask", "--json", "--resume", sessionId, "Continue."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    expect(resumed.code, `stdout: ${resumed.stdout}\nstderr: ${resumed.stderr}`).toBe(0);
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      { ...chatgptOauth.env, FX_PROVIDER: "codex", FX_MODEL: "gpt-5.6-luna" },
+      workspace,
+      sessionId,
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Continue again.");
+    const deadline = Date.now() + TIMEOUT;
+    while (codexResponseModels(chatgptOauth).length < 3 && Date.now() < deadline) await Bun.sleep(50);
+
+    expect(codexResponseModels(chatgptOauth)).toEqual(["gpt-5.6-luna", "gpt-5.6-luna", "gpt-5.6-luna"]);
+    expect(gateway.requests).toHaveLength(0);
+    const settingsPath = join(home, ".fx", "settings.json");
+    if (existsSync(settingsPath)) {
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).models?.codex).toBeUndefined();
+    }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "interactive --provider codex --model starts without a saved Codex model",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-codex-launch-model-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    writeSeededChatGptLogin(home);
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      { ...chatgptOauth.env, FX_MODEL: undefined },
+      undefined,
+      undefined,
+      ["--provider", "codex", "--model", "gpt-5.6-luna"],
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer directly.");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
+
+    const models = codexResponseModels(chatgptOauth);
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((model) => model === "gpt-5.6-luna")).toBe(true);
+    expect(gateway.requests).toHaveLength(0);
+    const settingsPath = join(home, ".fx", "settings.json");
+    if (existsSync(settingsPath)) {
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).models?.codex).toBeUndefined();
+    }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
 );

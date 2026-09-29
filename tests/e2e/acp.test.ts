@@ -26,6 +26,7 @@ import {
   toolShapesWithoutDescriptions,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
+import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -5777,6 +5778,49 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "image prompts over both the byte and pixel limits are downscaled",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-oversized-");
+      const image = paddedPng(solidPng(3420, 2224), 6_000_000);
+      const gateway = startFakeGateway(
+        [finalText("oversized image prompt complete")],
+        {
+          models: [{
+            id: FAKE_GATEWAY_MODEL,
+            type: "language",
+            tags: ["vision", "file-input", "tool-use"],
+          }],
+        },
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const prompted = await runPromptBlocks(
+          client,
+          [{ type: "image", data: image.toString("base64"), mimeType: "image/png" }],
+          TIMEOUT,
+        );
+        expect(prompted.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const files = acpGatewayRequest(gateway.requests[0]!.body).prompt
+          .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, any>> : [])
+          .filter((part) => part.type === "file");
+        expect(files).toHaveLength(1);
+        expect(files[0]!.mediaType).toBe("image/png");
+        expect(pngPixelSize(Buffer.from(files[0]!.data.data, "base64"))).toEqual({ width: 2000, height: 1301 });
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "image-only prompt publishes and reloads the shared image title",
     async () => {
       const root = createIsolatedRoot("fx-acp-image-only-title-");
@@ -5914,6 +5958,43 @@ describe("acp: model-independent", () => {
       }
     },
     LIVE_TIMEOUT,
+  );
+
+  test(
+    "initialize explains a missing Codex model and acp --model starts without one saved",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-run-model-");
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex();
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        FX_PROVIDER: "codex",
+        FX_MODEL: undefined,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+        FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+      };
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        const refused = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(refused.error?.message).toBe(
+          "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
+        );
+        await client.close();
+
+        client = await AcpClient.create({ cwd: root.workspace, env, args: ["acp", "--model", "gpt-5.4-mini"] });
+        const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(initialized.error).toBeUndefined();
+        expect(initialized.result.protocolVersion).toBe(1);
+        expect(codex.requests).toHaveLength(0);
+      } finally {
+        await client?.close();
+        codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
   );
 
   test(
