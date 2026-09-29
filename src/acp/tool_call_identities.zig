@@ -55,13 +55,14 @@ pub const Record = struct {
         } else if (self.entries.count() >= max_entries) return;
         const bytes = try self.serialize(alloc, name, identity);
         defer alloc.free(bytes);
-        // The record stays within what `load` accepts, so memory and the
-        // stored copy never disagree.
+        // The stored record stays within what `load` accepts.
         if (bytes.len > max_bytes) return error.ToolIdentityRecordFull;
+        if (capability) |target| {
+            var entry = try target.atomicReplace(alloc, .client_context, file_name, bytes);
+            entry.deinit(alloc);
+        }
+        // Memory follows the stored copy, so a failed write changes neither.
         try self.put(alloc, name, identity);
-        const target = capability orelse return;
-        var entry = try target.atomicReplace(alloc, .client_context, file_name, bytes);
-        entry.deinit(alloc);
     }
 
     fn put(self: *Record, alloc: Allocator, name: []const u8, identity: Identity) !void {
