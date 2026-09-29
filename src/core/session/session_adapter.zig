@@ -702,7 +702,13 @@ pub const Session = struct {
         defer dir.close();
         var buffer: [48]u8 = undefined;
         const content = try std.fmt.bufPrint(&buffer, "v1 {d}\n", .{now_ms});
-        try io_mod.durableReplaceVerified(self.alloc, &dir, self.id(), content);
+        // A full disk stops the turn here, before the model is asked, so it
+        // must read as one (D29) and not as a failed replace.
+        var cause: ?anyerror = null;
+        io_mod.durableReplaceVerifiedWithOps(self.alloc, &dir, self.id(), content, .{ .pre_rename_cause = &cause }) catch |err| {
+            if (cause) |stopped| if (storageCause(stopped)) |named| return named;
+            return err;
+        };
     }
 
     fn clearUsageMarker(self: *Session) void {
@@ -1234,6 +1240,18 @@ pub fn writeMayHaveLanded(err: anyerror) bool {
 }
 
 const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat } || sm.OpenError;
+
+/// The storage causes a host names (D29), from an OS error; null for any
+/// other error.
+fn storageCause(err: anyerror) ?error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig } {
+    return switch (err) {
+        error.NoSpaceLeft => error.NoSpaceLeft,
+        error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+        error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+        error.FileTooBig => error.FileTooBig,
+        else => null,
+    };
+}
 
 fn resumeError(err: sm.OpenError, target: Target) ResumeError {
     return switch (err) {
@@ -1834,6 +1852,18 @@ test "usage is durable before its marker goes, and resume restores it" {
     var restored = try r.restore(testing.allocator);
     defer restored.deinit(testing.allocator);
     try testing.expect(restored.usage != null);
+}
+
+test "a usage marker that cannot be written names a storage cause (D29)" {
+    // The real write is proven on a full disk end to end; opening the
+    // markers folder makes it private again, so a unit test cannot block it.
+    const Cause = ?error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig };
+    try testing.expectEqual(@as(Cause, error.NoSpaceLeft), storageCause(error.NoSpaceLeft));
+    try testing.expectEqual(@as(Cause, error.AccessDenied), storageCause(error.AccessDenied));
+    try testing.expectEqual(@as(Cause, error.AccessDenied), storageCause(error.PermissionDenied));
+    try testing.expectEqual(@as(Cause, error.ReadOnlyFileSystem), storageCause(error.ReadOnlyFileSystem));
+    try testing.expectEqual(@as(Cause, error.FileTooBig), storageCause(error.FileTooBig));
+    try testing.expectEqual(@as(Cause, null), storageCause(error.InputOutput));
 }
 
 test "a failed resume reports v1's error names" {
