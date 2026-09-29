@@ -2833,7 +2833,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     try {
       const readOnly = await appExit(fixture, gateway, ["--resume", id]);
       expect(readOnly.status).toBe(1);
-      expect(readOnly.stderr).toContain("AccessDenied");
+      expect(readOnly.stderr).toBe("fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n");
     } finally {
       chmodSync(folder, 0o700);
       chmodSync(log, 0o600);
@@ -2878,8 +2878,7 @@ test("ACP refuses a damaged or read-only session and leaves its log as it was", 
     chmodSync(log, 0o400);
     chmodSync(folder, 0o500);
     try {
-      // v1's load error names say any other failure is a missing session.
-      expect((await load()).error).toBeDefined();
+      expect((await load()).error.message).toBe("Session could not be loaded: permission denied");
     } finally {
       chmodSync(folder, 0o700);
       chmodSync(log, 0o600);
@@ -2980,9 +2979,9 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     // torn tail that the next open cuts.
     app2 = await launch(id, Math.ceil((whole.length + 2000) / SH_LIMIT_BLOCK));
     await app2.sendText("The disk fills in this turn.");
-    // The error it names is the write that failed first or, once that took
-    // the log down, the commit's own.
-    await app2.waitForText("Turn completed, but fx could not save it", TIMEOUT);
+    // It names the write that failed first, even when an earlier streamed
+    // write took the log down (D40).
+    await app2.waitForText("Turn completed, but fx could not save it (FileTooBig)", TIMEOUT);
     await app2.waitForComposer(TIMEOUT);
     await quit();
     expect(gateway.requests.length).toBe(asked + 1);
@@ -3029,7 +3028,7 @@ test("ACP on a full disk fails the prompt, and the session loads and continues a
     await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
     const asked = gateway.requests.length;
     const refused = await client.request("session/prompt", { sessionId: id, ...acpPrompt("The ACP disk is full.") });
-    expect(refused.error.code).toBe(-32603);
+    expect(refused.error).toEqual({ code: -32603, message: "Session could not be saved: a file-size limit was reached" });
     expect(await client.close()).toBe(0);
     // Refused before the model is asked, and nothing reached the log.
     expect(gateway.requests.length).toBe(asked);
@@ -3156,6 +3155,149 @@ test.skipIf(!tmuxAvailable())("a hosted terminal survives an app crash, and the 
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 4);
+
+/// A gateway that runs a fast tool, then a slow one, for `prompt`; `slow`
+/// resolves once the slow call is served. Any other prompt ends with `after`.
+function twoToolGateway(prefix: string, prompt: string, after: [string, string]) {
+  let served: () => void = () => {};
+  const slow = new Promise<void>((resolve) => (served = resolve));
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes(after[0])) return fakeGatewayFinalText(after[1]);
+    if (body.includes(prompt) && body.includes(`${prefix}_FIRST_TOOL_OUTPUT`)) {
+      served();
+      return fakeShellRun(`${prefix}-slow-2`, "sleep 30");
+    }
+    if (body.includes(prompt)) return fakeShellRun(`${prefix}-fast-1`, `echo ${prefix}_FIRST_TOOL_OUTPUT`);
+    return fakeGatewayFinalText(`${prefix}_UNEXPECTED`);
+  });
+  return { gateway, slow };
+}
+
+/// After a kill mid-tool: the finished call keeps its result, the running one
+/// comes back answered as possibly run, and the crash interrupted the turn.
+function expectToolKillRepaired(fixture: Fixture, id: string, body: string, prefix: string) {
+  expect(body).toContain(`${prefix}_FIRST_TOOL_OUTPUT`);
+  expectPairedToolCalls(body);
+  const { calls, results } = promptToolParts(body);
+  expect(calls.map((part) => part.toolCallId)).toEqual([`${prefix}-fast-1`, `${prefix}-slow-2`]);
+  expect(results.find((part) => part.toolCallId === `${prefix}-slow-2`)?.output?.value).toContain("may have partly run");
+  expect(logLines(fixture, id).filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+  expectWholeLog(fixture, id);
+}
+
+/// A write cut short by a power loss: part of a line, no newline.
+function tearTail(fixture: Fixture, id: string) {
+  appendFileSync(join(v2Root(fixture), id, "log.jsonl"), '{"v":1,"seq":99,"ts":1,"kind":"item","ty');
+}
+
+test.skipIf(!tmuxAvailable())("an app killed while a tool runs answers that call on resume and goes on", async () => {
+  const fixture = createFixture("fx-v2-app-kill-tool-");
+  const { gateway, slow } = twoToolGateway("APP", "Run two app tools.", ["After the app tool kill.", "AFTER_APP_TOOL_KILL"]);
+  const appEnv = { FX_PERMISSION_MODE: "full-access" };
+  try {
+    const app = await startApp(fixture, gateway, [], true, appEnv);
+    await app.session.sendText("Run two app tools.");
+    await slow;
+    const id = onlySession(fixture);
+    // The call is saved before it runs (D28).
+    await waitForLog(fixture, id, "APP-slow-2");
+    Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
+    await app.session.kill();
+
+    const resumed = await startApp(fixture, gateway, ["--resume", id], true, appEnv);
+    await resumed.session.sendText("After the app tool kill.");
+    await resumed.session.waitForText("AFTER_APP_TOOL_KILL", TIMEOUT);
+    await quitApp(resumed);
+    expectToolKillRepaired(fixture, id, gateway.requests.at(-1)!.body, "APP");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test("ACP killed while a tool runs answers that call on load and goes on", async () => {
+  const fixture = createFixture("fx-v2-acp-kill-tool-");
+  const { gateway, slow } = twoToolGateway("ACP", "Run two ACP tools.", ["After the ACP tool kill.", "AFTER_ACP_TOOL_KILL"]);
+  const acpEnv = { FX_PERMISSION_MODE: "full-access" };
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway, acpEnv);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    void client.request("session/prompt", { sessionId: id, ...acpPrompt("Run two ACP tools.") }).catch(() => {});
+    await slow;
+    await waitForLog(fixture, id, "ACP-slow-2");
+    await client.kill();
+
+    client = await AcpRpc.start(fixture, gateway, acpEnv);
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("After the ACP tool kill.") });
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expectToolKillRepaired(fixture, id, gateway.requests.at(-1)!.body, "ACP");
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test.skipIf(!tmuxAvailable())("the app cuts a torn tail on resume and the session goes on", async () => {
+  const fixture = createFixture("fx-v2-app-torn-");
+  const gateway = replyToLatest([
+    ["Before the app torn tail.", "BEFORE_APP_TORN"],
+    ["After the app torn tail.", "AFTER_APP_TORN"],
+  ]);
+  try {
+    const app = await startApp(fixture, gateway, []);
+    await app.session.sendText("Before the app torn tail.");
+    await app.session.waitForText("BEFORE_APP_TORN", TIMEOUT);
+    await quitApp(app);
+    const id = onlySession(fixture);
+    tearTail(fixture, id);
+
+    const resumed = await startApp(fixture, gateway, ["--resume", id]);
+    expect(await scrollbackContains(resumed.session, "BEFORE_APP_TORN")).toContain("BEFORE_APP_TORN");
+    await resumed.session.sendText("After the app torn tail.");
+    await resumed.session.waitForText("AFTER_APP_TORN", TIMEOUT);
+    await quitApp(resumed);
+    expect(gateway.requests.at(-1)!.body).toContain("BEFORE_APP_TORN");
+    expect(readFileSync(join(v2Root(fixture), id, "log.jsonl"), "utf8")).not.toContain('"seq":99');
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+test("ACP cuts a torn tail on load and the session goes on", async () => {
+  const fixture = createFixture("fx-v2-acp-torn-");
+  const gateway = replyToLatest([
+    ["Before the ACP torn tail.", "BEFORE_ACP_TORN"],
+    ["After the ACP torn tail.", "AFTER_ACP_TORN"],
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    client = await AcpRpc.start(fixture, gateway);
+    const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Before the ACP torn tail.") });
+    expect(await client.close()).toBe(0);
+    tearTail(fixture, id);
+
+    client = await AcpRpc.start(fixture, gateway);
+    await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(client.texts("agent_message_chunk")).toEqual(["BEFORE_ACP_TORN"]);
+    await client.ok("session/prompt", { sessionId: id, ...acpPrompt("After the ACP torn tail.") });
+    expect(await client.close()).toBe(0);
+    client = undefined;
+    expect(gateway.requests.at(-1)!.body).toContain("BEFORE_ACP_TORN");
+    expect(readFileSync(join(v2Root(fixture), id, "log.jsonl"), "utf8")).not.toContain('"seq":99');
+    expectWholeLog(fixture, id);
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
 
 test("a named child whose log is damaged fails that message, and the parent turn goes on", async () => {
   const fixture = createFixture("fx-v2-child-damaged-");
