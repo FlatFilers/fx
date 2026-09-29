@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
-import { equivalentPngEncodings } from "./fixtures/image-encoding";
+import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -4353,7 +4353,8 @@ test("Grok CLI sends verified images directly without advertising the vision fal
       { mode: 0o600 },
     );
     const imagePath = join(home, "attachment.png");
-    writeFileSync(imagePath, Buffer.from("89504e470d0a1a0a72657374", "hex"));
+    const image = solidPng(2, 2);
+    writeFileSync(imagePath, image);
     const ask = await runFx([
       "ask",
       "--json",
@@ -4379,6 +4380,7 @@ test("Grok CLI sends verified images directly without advertising the vision fal
     const responses = grok.requests.filter((request) => request.path === "/v1/responses");
     expect(responses).toHaveLength(1);
     expect(responses[0]!.body).toContain('"type":"input_image"');
+    expect(responses[0]!.body).toContain(`data:image/png;base64,${image.toString("base64")}`);
     expect(responses[0]!.body).not.toContain('"name":"vision"');
     expect(gateway.requests).toHaveLength(0);
   } finally {

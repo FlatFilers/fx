@@ -12,6 +12,7 @@ const model_capabilities = @import("../../../config/model_capabilities.zig");
 const model_provider = @import("../../../config/model_provider.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
+const png_downscale = @import("../../../images/png_downscale.zig");
 const io_mod = @import("../../../shared/io.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
@@ -66,6 +67,7 @@ const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
 };
 const terminal_advertised_names = [_][]const u8{"shell"};
 const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.shell.model_schema};
+const test_image_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -435,10 +437,14 @@ fn expectGatewayPromptTextCount(gateway: *const FakeGateway, index: usize, needl
 }
 
 fn writeTestImagePath(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const size = try std.base64.standard.Decoder.calcSizeForSlice(test_image_base64);
+    const bytes = try alloc.alloc(u8, size);
+    defer alloc.free(bytes);
+    try std.base64.standard.Decoder.decode(bytes, test_image_base64);
     {
         var file = try tmp.dir.createFile(std.testing.io, "fixture-image.png", .{});
         defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "\x89PNG\r\n\x1a\nfixture image bytes");
+        try file.writeStreamingAll(std.testing.io, bytes);
     }
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, "fixture-image.png");
 }
@@ -2610,7 +2616,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         if (entry.expect_native) {
             try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
             try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
-            try expectBodyContains(&gateway, 0, "iVBORw0KGgpmaXh0dXJlIGltYWdlIGJ5dGVz");
+            try expectBodyContains(&gateway, 0, test_image_base64);
             try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
             try std.testing.expectEqualStrings("Native route answer", hooks.finish_assistant_text.?);
         } else {
@@ -2619,7 +2625,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
             try expectBodyNotContains(&gateway, 0, "\"type\":\"file\"");
             try expectBodyContains(&gateway, 0, "[Image #1]");
             try expectBodyContains(&gateway, 1, "\"type\":\"file\"");
-            try expectBodyContains(&gateway, 1, "iVBORw0KGgpmaXh0dXJlIGltYWdlIGJ5dGVz");
+            try expectBodyContains(&gateway, 1, test_image_base64);
             try expectBodyContains(&gateway, 2, "text route evidence");
             try std.testing.expectEqualStrings(model, gateway.request_models.items[0]);
             try std.testing.expectEqualStrings("google/gemini-2.5-flash", gateway.request_models.items[1]);
@@ -3574,10 +3580,18 @@ test "retained tool images stay out of the measured text estimate" {
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
 
-    // A payload that dominates the request body makes the text-vs-image
+    // A valid image with a large encoded payload makes the text-vs-image
     // pricing gap unambiguous.
-    const payload = "AAAA" ** 4096;
-    const tool_images = [_]types.ToolImage{.{ .data = @constCast(payload), .mime_type = @constCast("image/png") }};
+    const image_len = try std.base64.standard.Decoder.calcSizeForSlice(test_image_base64);
+    const original = try alloc.alloc(u8, image_len);
+    defer alloc.free(original);
+    try std.base64.standard.Decoder.decode(original, test_image_base64);
+    const padded = try png_downscale.testPaddedPng(alloc, original, 12 * 1024);
+    defer alloc.free(padded);
+    const payload = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(padded.len));
+    defer alloc.free(payload);
+    _ = std.base64.standard.Encoder.encode(payload, padded);
+    const tool_images = [_]types.ToolImage{.{ .data = payload, .mime_type = @constCast("image/png") }};
     const model = "provider/tool-image-measurement";
     const calls = [_]ToolCall{toolCall("call-1", "read_file", "{\"path\":\"a.png\"}")};
     var gateway = FakeGateway.init(alloc, &.{
