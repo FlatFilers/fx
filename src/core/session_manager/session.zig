@@ -232,7 +232,11 @@ pub const Session = struct {
     synced_seq: u64 = 0,
     /// Written under `mutex`, read under `sync_mutex`.
     written_seq: SeqCell = .{},
-    sync_failed: std.atomic.Value(bool) = .init(false),
+    /// A sync that failed outside `mutex`, as a `FaultCode`; `none` until then.
+    sync_fault: std.atomic.Value(u8) = .init(@intFromEnum(FaultCode.none)),
+    /// Under `mutex`: the cause of the write or sync that failed the
+    /// session. Every later call reports it (D40).
+    fault: ?storage.IoFault = null,
 
     pub fn id(session: *const Session) []const u8 {
         return session.identity.id;
@@ -336,12 +340,12 @@ pub const Session = struct {
     fn appendLocked(session: *Session, events: []const fold.Event, sync_through: *?u64) AppendError!u64 {
         switch (session.phase) {
             .closed => return error.SessionClosed,
-            .failed => return error.Io,
+            .failed => return session.fault orelse error.Io,
             .held, .live => {},
         }
-        if (session.sync_failed.load(.acquire)) {
-            session.markFailed();
-            return error.Io;
+        if (faultFromCode(session.sync_fault.load(.acquire))) |cause| {
+            session.markFailed(cause);
+            return cause;
         }
         if (events.len == 0) return session.state.last_seq;
         const gpa = session.env.gpa;
@@ -526,7 +530,7 @@ pub const Session = struct {
             switch (session.phase) {
                 .live => |live| break :blk s.openDir(live.dir, "blobs") catch |io_err| return storage.ioFault(io_err),
                 .held => return error.InvalidTransition,
-                .failed => return error.Io,
+                .failed => return session.fault orelse error.Io,
                 .closed => return error.SessionClosed,
             }
         };
@@ -579,8 +583,9 @@ pub const Session = struct {
         session.bounds.clearRetainingCapacity();
         for (bodies, 0..) |body, i| try session.frameMarked(first_seq + i, ts, body);
         session.writeFramed(&live.log, first_seq, cause) catch |err| {
-            session.markFailed();
-            return storage.ioFault(err);
+            const fault = storage.ioFault(err);
+            session.markFailed(fault);
+            return fault;
         };
         const fork_seq = session.identity.forkSeq();
         for (bodies, 0..) |body, i| {
@@ -684,8 +689,10 @@ pub const Session = struct {
         const target = session.written_seq.load(io);
         std.debug.assert(target >= seq);
         session.env.s.sync(file) catch |err| {
-            session.sync_failed.store(true, .release);
-            return storage.ioFault(err);
+            const fault = storage.ioFault(err);
+            // Only the first cause is kept; a later failure changes nothing.
+            _ = session.sync_fault.cmpxchgStrong(@intFromEnum(FaultCode.none), @intFromEnum(faultCode(fault)), .release, .monotonic);
+            return fault;
         };
         session.synced_seq = target;
     }
@@ -698,11 +705,13 @@ pub const Session = struct {
         session.synced_seq = synced;
     }
 
-    fn markFailed(session: *Session) void {
+    /// Fails a live session with `cause`; the first cause is the one kept.
+    fn markFailed(session: *Session, cause: storage.IoFault) void {
         switch (session.phase) {
             .live => |live| session.phase = .{ .failed = live },
             else => {},
         }
+        if (session.fault == null) session.fault = cause;
     }
 
     fn timestamp(session: *const Session) u64 {
@@ -822,6 +831,37 @@ pub const Session = struct {
 
 /// Blobs above this size are refused; the adapter keeps fx's own, smaller limits.
 pub const max_blob_bytes: usize = 512 << 20;
+
+/// An I/O fault as one byte, so a sync on another thread can hand its cause
+/// to the next append through an atomic.
+const FaultCode = enum(u8) { none, io, no_space, access_denied, read_only, too_big };
+
+fn faultCode(fault: storage.IoFault) FaultCode {
+    return switch (fault) {
+        error.Io => .io,
+        error.NoSpaceLeft => .no_space,
+        error.AccessDenied => .access_denied,
+        error.ReadOnlyFileSystem => .read_only,
+        error.FileTooBig => .too_big,
+    };
+}
+
+fn faultFromCode(code: u8) ?storage.IoFault {
+    return switch (std.enums.fromInt(FaultCode, code) orelse .io) {
+        .none => null,
+        .io => error.Io,
+        .no_space => error.NoSpaceLeft,
+        .access_denied => error.AccessDenied,
+        .read_only => error.ReadOnlyFileSystem,
+        .too_big => error.FileTooBig,
+    };
+}
+
+test "a fault code round trips every I/O fault, and none is no fault" {
+    const faults = [_]storage.IoFault{ error.Io, error.NoSpaceLeft, error.AccessDenied, error.ReadOnlyFileSystem, error.FileTooBig };
+    for (faults) |fault| try std.testing.expectEqual(fault, faultFromCode(@intFromEnum(faultCode(fault))).?);
+    try std.testing.expectEqual(@as(?storage.IoFault, null), faultFromCode(@intFromEnum(FaultCode.none)));
+}
 
 fn hasBlobRefs(bodies: []const schema.Body) bool {
     for (bodies) |body| switch (body) {
