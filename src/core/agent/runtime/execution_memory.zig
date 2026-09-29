@@ -292,6 +292,13 @@ test "retained standalone cut rebuilds exactly the selected execution suffix" {
     }
 }
 
+/// Steering the user typed during the turn, which a cancelled turn keeps.
+fn isSteering(message: ChatMessage) bool {
+    if (message.restored_steering) return true;
+    const content = message.content orelse return false;
+    return steeringText(content) != null;
+}
+
 fn steeringText(content: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, content, parent_steering_open) and std.mem.endsWith(u8, content, parent_steering_close)) {
         // Keep the sender label in persisted text and ordinary history replay.
@@ -385,7 +392,7 @@ pub fn buildInterruptedExecutionMemory(
                 }
             }
             for (user_tail) |entry| {
-                if (!entry.permission_feedback) continue;
+                if (!entry.permission_feedback and !isSteering(entry)) continue;
                 if (entry.tool_call_id) |source_tool_call_id| {
                     if (execution_memory_helpers.findToolCallById(calls, source_tool_call_id) == null) {
                         continue;
@@ -497,6 +504,34 @@ test "interrupted execution memory retains marked feedback through mixed user ta
     try std.testing.expectEqualStrings("first command feedback marker", results[0].permission_feedback[0]);
     try std.testing.expectEqual(@as(usize, 1), results[1].permission_feedback.len);
     try std.testing.expectEqualStrings("second command feedback marker", results[1].permission_feedback[0]);
+}
+
+test "interrupted execution memory keeps steering typed right after a tool result" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{
+        .{ .id = "call_done", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"work\"}}" },
+        .{ .id = "call_active", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
+    };
+    const steering = try steeringMessage(alloc, "check the tests too");
+    defer alloc.free(steering);
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..1] },
+        .{ .role = .tool, .content = "child is still running", .tool_call_id = calls[0].id, .tool_name = calls[0].name, .tool_result_status = .success },
+        .{ .role = .user, .content = steering },
+        .{ .role = .user, .content = "custom hint", .permission_feedback = false },
+        .{ .role = .assistant, .content = "on it" },
+        .{ .role = .assistant, .tool_calls = calls[1..2] },
+    };
+
+    const memory = try buildInterruptedExecutionMemory(alloc, &messages, calls[1]);
+    defer types.freeExecutionMemory(alloc, memory);
+
+    // The cancelled turn keeps what the user typed, after the step it
+    // followed; an unmarked plain message still stays out.
+    try std.testing.expectEqual(@as(usize, 1), memory.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
+    try std.testing.expectEqualStrings("check the tests too", memory.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering[0].after_tool_step_count);
 }
 
 fn hasToolResultForCall(

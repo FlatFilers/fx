@@ -184,7 +184,11 @@ for (const action of ["run", "message"] as const) for (const stop of [false, tru
       await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
       expect(tui.paneStatus().status).toBe(0);
       expect(readFileSync(join(root.root, "stderr.log"), "utf8")).toBe("");
-      const frames = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const events = readFileSync(join(root.home, ".fx/sessions", registry().id, "events.jsonl"), "utf8");
+      const frames = events.trim().split("\n").map(line => JSON.parse(line));
+      // The saved turn keeps what the user typed while the child ran, whether
+      // the turn finished or was cancelled.
+      expect(events.split("STEERING_FIRST").length - 1).toBe(1);
       expect(frames.filter(frame => frame.event?.tool_result?.call_id === "steering-delegation")).toHaveLength(1);
       const trace = readFileSync(join(root.root, "trace.log"), "utf8");
       expect(trace).toContain("event=steering_wait_yielded ");
