@@ -1243,12 +1243,15 @@ describe("Vision route fake Gateway", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "tmux withholds an over-8000-pixel attached image and returns to a usable composer",
+    "tmux consumes /image when its pasted path becomes a prompt attachment",
     async () => {
       const root = createIsolatedRoot();
       const photoPath = join(root.workspace, "photo.jpg");
       writeFileSync(photoPath, jpegHeader(8001, 1));
-      const gateway = startImageGateway([sseText("TUI oversized image recovery answer")]);
+      const gateway = startImageGateway([
+        sseText("TUI oversized image recovery answer"),
+        sseText("TUI pasted slash image answer"),
+      ]);
       const stderrPath = join(root.root, "stderr.log");
       writeFileSync(stderrPath, "");
       let session: TmuxSession | null = null;
@@ -1266,9 +1269,12 @@ describe("Vision route fake Gateway", () => {
           height: 50,
         });
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
-        await session.sendText(`/image ${photoPath}`);
-        await session.waitForText("attached image: photo.jpg", TIMEOUT);
-        await session.sendText("Describe the attached image.");
+        await session.sendLiteral("/image ");
+        await session.pasteText(photoPath);
+        const draft = await session.captureFullScrollback();
+        expect(draft).toContain("[Image 1]");
+        expect(draft).not.toContain("/image ");
+        await session.sendText(" Describe the attached image.");
         await session.waitForText("TUI oversized image recovery answer", TIMEOUT);
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         const scrollback = await session.captureFullScrollbackEscapes();
@@ -1283,6 +1289,17 @@ describe("Vision route fake Gateway", () => {
           "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
         );
         expect(body).toContain("then read_file the copy.");
+
+        await session.pasteText(`/image ${photoPath}`);
+        const secondDraft = await session.captureFullScrollback();
+        expect(secondDraft).toContain("[Image 2]");
+        expect(secondDraft).not.toContain("/image ");
+        await session.sendText(" Describe the second image.");
+        await session.waitForText("TUI pasted slash image answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        expect(gateway.chatRequests).toHaveLength(2);
+        expect(nativeFileParts(gateway.chatRequests[1]!.body)).toHaveLength(0);
+        expect(gateway.chatRequests[1]!.body).toContain("then read_file the copy.");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
         await session.sendText("/quit");
