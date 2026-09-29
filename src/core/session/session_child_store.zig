@@ -17,6 +17,9 @@ pub const ManagedChildKind = enum {
     subagent_control,
     terminal_state,
     terminal_proofs,
+    /// Session-scoped context supplied by the client that created it, such as
+    /// an ACP client system prompt.
+    client_context,
 };
 
 pub const Mode = enum {
@@ -187,6 +190,7 @@ const CapabilityImpl = struct {
     terminal_parent: ?io_mod.VerifiedDir = null,
     terminal_state: ?io_mod.VerifiedDir = null,
     terminal_proofs: ?io_mod.VerifiedDir = null,
+    client_context: ?io_mod.VerifiedDir = null,
     indeterminate_names: [@typeInfo(ManagedChildKind).@"enum".fields.len]?[]u8 =
         [_]?[]u8{null} ** @typeInfo(ManagedChildKind).@"enum".fields.len,
 
@@ -202,6 +206,7 @@ const CapabilityImpl = struct {
         closeOptionalDir(&self.terminal_state);
         closeOptionalDir(&self.terminal_proofs);
         closeOptionalDir(&self.terminal_parent);
+        closeOptionalDir(&self.client_context);
         self.session_dir.close();
         self.alloc.free(self.display_session_path);
         if (self.legacy_display_route) |path| self.alloc.free(path);
@@ -292,6 +297,12 @@ const CapabilityImpl = struct {
                 "subagent",
                 create_if_missing,
             ),
+            .client_context => self.ensureComponent(
+                &self.session_dir,
+                &self.client_context,
+                "client",
+                create_if_missing,
+            ),
             .terminal_state, .terminal_proofs => blk: {
                 const parent = try self.ensureComponent(
                     &self.session_dir,
@@ -331,6 +342,7 @@ const CapabilityImpl = struct {
             .subagent_control => &self.subagent_control.?,
             .terminal_state => &self.terminal_state.?,
             .terminal_proofs => &self.terminal_proofs.?,
+            .client_context => &self.client_context.?,
         };
     }
 
@@ -456,6 +468,10 @@ const CapabilityImpl = struct {
             .terminal_proofs => std.fs.path.join(
                 alloc,
                 &.{ self.display_session_path, "terminal", "proofs" },
+            ),
+            .client_context => std.fs.path.join(
+                alloc,
+                &.{ self.display_session_path, "client" },
             ),
         };
     }
@@ -613,6 +629,7 @@ pub const SessionChildCapability = struct {
             .subagent_control => impl.subagent_control = .{ .dir = route },
             .terminal_state => impl.terminal_state = .{ .dir = route },
             .terminal_proofs => impl.terminal_proofs = .{ .dir = route },
+            .client_context => impl.client_context = .{ .dir = route },
         }
         return .{ .impl = impl };
     }

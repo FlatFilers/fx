@@ -365,6 +365,64 @@ persistent subagents receive an immutable, permission-filtered view of the
 parent or ACP session's admitted MCP tools, resources, prompts, and completion
 capability. Missing, revoked, stale, or closed authority fails before transport.
 
+ACP clients can also serve an MCP server over the ACP connection itself, as
+described in the MCP-over-ACP RFD, by declaring
+`{"type":"acp","name":"...","serverId":"..."}` in `mcpServers`. fx advertises
+`mcpCapabilities.acp` and sends each modern MCP request as an `mcp/message`
+request with a fresh logical `requestId`; the client answers with a `result` or
+`error` carrier, and timeouts or cancellation send `$/cancel_request`. These
+servers connect from the prompt worker at the start of the first turn, because
+discovery waits for replies that only the connection reader delivers, so a
+server that fails to connect appears in the model's server catalog instead of
+failing session setup. Request-scoped `mcp/message` notifications such as
+progress are not delivered to operations yet.
+
+## ACP Embedding
+
+`fx acp` extends ACP v1 for clients that embed it. Extensions are read and
+written under `_meta.fx`.
+
+* **Client MCP tools stay loaded:** tool schemas from servers in `mcpServers`
+  are advertised on every turn within the `mcp_selected_schema_bytes` budget.
+  Set `_meta.fx.alwaysLoaded` to `false` on a server entry to load it on demand
+  instead. A model call naming a live MCP tool that is not loaded is loaded and
+  admitted through the normal MCP permission path instead of failing.
+* **Steering:** a `session/prompt` with `_meta.fx.steer` set to `true` while a
+  turn runs joins that turn at its next safe boundary and is replayed as a
+  `user_message_chunk` whose `_meta.fx.steering.requestId` names the request.
+  Its response arrives when that turn ends, with the turn's `stopReason` and
+  `_meta.fx.steering` set to `absorbed`. Steering queued when a turn is
+  cancelled answers `cancelled` with `dropped`; steering that a turn ended
+  without reading returns an error so the client can send it again. Without the
+  opt-in, a second prompt keeps the `Prompt already in progress` error.
+  `session/load` replays absorbed steering in place with a null `requestId`.
+  `initialize` reports support in `agentCapabilities._meta.fx.steering`.
+* **Client system prompt:** `session/new` accepts `systemPrompt` text blocks in
+  `append` mode, as proposed in the client system prompt RFD, and `initialize`
+  advertises `sessionCapabilities.systemPrompt`. `_meta.fx.systemPrompt`
+  accepts the same blocks for SDKs that drop unknown fields. The prompt follows
+  fx's own instructions in the system slot, is stored with the session, and is
+  restored on `session/load` and `session/resume`. Set `_meta.fx.terminal` to
+  `false` on `initialize` when fx is not presented in a terminal; fx then drops
+  its terminal identity and rendering guidance.
+* **Tool call metadata:** each `tool_call` update carries
+  `_meta.fx.toolCall.internal`, which is true for fx's own discovery and
+  bookkeeping steps such as `capability_search`, `mcp_select_tool`, and
+  `read_tool_result`. MCP tool calls add `mcp.server` and `mcp.tool` and use
+  the server's tool title, falling back to the tool's own name. `session/load`
+  replays the same metadata, including for servers that reconnect only on the
+  next turn.
+* **Session workspace:** an absolute `cwd` on `session/new`, `session/load`,
+  or `session/resume` becomes that session's workspace for file access, shell
+  commands, project instructions, project skills, project MCP servers, and the
+  session record. Model, provider, credentials, and permission policy stay as
+  resolved at `initialize` from the launch directory. A client without a
+  project can pass an empty directory it owns.
+* **Profile MCP servers:** ACP sessions use only client-supplied and approved
+  project servers. Set `_meta.fx.profileMcpServers` to `true` on a session
+  request to add the user's `~/.fx/mcp.json` servers. Request entries win name
+  collisions, and profile entries win over project entries.
+
 ## Permissions and Auto Mode
 
 Security is permission-first.

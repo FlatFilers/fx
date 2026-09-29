@@ -506,6 +506,7 @@ pub fn shellProcessOnlySpec() ToolSpec {
 
 pub const capability_search = ToolSpec{
     .name = "capability_search",
+    .internal = true,
     .description = capability_search_description,
     .model_schema = .{
         .name = "capability_search",
@@ -630,6 +631,7 @@ pub const subagent = ToolSpec{
 
 pub const mcp_select_tool = ToolSpec{
     .name = "mcp_select_tool",
+    .internal = true,
     .description = mcp_select_tool_description,
     .model_schema = .{
         .name = "mcp_select_tool",
@@ -795,6 +797,7 @@ const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
 
 pub const read_tool_result = ToolSpec{
     .name = "read_tool_result",
+    .internal = true,
     .description = read_tool_result_description,
     .model_schema = .{
         .name = "read_tool_result",

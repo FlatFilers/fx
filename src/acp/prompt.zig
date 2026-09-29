@@ -22,6 +22,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
+const client_instructions = @import("client_instructions.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -75,6 +76,8 @@ else
     struct {};
 const types = @import("../core/shared/types.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
+const agent_stream_provider = @import("../core/agent/stream_provider.zig");
+const runtime_gateway_step = @import("../core/agent/runtime/gateway_step.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -222,10 +225,31 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
+    fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?mcp_runtime.McpRuntime.ToolIdentity {
+        if (comptime host_target.is_wasm) return null;
+        const mcp = activeMcp(self) orelse return null;
+        return mcp.toolIdentity(arena, name) catch |err| {
+            debug_trace.logf("acp", "tool call MCP identity unavailable tool={s} err={s}", .{ name, @errorName(err) });
+            return null;
+        };
+    }
+
+    /// Keeps the identity shown for `name` so session/load can replay it
+    /// before its server reconnects. A failure costs only replay detail.
+    fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
+        const session = if (self.state.active_session) |*active| active else return;
+        const capability = if (session.writable) |*writable| writable.childCapability() catch null else null;
+        session.tool_identities.remember(self.state.alloc, capability, name, identity) catch |err| {
+            debug_trace.logf("acp", "tool identity not recorded tool={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+
     fn sendToolCallPending(self: *AcpContext, arena: Allocator, call: ToolCall) ![]const u8 {
         if (self.published_tool_calls.getKey(call.id)) |published| return published;
         const registry = self.toolRegistry();
-        const title = describeToolTitle(registry, arena, call) catch "Tool call";
+        const mcp_identity = if (registry.lookup(call.name) == null) self.mcpToolIdentity(arena, call.name) else null;
+        if (mcp_identity) |identity| self.rememberToolIdentity(call.name, identity);
+        const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
         const name = acpToolName(call.name);
         const kind = mapToolKind(name);
         const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(
@@ -251,7 +275,7 @@ const AcpContext = struct {
         errdefer self.alloc.free(owned_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCall(&out.writer, owned_id, name, title, kind, .pending, raw_input);
+        try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, presentation.meta);
         try self.sendUpdate(out.writer.buffered());
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
@@ -780,6 +804,8 @@ pub fn handlePrompt(
         }
     }
 
+    if (comptime !host_target.is_wasm) connectHostChannelServers(session);
+
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
@@ -795,7 +821,11 @@ pub fn handlePrompt(
 
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
-    const host_instructions = try alloc.dupe(u8, state.host_instructions);
+    const host_instructions = try client_instructions.compose(
+        alloc,
+        state.host_instructions,
+        session.client_system_prompt,
+    );
     defer alloc.free(host_instructions);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
@@ -874,9 +904,13 @@ pub fn handlePrompt(
             recovery_checkpoint == null
     else
         false;
+    var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dynamic_tool_arena.deinit();
+    const initial_dynamic_tools = try initialDynamicTools(&ctx, dynamic_tool_arena.allocator());
     var agent_config = buildAgentConfig(state, session, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .host_instructions = host_instructions,
+        .initial_dynamic_tools = initial_dynamic_tools,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
@@ -1024,7 +1058,7 @@ pub fn runSubagentChild(
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
-        .system_prompt = state.cfg.prompt_policy.system_prompt,
+        .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
@@ -1060,8 +1094,50 @@ fn refreshProjectContext(
     };
 }
 
+/// Connects MCP servers the client serves over this ACP connection. This runs
+/// on the prompt worker because each discovery request waits for a reply that
+/// only the connection reader can deliver. A server that fails to connect is
+/// reported in the model's server catalog.
+fn connectHostChannelServers(session: *server.ActiveSessionState) void {
+    const mcp = session.mcp orelse return;
+    if (!mcp.hasPendingHostChannelServers()) return;
+    mcp.connectHostChannelServers(builtin_tools.registry, &session.cancel_flag) catch |err| {
+        debug_trace.logf("mcp", "ACP host-channel MCP servers did not connect err={s}", .{@errorName(err)});
+    };
+}
+
+/// Host tools plus every tool of the session's always-loaded MCP servers, so
+/// client-provided tools stay callable on each turn without a search. The
+/// result is allocated in `arena`, which must outlive the turn.
+fn initialDynamicTools(
+    ctx: *AcpContext,
+    arena: Allocator,
+) ![]const agent_stream_provider.DynamicFunctionTool {
+    const host_tools = ctx.state.host_tools.dynamic_tools;
+    if (comptime host_target.is_wasm) return host_tools;
+    const session = if (ctx.state.active_session) |*active| active else return host_tools;
+    const mcp = session.mcp orelse return host_tools;
+    const loaded = try mcp.snapshotAlwaysLoadedTools(
+        arena,
+        session.permission_rules,
+        ctx.state.context_limits,
+        .unrestricted,
+    );
+    if (loaded.notice) |notice| try pushContextNotice(@ptrCast(ctx), notice);
+    if (loaded.tools.len == 0) return host_tools;
+    var tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try tools.ensureTotalCapacity(arena, host_tools.len + loaded.tools.len);
+    tools.appendSliceAssumeCapacity(host_tools);
+    for (loaded.tools) |selected| {
+        try runtime_gateway_step.recordSelectedDynamicTool(arena, &tools, selected);
+    }
+    debug_trace.logf("mcp", "advertised always-loaded MCP tools count={d}", .{loaded.tools.len});
+    return tools.items;
+}
+
 const AgentConfigSections = struct {
     host_instructions: []const u8 = "",
+    initial_dynamic_tools: ?[]const agent_stream_provider.DynamicFunctionTool = null,
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
@@ -1075,7 +1151,7 @@ fn buildAgentConfig(
     current_prompt_is_external: bool,
 ) agent_runtime.Config {
     return .{
-        .system_prompt = state.cfg.prompt_policy.system_prompt,
+        .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
         .host_instructions = sections.host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
         .skill_catalog = sections.skill_catalog,
@@ -1083,7 +1159,7 @@ fn buildAgentConfig(
         .gateway_chat_url = state.cfg.gateway_chat_url,
         .advertised_tool_names = sections.advertised_tool_names,
         .advertised_functions = sections.advertised_functions,
-        .initial_dynamic_tools = state.host_tools.dynamic_tools,
+        .initial_dynamic_tools = sections.initial_dynamic_tools orelse state.host_tools.dynamic_tools,
         .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
@@ -1225,14 +1301,7 @@ fn parsePromptInputWithFirstImageId(
 
     if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, "") };
 
-    const continue_recovery = blk: {
-        const meta = parsed.value.object.get("_meta") orelse break :blk false;
-        if (meta != .object) break :blk false;
-        const fx = meta.object.get("fx") orelse break :blk false;
-        if (fx != .object) break :blk false;
-        const value = fx.object.get("continueRecovery") orelse break :blk false;
-        break :blk value == .bool and value.bool;
-    };
+    const continue_recovery = acp_types.fxMetaBool(parsed.value.object, "continueRecovery") orelse false;
 
     const prompt_arr = parsed.value.object.get("prompt") orelse
         return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
@@ -1433,12 +1502,13 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
-        .take_steering_boundary = if (ctx.state.cfg.minimal_kernel) takeLibfxSteeringBoundary else null,
+        .take_steering_boundary = takeSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
+        .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
         .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
@@ -1483,7 +1553,12 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     };
 }
 
-fn takeLibfxSteeringBoundary(
+/// Drains steering at a turn boundary. ACP clients steer by sending
+/// `session/prompt` with `_meta.fx.steer` during a turn; each delivered message
+/// is replayed as a user message where it joined the turn. A cancelled ACP
+/// turn stops instead of continuing with queued steering, and the steering
+/// prompt responses report what was dropped.
+fn takeSteeringBoundary(
     raw_ctx: *anyopaque,
     arena: Allocator,
     _: u64,
@@ -1491,15 +1566,40 @@ fn takeLibfxSteeringBoundary(
 ) !worker_runtime.SteeringBoundaryResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const close_if_empty = kind == .finalizing;
-    const messages = if (comptime host_target.is_wasm)
-        try js_host_steering.takeAll(arena)
-    else
-        try server.takeLibfxSteering(ctx.state, arena, close_if_empty);
-    if (messages.len > 0) return .{ .continue_turn = messages };
     if (comptime host_target.is_wasm) {
+        const messages = try js_host_steering.takeAll(arena);
+        if (messages.len > 0) return .{ .continue_turn = messages };
         if (close_if_empty) js_host_steering.close();
+        return if (kind == .cancelled) .interrupt else .none;
     }
-    return if (kind == .cancelled) .interrupt else .none;
+    const kernel = ctx.state.cfg.minimal_kernel;
+    if (kind == .cancelled and !kernel) return .interrupt;
+    // ACP keeps accepting steering until the turn has fully returned: a
+    // pending subagent can continue a turn past its final boundary, and a
+    // steering prompt that arrives after input closes joins the worker from
+    // the connection reader, which must never wait on work that needs it.
+    const drained = try server.takeSteering(ctx.state, arena, close_if_empty and kernel);
+    if (drained.texts.len == 0) return if (kind == .cancelled) .interrupt else .none;
+    // libfx replays steering when it is queued; ACP replays it on delivery.
+    if (!kernel) {
+        for (drained.texts, drained.request_ids) |text, request_id| {
+            try publishSteeringReplay(ctx, text, request_id);
+        }
+    }
+    return .{ .continue_turn = drained.texts };
+}
+
+fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId) !void {
+    var message_id_storage: acp_types.MessageIdBuffer = undefined;
+    const message_id = acp_types.generateMessageId(&message_id_storage);
+    var update: std.Io.Writer.Allocating = .init(ctx.alloc);
+    defer update.deinit();
+    try update.writer.writeAll("{\"sessionId\":");
+    try jsonrpc.writeJsonStr(ctx.session_id, &update.writer);
+    try update.writer.writeAll(",\"update\":");
+    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id);
+    try update.writer.writeByte('}');
+    try ctx.state.writer.writeNotification(ctx.alloc, "session/update", update.written());
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -1688,6 +1788,11 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
+}
+
+fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.resolveUnselectedMcpTool(ctx.toolContext(), arena, name);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {

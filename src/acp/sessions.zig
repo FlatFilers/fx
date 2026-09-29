@@ -6,6 +6,11 @@ const mem_utils = @import("../core/shared/mem_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
+const client_instructions = @import("client_instructions.zig");
+const tool_call_identities = @import("tool_call_identities.zig");
+const workspace_binding = @import("workspace_binding.zig");
+const mcp_carrier = @import("mcp_carrier.zig");
+const message_carrier = @import("../core/mcp/message_carrier.zig");
 const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
@@ -19,6 +24,7 @@ const tool_call_presentation = @import("tool_call_presentation.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const project_config = @import("../core/mcp/project_config.zig");
+const builtin_mcp = @import("../builtins/mcp.zig");
 const workspace_config = @import("../core/mcp/workspace_config.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
@@ -90,7 +96,7 @@ pub fn handleNewLibfxSession(
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     try server.releaseActiveSession(state);
 
-    var durable = try freshAcpState(state, alloc);
+    var durable = try freshAcpState(state, alloc, state.workspace_root);
     var durable_owned = true;
     defer if (durable_owned) durable.deinit(alloc);
     const session_id = try alloc.dupe(u8, durable.id);
@@ -183,6 +189,24 @@ pub fn commitWasmSession(alloc: Allocator, session: *server.ActiveSessionState) 
 }
 
 pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    // Validate the client system prompt before any session side effect.
+    var client_system_prompt = client_instructions.parse(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = client_instructions.parseErrorMessage(err),
+        }),
+    };
+    defer if (client_system_prompt) |text| alloc.free(text);
+    var workspace = workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = workspace_binding.prepareErrorMessage(err),
+        }),
+    };
+    defer if (workspace) |*binding| binding.deinit(alloc);
+    const workspace_root = if (workspace) |binding| binding.root else state.workspace_root;
     var mcp_configs = mcp_servers.parse(alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -197,13 +221,17 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             .message = "MCP servers are unavailable in this runtime",
         });
     }
-    if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
+    if (state.cfg.allow_acp_mcp) {
+        try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
+        try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+    }
     retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
+        hostChannel(state),
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -223,9 +251,9 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     };
 
     var store = (if (state.cfg.home_override) |home|
-        session_store.Store.initFromHome(alloc, home, state.workspace_root)
+        session_store.Store.initFromHome(alloc, home, workspace_root)
     else
-        session_store.Store.init(alloc, state.workspace_root)) catch
+        session_store.Store.init(alloc, workspace_root)) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session store not available",
@@ -233,7 +261,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     var store_owned = true;
     defer if (store_owned) store.deinit(alloc);
 
-    var initial = try freshAcpState(state, alloc);
+    var initial = try freshAcpState(state, alloc, workspace_root);
     defer initial.deinit(alloc);
     var writable = store.startWritableSessionWithOptions(
         alloc,
@@ -243,6 +271,17 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Failed to create session" });
     var writable_owned = true;
     defer if (writable_owned) writable.deinit(alloc);
+    if (client_system_prompt) |text| {
+        persistClientSystemPrompt(alloc, &writable, text) catch |err| {
+            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+            _ = store.discardPristineStartedSession(alloc, &writable);
+            writable_owned = false;
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to save the client system prompt",
+            });
+        };
+    }
 
     const session_id = try alloc.dupe(u8, writable.active_id);
     var session_id_owned = true;
@@ -282,6 +321,8 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .effort = state.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
+        .client_system_prompt = client_system_prompt,
+        .workspace = if (workspace) |*binding| binding else null,
     }) catch {
         _ = store.discardPristineStartedSession(alloc, &writable);
         writable_owned = false;
@@ -290,6 +331,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             .message = "Failed to save active session",
         });
     };
+    client_system_prompt = null;
     writable_owned = false;
     store_owned = false;
     session_id_owned = false;
@@ -509,6 +551,16 @@ fn handleRestoreSession(
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
     };
 
+    var workspace = workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = workspace_binding.prepareErrorMessage(err),
+        }),
+    };
+    defer if (workspace) |*binding| binding.deinit(alloc);
+    const workspace_root = if (workspace) |binding| binding.root else state.workspace_root;
+
     var mcp_configs = switch (kind) {
         .load => mcp_servers.parse(alloc, msg.params_raw),
         .reconnect => mcp_servers.parseResume(alloc, msg.params_raw),
@@ -528,7 +580,8 @@ fn handleRestoreSession(
             });
         }
     } else {
-        try appendProjectMcpConfigs(state, alloc, &mcp_configs);
+        try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
+        try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
     }
     retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
@@ -536,6 +589,7 @@ fn handleRestoreSession(
         &mcp_configs,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
+        hostChannel(state),
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -554,6 +608,14 @@ fn handleRestoreSession(
         }
     };
 
+    if (state.active_session) |*active| {
+        // Loading the active session into another workspace releases it and
+        // reopens it through the ordinary rebinding path below.
+        if (sameSessionId(active.session_id, session_id) and workspace != null) {
+            server.cancelAndReapActivePrompt(state);
+            try server.releaseActiveSession(state);
+        }
+    }
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
             server.cancelAndReapActivePrompt(state);
@@ -594,9 +656,9 @@ fn handleRestoreSession(
     }
 
     var store = (if (state.cfg.home_override) |home|
-        session_store.Store.initFromHome(alloc, home, state.workspace_root)
+        session_store.Store.initFromHome(alloc, home, workspace_root)
     else
-        session_store.Store.init(alloc, state.workspace_root)) catch
+        session_store.Store.init(alloc, workspace_root)) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session store not available",
@@ -614,7 +676,7 @@ fn handleRestoreSession(
         store,
         alloc,
         .{ .id = session_id },
-        state.workspace_root,
+        workspace_root,
         .{
             .seed_preferences = seed_preferences,
             .log = .{},
@@ -693,6 +755,7 @@ fn handleRestoreSession(
         .effort = writable.state.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
+        .workspace = if (workspace) |*binding| binding else null,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
@@ -754,19 +817,58 @@ fn retireReducedActiveMcp(
     server.enableSubagentHost(state);
 }
 
+/// Adds the user's profile MCP servers after the request's own servers when
+/// the client sets `_meta.fx.profileMcpServers`. ACP sessions otherwise use
+/// only client-supplied and approved project servers. Request entries win
+/// name collisions, and profile entries win over project entries.
+fn appendProfileMcpConfigsIfRequested(
+    state: *server.ServerState,
+    alloc: Allocator,
+    params_raw: ?[]const u8,
+    configs: *mcp_servers.OwnedServerConfigs,
+) !void {
+    if (!profileMcpRequested(alloc, params_raw)) return;
+    const home = state.cfg.home_override orelse io_mod.getenv("HOME") orelse {
+        debug_trace.logf("mcp", "ACP profile MCP servers skipped reason=no_home", .{});
+        return;
+    };
+    const config_path = try builtin_mcp.configPathFromHome(alloc, home);
+    defer alloc.free(config_path);
+    var profile = builtin_mcp.loadConfigFromPath(alloc, config_path) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("mcp", "ACP profile MCP servers unavailable err={s}", .{@errorName(err)});
+        return;
+    };
+    defer {
+        for (profile.items) |*config| config.deinit(alloc);
+        profile.deinit(alloc);
+    }
+    debug_trace.logf("mcp", "ACP profile MCP servers requested count={d}", .{profile.items.len});
+    try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &profile);
+}
+
+fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
+    const raw = params_raw orelse return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return acp_types.fxMetaBool(parsed.value.object, "profileMcpServers") orelse false;
+}
+
 fn appendProjectMcpConfigs(
     state: *server.ServerState,
     alloc: Allocator,
+    workspace_root: []const u8,
     configs: *mcp_servers.OwnedServerConfigs,
 ) !void {
     var choices = if (state.cfg.home_override) |home|
-        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, state.workspace_root) catch |err| {
+        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
             return;
         }
     else
-        config_runtime.loadProjectMcpChoices(alloc, state.workspace_root) catch |err| {
+        config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
             return;
@@ -775,7 +877,7 @@ fn appendProjectMcpConfigs(
 
     var workspace = try workspace_config.load(
         alloc,
-        state.workspace_root,
+        workspace_root,
         .workspace,
         choices.choices,
     );
@@ -799,6 +901,12 @@ fn appendProjectMcpConfigs(
                     "none",
             },
         );
+    }
+    // Project servers run in the session's workspace, which a client `cwd`
+    // may have moved away from the directory fx was launched in.
+    for (workspace.configs.items) |*config| {
+        if (config.transport != .stdio or config.cwd != null) continue;
+        config.cwd = try alloc.dupe(u8, workspace_root);
     }
     try project_config.appendWorkspaceAfterAcpPrimary(
         alloc,
@@ -890,13 +998,14 @@ fn writeLoadSessionResponse(
 fn freshAcpState(
     state: *server.ServerState,
     alloc: Allocator,
+    workspace_root: []const u8,
 ) !session_codec.DurableSessionState {
     const now = io_mod.milliTimestamp();
     const id = try session_store.generateSessionId(alloc);
     errdefer alloc.free(id);
-    const origin = try alloc.dupe(u8, state.workspace_root);
+    const origin = try alloc.dupe(u8, workspace_root);
     errdefer alloc.free(origin);
-    const workspace = try alloc.dupe(u8, state.workspace_root);
+    const workspace = try alloc.dupe(u8, workspace_root);
     errdefer alloc.free(workspace);
     const model = try alloc.dupe(u8, state.configured_model);
     errdefer alloc.free(model);
@@ -931,7 +1040,65 @@ const SessionActivation = struct {
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
     mcp: ?*mcp_runtime.McpRuntime,
+    /// Owned prompt for a new session. Restored sessions load their persisted
+    /// prompt instead.
+    client_system_prompt: ?[]u8 = null,
+    /// Workspace named by the request's `cwd`, installed once the previous
+    /// session is released. Left empty after a successful activation.
+    workspace: ?*workspace_binding.Binding = null,
 };
+
+fn persistClientSystemPrompt(
+    alloc: Allocator,
+    writable: *session_store.LoadedWritableSession,
+    text: []const u8,
+) !void {
+    const capability = try writable.childCapability();
+    try client_instructions.persist(alloc, capability, text);
+}
+
+/// Returns the owned persisted client prompt of a restored session. A prompt
+/// that cannot be read is reported in the trace and left out.
+fn restoredClientSystemPrompt(
+    alloc: Allocator,
+    writable: ?*session_store.LoadedWritableSession,
+) Allocator.Error![]u8 {
+    const session = writable orelse return &.{};
+    const capability = session.childCapability() catch return &.{};
+    const text = client_instructions.load(alloc, capability) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf(
+                "acp",
+                "dropped unreadable client system prompt session={s} err={s}",
+                .{ session.active_id, @errorName(err) },
+            );
+            return &.{};
+        },
+    };
+    return text orelse &.{};
+}
+
+/// Returns the tool identity record of a restored session. A record that
+/// cannot be read is reported in the trace and replaced by an empty one.
+fn restoredToolIdentities(
+    alloc: Allocator,
+    writable: ?*session_store.LoadedWritableSession,
+) Allocator.Error!tool_call_identities.Record {
+    const session = writable orelse return .{};
+    const capability = session.childCapability() catch return .{};
+    return tool_call_identities.load(alloc, capability) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf(
+                "acp",
+                "dropped unreadable tool identity record session={s} err={s}",
+                .{ session.active_id, @errorName(err) },
+            );
+            return .{};
+        },
+    };
+}
 
 fn activateSession(
     state: *server.ServerState,
@@ -939,11 +1106,22 @@ fn activateSession(
     activation: SessionActivation,
 ) !void {
     try server.releaseActiveSession(state);
+    var restored_writable = activation.writable;
+    const client_system_prompt = activation.client_system_prompt orelse
+        try restoredClientSystemPrompt(state.alloc, &restored_writable);
+    errdefer if (activation.client_system_prompt == null and client_system_prompt.len > 0) {
+        state.alloc.free(client_system_prompt);
+    };
+    if (activation.workspace) |binding| try workspace_binding.commit(state, binding);
     if (activation.credential) |credential| server.adoptServerCredential(state, credential);
+    // Nothing after this load can fail before the session takes ownership.
+    const tool_identities = try restoredToolIdentities(state.alloc, &restored_writable);
     state.active_session = .{
         .session_id = activation.session_id,
         .store = store,
-        .writable = activation.writable,
+        .writable = restored_writable,
+        .client_system_prompt = client_system_prompt,
+        .tool_identities = tool_identities,
         .model = activation.model,
         .provider = activation.provider,
         .mode = state.cfg.mode_registry.default_mode_id,
@@ -1317,11 +1495,14 @@ fn sendExecutionHistory(
     const frames = try planExecutionReplay(
         arena_state.allocator(),
         tool_call_presentation.activeToolRegistry(state),
+        activeSessionMcp(state),
+        if (state.active_session) |*active| &active.tool_identities else null,
         execution,
     );
     for (frames) |frame| {
         switch (frame) {
             .assistant_text => |text| try sendAgentHistoryChunk(state, alloc, session_id, text),
+            .steering_text => |text| try sendSteeringHistoryChunk(state, alloc, session_id, text),
             .tool_call => |call| try sendHistoryToolCall(state, alloc, session_id, call),
         }
     }
@@ -1331,6 +1512,7 @@ const ReplayToolCall = struct {
     id: []const u8,
     name: []const u8,
     title: []const u8,
+    meta: acp_types.ToolCallMeta,
     kind: acp_types.ToolCallKind,
     status: acp_types.ToolCallStatus,
     raw_input: ?std.json.Value,
@@ -1339,6 +1521,8 @@ const ReplayToolCall = struct {
 
 const ReplayFrame = union(enum) {
     assistant_text: []const u8,
+    /// A steering message the turn absorbed, replayed where it was inserted.
+    steering_text: []const u8,
     tool_call: ReplayToolCall,
 };
 
@@ -1360,11 +1544,21 @@ fn findToolResultIndex(results: []const types.PersistedToolResult, call_id: []co
 fn planToolCallFrame(
     arena: Allocator,
     registry: tool_dispatch.Registry,
+    mcp: ?*mcp_runtime.McpRuntime,
+    identities: ?*tool_call_identities.Record,
     call: types.ToolCall,
     result: ?types.PersistedToolResult,
 ) !ReplayToolCall {
     const name = tool_call_presentation.acpToolName(call.name);
-    const title = tool_call_presentation.describeToolTitle(registry, arena, call) catch "Tool call";
+    // MCP identity comes from the live catalog, or from the identity recorded
+    // when the session made the call; it is never guessed from the exposed
+    // name. Servers served over ACP connect only on the next turn.
+    const mcp_identity = if (registry.lookup(call.name) == null)
+        (if (mcp) |runtime| runtime.toolIdentity(arena, call.name) catch null else null) orelse
+            if (identities) |record| try record.lookup(arena, call.name) else null
+    else
+        null;
+    const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
     const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(arena, call.name, call.arguments_json);
     // Parsed with the arena and returned in the frame; no deinit, the caller's
     // arena frees it in bulk.
@@ -1380,7 +1574,8 @@ fn planToolCallFrame(
     return .{
         .id = call.id,
         .name = name,
-        .title = title,
+        .title = presentation.title,
+        .meta = presentation.meta,
         .kind = tool_call_presentation.mapToolKind(name),
         .status = replayStatus(result),
         .raw_input = if (parsed) |p| p.value else null,
@@ -1399,13 +1594,27 @@ fn planToolCallFrame(
 /// tool_call announcement (and final tool_call_update) per tool call.
 /// The returned frames borrow from `execution` and `arena`; the caller owns
 /// the slice and must free it with the arena.
+fn hostChannel(state: *server.ServerState) ?message_carrier.Carrier {
+    if (comptime host_target.is_wasm) return null;
+    return mcp_carrier.carrier(state);
+}
+
+fn activeSessionMcp(state: *server.ServerState) ?*mcp_runtime.McpRuntime {
+    if (comptime host_target.is_wasm) return null;
+    const session = if (state.active_session) |*active| active else return null;
+    return session.mcp;
+}
+
 fn planExecutionReplay(
     arena: Allocator,
     registry: tool_dispatch.Registry,
+    mcp: ?*mcp_runtime.McpRuntime,
+    identities: ?*tool_call_identities.Record,
     execution: types.ExecutionMemory,
 ) ![]ReplayFrame {
     var frames: std.ArrayList(ReplayFrame) = .empty;
-    for (execution.tool_steps) |step| {
+    var steering_index = try appendSteeringReplay(arena, &frames, execution.steering, 0, 0);
+    for (execution.tool_steps, 0..) |step, step_index| {
         if (step.assistant) |assistant| {
             if (assistant.len > 0) try frames.append(arena, .{ .assistant_text = assistant });
         }
@@ -1416,7 +1625,7 @@ fn planExecutionReplay(
                 matched[i] = true;
                 break :blk step.tool_results[i];
             } else null;
-            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, call, result) });
+            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, call, result) });
         }
         // Results without a surviving call record (e.g. trimmed history) still
         // replay as completed frames so the transcript stays faithful.
@@ -1427,10 +1636,35 @@ fn planExecutionReplay(
                 .name = result.tool_name,
                 .arguments_json = "{}",
             };
-            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, call, result) });
+            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, call, result) });
         }
+        steering_index = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, step_index + 1);
     }
+    // Entries past the last step still replay, in order, rather than vanish.
+    _ = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, null);
     return frames.toOwnedSlice(arena);
+}
+
+/// Appends the steering entries recorded after `completed_steps` tool steps
+/// (every remaining entry when null), each preceded by the assistant text the
+/// turn had streamed before absorbing it. Returns the next unreplayed index.
+fn appendSteeringReplay(
+    arena: Allocator,
+    frames: *std.ArrayList(ReplayFrame),
+    steering: []const types.PersistedSteering,
+    start: usize,
+    completed_steps: ?usize,
+) !usize {
+    var index = start;
+    while (index < steering.len) : (index += 1) {
+        const entry = steering[index];
+        if (completed_steps) |count| if (entry.after_tool_step_count != count) break;
+        if (entry.assistant_prefix) |prefix| {
+            if (prefix.len > 0) try frames.append(arena, .{ .assistant_text = prefix });
+        }
+        if (entry.text.len > 0) try frames.append(arena, .{ .steering_text = entry.text });
+    }
+    return index;
 }
 
 fn sendHistoryToolCall(
@@ -1444,7 +1678,7 @@ fn sendHistoryToolCall(
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeToolCall(&out.writer, call.id, call.name, call.title, call.kind, .pending, call.raw_input);
+    try acp_types.writeToolCall(&out.writer, call.id, call.name, call.title, call.kind, .pending, call.raw_input, call.meta);
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
     if (call.status == .pending) return;
@@ -1453,6 +1687,25 @@ fn sendHistoryToolCall(
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
     try acp_types.writeToolCallUpdate(&out.writer, call.id, call.status, call.content_text);
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
+}
+
+/// Replays absorbed steering. The original request ID is not persisted, so the
+/// frame carries a null `requestId`.
+fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, session_id: []const u8, text: []const u8) !void {
+    var message_id: acp_types.MessageIdBuffer = undefined;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(session_id, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeSteeringUserMessageChunk(
+        &out.writer,
+        acp_types.generateMessageId(&message_id),
+        text,
+        null,
+    );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -2103,6 +2356,8 @@ test "execution replay plan interleaves assistant text and orphan results" {
     const frames = try planExecutionReplay(
         arena,
         @import("../builtins/tools.zig").registry,
+        null,
+        null,
         .{ .tool_steps = steps[0..] },
     );
     try std.testing.expectEqual(@as(usize, 3), frames.len);

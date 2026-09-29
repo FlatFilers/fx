@@ -1026,6 +1026,34 @@ pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, k
     return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
 }
 
+/// Resolves the exact exposed name of a live MCP tool the model called
+/// without selecting it. Returns null for unknown, denied, inaccessible, or
+/// oversized definitions. The result is allocated in `arena`.
+pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const runtime_context = ctx.mcp_ctx orelse return null;
+    const schema_fn = ctx.mcp_tool_schema orelse return null;
+    const projection = (schema_fn(
+        runtime_context,
+        arena,
+        name,
+        ctx.permission_rules,
+        ctx.context_limits,
+        ctx.mcp_access,
+        runtimeCancelFlag(ctx),
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return null,
+    }) orelse return null;
+    return switch (projection) {
+        .selected => |payload| .{
+            .name = name,
+            .schema_json = payload.model_output,
+            .mcp_binding = payload.mcp_binding,
+        },
+        .rejected => null,
+    };
+}
+
 fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
     var unavailable_output: []const u8 = "MCP tool definition changed before execution and is no longer available. Search for current tools.";
     var notice: ?[]const u8 = null;
