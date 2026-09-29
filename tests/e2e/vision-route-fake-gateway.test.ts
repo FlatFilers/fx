@@ -1160,9 +1160,7 @@ describe("Vision route fake Gateway", () => {
         expect(body).toContain("This request permits at most 8000 per side and 5 MiB encoded per image.");
         expect(body).toContain("The original is saved at ");
         expect(body).toContain("then read_file the copy.");
-        expect(result.stderr).toContain(
-          "An attached image was not sent because the request limit is 8000 pixels per side or 5 MiB encoded per image.",
-        );
+        expect(result.stderr).toBe("");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1235,9 +1233,7 @@ describe("Vision route fake Gateway", () => {
         expect(body).toContain(
           "Use an available image tool to save a smaller copy to a new file ending in .jpg, then read_file the copy.",
         );
-        expect(result.stderr).toContain(
-          "An attached image was not sent because the request limit is 8000 pixels per side or 5 MiB encoded per image.",
-        );
+        expect(result.stderr).toBe("");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1256,7 +1252,6 @@ describe("Vision route fake Gateway", () => {
       const stderrPath = join(root.root, "stderr.log");
       writeFileSync(stderrPath, "");
       let session: TmuxSession | null = null;
-      const notice = "An attached image was not sent because the request limit is 8000 pixels per side or 5 MiB encoded per image.";
       try {
         session = await TmuxSession.create({
           cmd: FX_BIN,
@@ -1275,8 +1270,11 @@ describe("Vision route fake Gateway", () => {
         await session.waitForText("attached image: photo.jpg", TIMEOUT);
         await session.sendText("Describe the attached image.");
         await session.waitForText("TUI oversized image recovery answer", TIMEOUT);
-        await session.waitForText(notice, TIMEOUT);
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        const scrollback = await session.captureFullScrollbackEscapes();
+        expect(scrollback).toContain("TUI oversized image recovery answer");
+        expect(scrollback).not.toContain("An attached image was not sent");
+        expect(scrollback).not.toContain("[Image #1 not sent");
 
         expect(gateway.chatRequests).toHaveLength(1);
         const body = gateway.chatRequests[0]!.body;

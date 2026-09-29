@@ -6967,7 +6967,6 @@ fn processQueuedPromptLoop(
         selected_fast_mode;
     var fast_unavailable_notified = false;
     var tool_image_strip_notified = false;
-    var attachment_withheld_notified = false;
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
@@ -7351,23 +7350,6 @@ fn processQueuedPromptLoop(
                     safe_tool_messages,
                     max_dimension,
                 );
-                // The model gets a note for each withheld attachment. The user
-                // hears about ones attached this turn, once per turn.
-                var withheld_now: usize = 0;
-                for (projection.withheld_ids) |id| {
-                    for (job.images) |image| {
-                        if (image.id == id) withheld_now += 1;
-                    }
-                }
-                if (withheld_now > 0 and !attachment_withheld_notified) {
-                    attachment_withheld_notified = true;
-                    try deps.push_text(deps.ctx, .{ .operational = try std.fmt.allocPrint(
-                        overlay_arena,
-                        "{s} not sent because the request limit is {d} pixels per side or 5 MiB encoded per image. The model received recovery guidance instead.",
-                        .{ if (withheld_now == 1) @as([]const u8, "An attached image was") else "Some attached images were", max_dimension },
-                    ) });
-                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
-                }
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);

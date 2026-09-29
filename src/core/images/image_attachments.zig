@@ -889,8 +889,6 @@ fn mediaTypeExtension(media_type: []const u8) ?[]const u8 {
 
 pub const AttachmentProjection = struct {
     messages: []const types.ChatMessage,
-    /// Ids of the attachments left out of the request, in message order.
-    withheld_ids: []const usize = &.{},
 };
 
 /// Leaves unsafe attachments out of the request and gives the model a source
@@ -904,7 +902,6 @@ pub fn withholdOversizedAttachments(
     max_dimension: u32,
 ) !AttachmentProjection {
     var result: ?[]types.ChatMessage = null;
-    var withheld_ids: std.ArrayList(usize) = .empty;
     for (messages, 0..) |message, index| {
         if (message.images.len == 0) continue;
         var kept: ?std.ArrayList(types.ImageAttachment) = null;
@@ -919,7 +916,6 @@ pub fn withholdOversizedAttachments(
                 kept = try .initCapacity(arena, message.images.len);
                 kept.?.appendSliceAssumeCapacity(message.images[0..image_index]);
             }
-            try withheld_ids.append(arena, image.id);
             debug_trace.logf("images", "event=attachment_withheld image_id={d} max_dimension={d} dimensions_known={s}", .{ image.id, max_dimension, if (dimensions != null) "true" else "false" });
             writeWithheldAttachmentNotice(&notice.writer, image, dimensions, max_dimension) catch return error.OutOfMemory;
         }
@@ -930,7 +926,7 @@ pub fn withholdOversizedAttachments(
         projected[index].images = kept_images.items;
         projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
     }
-    return .{ .messages = result orelse messages, .withheld_ids = withheld_ids.items };
+    return .{ .messages = result orelse messages };
 }
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
@@ -3079,7 +3075,6 @@ test "requests leave out attachments over the model pixel limit and name their s
     try std.testing.expectEqualStrings("ok", projected[1].content.?);
     try std.testing.expectEqual(@as(usize, 2), messages[0].images.len);
     try std.testing.expectEqualStrings("compare [Image #1] and [Image #2]", messages[0].content.?);
-    try std.testing.expectEqualSlices(usize, &.{1}, projection.withheld_ids);
 }
 
 test "request cache still withholds a snapshot deleted after dimension lookup" {
@@ -3108,7 +3103,6 @@ test "request cache still withholds a snapshot deleted after dimension lookup" {
     try std.testing.expectEqual(@as(usize, 0), first.messages[0].images.len);
     try std.testing.expectEqual(@as(usize, 0), second.messages[0].images.len);
     try std.testing.expectEqualStrings(first.messages[0].content.?, second.messages[0].content.?);
-    try std.testing.expectEqualSlices(usize, &.{1}, second.withheld_ids);
 }
 
 test "requests ask for a smaller copy of an oversized in-memory attachment" {
@@ -3150,7 +3144,6 @@ test "requests keep verified attachments within the pixel limit unchanged" {
     const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
 
     try std.testing.expectEqual(@as([*]const types.ChatMessage, &messages), projection.messages.ptr);
-    try std.testing.expectEqual(@as(usize, 0), projection.withheld_ids.len);
 }
 
 test "requests withhold snapshots whose dimensions cannot be verified" {
@@ -3285,7 +3278,6 @@ test "requests find a JPEG frame header behind large metadata" {
 
     const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
 
-    try std.testing.expectEqualSlices(usize, &.{1}, projection.withheld_ids);
     try std.testing.expect(std.mem.startsWith(u8, projection.messages[0].content.?, "[Image #1 not sent: image/jpeg is 4032x3024 pixels"));
 }
 
