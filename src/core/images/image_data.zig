@@ -101,20 +101,40 @@ fn detectFormat(bytes: []const u8) ?ImageFormat {
     return null;
 }
 
-/// Longest side, in pixels, of any image in a chat request. Gateway provider
-/// routes reject larger images once a request carries many images (2000 on the
-/// strictest routes, 2576 on others). Images stay in conversation history, so
-/// one conservative bound keeps every later request valid. The vision tool
-/// route sends at most a few images and keeps none, so it does not apply this
-/// bound.
+/// The strictest supported provider permits an image up to 8000 pixels per
+/// side, but limits every image to 2000 when a request carries over 20 images.
 pub const max_image_dimension: u32 = 2000;
+pub const max_single_image_dimension: u32 = 8000;
+pub const strict_image_count: usize = 20;
+
+pub fn requestMaxDimension(image_count: usize) u32 {
+    return if (image_count > strict_image_count) max_image_dimension else max_single_image_dimension;
+}
+
+pub fn countRequestImages(messages: []const types.ChatMessage) usize {
+    var count: usize = 0;
+    for (messages) |message| {
+        count +|= message.images.len;
+        if (message.tool_result_memory) |memory| count +|= memory.tool_images.len;
+    }
+    return count;
+}
+
+pub fn fitsEncodedImageLimit(raw_bytes: usize) bool {
+    const groups = @divTrunc(std.math.add(usize, raw_bytes, 2) catch return false, 3);
+    return (std.math.mul(usize, groups, 4) catch return false) <= max_encoded_image_bytes;
+}
 
 pub const Dimensions = struct {
     width: u32,
     height: u32,
 
+    pub fn exceeds(self: Dimensions, limit: u32) bool {
+        return self.width > limit or self.height > limit;
+    }
+
     pub fn exceedsModelLimit(self: Dimensions) bool {
-        return self.width > max_image_dimension or self.height > max_image_dimension;
+        return self.exceeds(max_image_dimension);
     }
 };
 
@@ -409,10 +429,29 @@ test "image dimensions read every supported header" {
     try expectDimensions(.{ .width = 5000, .height = 2 }, &testWebpExtended(5000, 2));
 }
 
-test "model image limit allows exactly the maximum side" {
-    try std.testing.expect(!(Dimensions{ .width = max_image_dimension, .height = max_image_dimension }).exceedsModelLimit());
-    try std.testing.expect((Dimensions{ .width = max_image_dimension + 1, .height = 1 }).exceedsModelLimit());
-    try std.testing.expect((Dimensions{ .width = 1, .height = max_image_dimension + 1 }).exceedsModelLimit());
+test "request image limit follows the count and byte boundaries" {
+    try std.testing.expectEqual(@as(u32, 8000), requestMaxDimension(1));
+    try std.testing.expectEqual(@as(u32, 8000), requestMaxDimension(20));
+    try std.testing.expectEqual(@as(u32, 2000), requestMaxDimension(21));
+    const wide = Dimensions{ .width = 3420, .height = 2224 };
+    try std.testing.expect(!wide.exceeds(requestMaxDimension(20)));
+    try std.testing.expect(wide.exceeds(requestMaxDimension(21)));
+    try std.testing.expect(!(Dimensions{ .width = 8000, .height = 1 }).exceeds(requestMaxDimension(1)));
+    try std.testing.expect((Dimensions{ .width = 8001, .height = 1 }).exceeds(requestMaxDimension(1)));
+    const max_raw = max_encoded_image_bytes / 4 * 3;
+    try std.testing.expect(fitsEncodedImageLimit(max_raw));
+    try std.testing.expect(!fitsEncodedImageLimit(max_raw + 1));
+    try std.testing.expect(!fitsEncodedImageLimit(std.math.maxInt(usize)));
+}
+
+test "request image count includes attachments and retained tool images" {
+    const attachments = [_]types.ImageAttachment{.{ .path = @constCast("image.png"), .media_type = @constCast("image/png") }};
+    const tool_images = [_]types.ToolImage{.{ .data = @constCast("base64"), .mime_type = @constCast("image/png") }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .images = &attachments },
+        .{ .role = .tool, .tool_result_memory = .{ .tool_images = &tool_images } },
+    };
+    try std.testing.expectEqual(@as(usize, 2), countRequestImages(&messages));
 }
 
 test "image dimensions reject malformed and truncated headers" {

@@ -3245,7 +3245,7 @@ fn finishPendingParallelCancelled(
             // parallel run is deinitialized after this scope, while history
             // keeps prepared.memory.
             prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
-            try runtime_execution_memory.retainToolImages(arena, provisional_alloc, config, call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -7341,11 +7341,15 @@ fn processQueuedPromptLoop(
                 }
             }
             const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
+                const loaded_messages = try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages);
+                const max_dimension = image_data.requestMaxDimension(image_data.countRequestImages(loaded_messages));
+                const safe_tool_messages = try runtime_execution_memory.withholdRequestToolImages(overlay_arena, loaded_messages, max_dimension, config.max_tool_result_bytes);
                 const projection = try image_attachments.withholdOversizedAttachments(
                     overlay_arena,
                     arena,
                     &attachment_dimensions,
-                    try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
+                    safe_tool_messages,
+                    max_dimension,
                 );
                 // The model gets a note for each withheld attachment. The user
                 // hears about ones attached this turn, once per turn.
@@ -7357,11 +7361,11 @@ fn processQueuedPromptLoop(
                 }
                 if (withheld_now > 0 and !attachment_withheld_notified) {
                     attachment_withheld_notified = true;
-                    const limit = image_data.max_image_dimension;
-                    try deps.push_text(deps.ctx, .{ .operational = if (withheld_now == 1)
-                        std.fmt.comptimePrint("An attached image is over {d} pixels per side and fx can't downscale it here, so the model gets a note about it instead of the image.", .{limit})
-                    else
-                        std.fmt.comptimePrint("Some attached images are over {d} pixels per side and fx can't downscale them here, so the model gets a note about them instead of the images.", .{limit}) });
+                    try deps.push_text(deps.ctx, .{ .operational = try std.fmt.allocPrint(
+                        overlay_arena,
+                        "{s} not sent because the request limit is {d} pixels per side or 5 MiB encoded per image. The model received recovery guidance instead.",
+                        .{ if (withheld_now == 1) @as([]const u8, "An attached image was") else "Some attached images were", max_dimension },
+                    ) });
                     try deps.push_text(deps.ctx, .{ .operational = "\n" });
                 }
                 break :native projection.messages;
@@ -11977,7 +11981,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            try runtime_execution_memory.retainToolImages(arena, stream_ctx.alloc, config, tool_call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,
