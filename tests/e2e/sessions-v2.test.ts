@@ -3050,6 +3050,113 @@ test("ACP on a full disk fails the prompt, and the session loads and continues a
   }
 }, TIMEOUT * 3);
 
+test.skipIf(!tmuxAvailable())("an app killed after a named child finished resumes, and the child continues with its history", async () => {
+  const fixture = createFixture("fx-v2-app-kill-after-child-");
+  let phase = 1;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) {
+      if (phase === 1) return fakeGatewayFinalText("CHILD_FIRST_ANSWER");
+      return fakeGatewayFinalText(body.includes("CHILD_FIRST_ANSWER") ? "CHILD_REMEMBERED" : "CHILD_FORGOT");
+    }
+    if (body.includes(`delegate-${phase}`)) return fakeGatewayFinalText(`PARENT_${phase}_DONE`);
+    return fakeGatewayToolCall(`delegate-${phase}`, "subagent", { request: { action: "message", agent: "worker", message: `Worker message ${phase}.` } });
+  }, { classifierDecision: "clear" });
+  try {
+    const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
+    await app.session.sendText("Start the worker.");
+    await scrollbackContains(app.session, "PARENT_1_DONE");
+    await app.session.waitForComposer(TIMEOUT);
+    const roots = rootSessions(fixture);
+    expect(roots).toHaveLength(1);
+    const id = roots[0]!;
+    await waitForLog(fixture, id, "turn_committed");
+    Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
+    await app.session.kill();
+
+    phase = 2;
+    const resumed = await startApp(fixture, gateway, ["--resume", id], true, { FX_PERMISSION_MODE: "auto" });
+    await resumed.session.sendText("Ask the worker again.");
+    await scrollbackContains(resumed.session, "PARENT_2_DONE");
+    await resumed.session.waitForComposer(TIMEOUT);
+    await quitApp(resumed);
+
+    const lines = childLines(fixture, id);
+    expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
+      ["child_spawned", null], ["child_finished", "ok"], ["child_spawned", null], ["child_finished", "ok"],
+    ]);
+    expect(lines[2].child).toBe(lines[0].child);
+    const childId = lines[0].child;
+    const child = logLines(fixture, childId).map((line) => line.kind);
+    expect(child.filter((kind) => kind === "turn_committed")).toHaveLength(2);
+    expect(JSON.stringify(logLines(fixture, childId))).toContain("CHILD_REMEMBERED");
+    expect(logLines(fixture, id).map((line) => line.kind)).not.toContain("turn_interrupted");
+    expectWholeLog(fixture, id);
+    expectWholeLog(fixture, childId);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+/// Hosted terminal records for a v2 session: its side folder (D27).
+function terminalRecords(fixture: Fixture, id: string): Array<Record<string, unknown>> {
+  const root = join(fixture.home, ".fx", "session-files", id, "terminal", "state");
+  if (!existsSync(root)) return [];
+  return readdirSync(root)
+    .filter((name) => name.startsWith("record-") && name.endsWith(".json"))
+    .map((name) => JSON.parse(readFileSync(join(root, name), "utf8")));
+}
+
+test.skipIf(!tmuxAvailable())("a hosted terminal survives an app crash, and the resumed app talks to it and stops it", async () => {
+  const fixture = createFixture("fx-v2-tty-crash-");
+  let shellId = "";
+  const gateway = startFakeGateway([
+    fakeGatewayToolCall("tty_run", "shell", {
+      request: {
+        action: "run",
+        command: "printf 'TTY_READY\\n'; while IFS= read -r line; do printf 'TTY_ECHO:%s\\n' \"$line\"; done",
+        profile: "clean",
+        tty: true,
+        yield_time_ms: 0,
+      },
+    }),
+    (body: string) => {
+      shellId = body.match(/shell-[A-Za-z0-9_-]{22}/)?.[0] ?? "";
+      return fakeGatewayFinalText("TTY_STARTED");
+    },
+    () => fakeGatewayToolCall("tty_interact", "shell", {
+      request: { action: "interact", session_id: shellId, chars: "after the crash\n", yield_time_ms: 2000 },
+    }),
+    () => fakeGatewayToolCall("tty_stop", "shell", { request: { action: "stop", session_id: shellId, force: true } }),
+    fakeGatewayFinalText("TTY_STOPPED"),
+  ]);
+  const appEnv = { FX_PERMISSION_MODE: "full-access", SHELL: "/bin/sh" };
+  try {
+    const app = await startApp(fixture, gateway, [], true, appEnv);
+    await app.session.sendText("Start a terminal.");
+    await app.session.waitForText("TTY_STARTED", TIMEOUT);
+    expect(shellId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
+    const id = onlySession(fixture);
+    await waitForLog(fixture, id, "turn_committed");
+    Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
+    await app.session.kill();
+
+    const resumed = await startApp(fixture, gateway, ["--resume", id], true, appEnv);
+    await resumed.session.sendText("Talk to the terminal, then stop it.");
+    await resumed.session.waitForText("TTY_STOPPED", TIMEOUT);
+    // The terminal kept running through the crash: it echoes a line sent
+    // after it, and the stop finds it.
+    expect(gateway.requests[3]!.body).toContain("TTY_ECHO:after the crash");
+    expect(gateway.requests[4]!.body).toContain('\\"state\\":\\"stopped\\"');
+    await quitApp(resumed);
+    expect(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.lifecycle).toBe("closed");
+    expectWholeLog(fixture, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
 test("a named child whose log is damaged fails that message, and the parent turn goes on", async () => {
   const fixture = createFixture("fx-v2-child-damaged-");
   let phase = 1;
