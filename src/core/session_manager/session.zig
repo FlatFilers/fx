@@ -1489,6 +1489,17 @@ fn notFoundOr(err: storage.Error) (error{NotFound} || storage.IoFault) {
     return if (err == error.NotFound) error.NotFound else error.Io;
 }
 
+/// Whether a blob of session `id_` is present and matches its name. A
+/// missing or damaged one damages its session like a bad line (D39).
+fn blobIsWhole(env: *const Env, id_: []const u8, hash: []const u8) (error{OutOfMemory} || storage.IoFault)!bool {
+    const bytes = readBlob(env, env.gpa, id_, hash) catch |err| switch (err) {
+        error.NotFound, error.Corrupt => return false,
+        else => |e| return e,
+    };
+    env.gpa.free(bytes);
+    return true;
+}
+
 pub const ForkPoint = union(enum) {
     /// The end of this turn; 0 means before the first turn.
     turn: u64,
@@ -1522,7 +1533,7 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
     defer s.closeFile(src);
     const len = s.length(src) catch |io_err| return storage.ioFault(io_err);
     const end = log_mod.lastLineEnd(s, src, len) catch return error.Corrupt;
-    const point = try findForkPoint(env, src, end, options.at);
+    const point = try findForkPoint(env, options.source, src, end, options.at);
 
     const session = try openNew(env, .{
         .workspace = options.workspace,
@@ -1573,8 +1584,9 @@ const ForkPointFound = struct {
     line1_end: u64,
 };
 
-/// Pass 1 of a fork: where S is. Reading stops at the first damage.
-fn findForkPoint(env: *const Env, src: storage.File, end: u64, at: ForkPoint) ForkError!ForkPointFound {
+/// Pass 1 of a fork: where S is. Reading stops at the first damage: a bad
+/// line, or a line naming a missing or damaged blob (D39).
+fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u64, at: ForkPoint) ForkError!ForkPointFound {
     const gpa = env.gpa;
     var reader = log_mod.ForwardReader.init(gpa, env.s, src, 0, end, 1);
     defer reader.deinit();
@@ -1596,6 +1608,15 @@ fn findForkPoint(env: *const Env, src: storage.File, end: u64, at: ForkPoint) Fo
         const kind = line.header.kind orelse continue;
         switch (kind) {
             .turn_started => turn_seen = true,
+            .item => {
+                _ = arena.reset(.retain_capacity);
+                const body = schema.parseBody(arena.allocator(), kind, line.body()) catch return error.Corrupt;
+                var whole = true;
+                for (body.item.blobs) |hash| {
+                    if (!try blobIsWhole(env, source, hash)) whole = false;
+                }
+                if (!whole) break;
+            },
             .turn_committed, .turn_interrupted => {
                 _ = arena.reset(.retain_capacity);
                 const body = schema.parseBody(arena.allocator(), kind, line.body()) catch return error.Corrupt;
@@ -1764,6 +1785,8 @@ pub const Verified = struct {
     damaged_at: ?u64,
     /// Snapshots whose state differs from the fold at their position.
     bad_snapshots: u64,
+    /// Blobs a line names that are missing or fail their hash (D39).
+    bad_blobs: u64 = 0,
 };
 
 /// Reads a whole log without its lock: every line's frame, checksum and
@@ -1805,6 +1828,9 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
         };
         switch (body) {
             .session_created => |c| fork_seq = if (c.forked_from) |o| o.seq else 0,
+            .item => |piece| for (piece.blobs) |hash| {
+                if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
+            },
             .snapshot => |snap| {
                 var decoded = fold.decodeState(gpa, arena.allocator(), snap.state) catch {
                     result.bad_snapshots += 1;

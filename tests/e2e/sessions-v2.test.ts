@@ -1996,3 +1996,49 @@ test("doctor on v2 reports a damaged session and removes only old side folders w
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 3);
+
+test("doctor reports a session whose blob went missing, and recover copies the turns before it", async () => {
+  const fixture = createFixture("fx-v2-lost-blob-recover-");
+  const big = "RECOVER_BLOB_START " + "blob-body ".repeat(30_000) + "RECOVER_BLOB_END";
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("RECOVER_TURN_ONE"),
+    fakeGatewayFinalText(big),
+    fakeGatewayFinalText("RECOVER_TURN_THREE"),
+    fakeGatewayFinalText("AFTER_RECOVER"),
+  ]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Recover question one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume-id", id, "Recover question two."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume-id", id, "Recover question three."])).code).toBe(0);
+    const referenced = (logLines(fixture, id) as any[]).find((line) => Array.isArray(line.blobs) && line.blobs.length === 1);
+    rmSync(join(v2Root(fixture), id, "blobs", referenced.blobs[0]));
+    const logPath = join(v2Root(fixture), id, "log.jsonl");
+    const before = readFileSync(logPath);
+
+    // The log is intact, but a turn it holds is not: doctor says so.
+    const checks = JSON.parse((await command(fixture, gateway, ["doctor", "--json"])).stdout).checks;
+    expect(checks.filter((check: any) => check.name === "session").map((check: any) => `${check.status}: ${check.detail}`)).toEqual([
+      `warn: session ${id} has a damaged log; \`fx session recover ${id}\` copies its good turns`,
+    ]);
+
+    // Recover keeps the turn before the one whose blob is gone.
+    const result = await command(fixture, gateway, ["session", "recover", id, "--json"]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const recovered = JSON.parse(result.stdout);
+    expect(recovered).toMatchObject({ kind: "session_recovery", source_id: id, status: "recovered", history_turns: 1 });
+    const copy: string = recovered.recovered_id;
+    const resumed = await ask(fixture, gateway, ["--resume-id", copy, "Continue in the copy."]);
+    expect(resumed.code).toBe(0);
+    expect(JSON.parse(resumed.stdout).output).toBe("AFTER_RECOVER");
+    const last = gateway.requests.at(-1)!.body;
+    expect(last).toContain("RECOVER_TURN_ONE");
+    expect(last).not.toContain("RECOVER_BLOB_END");
+    expect(last).not.toContain("RECOVER_TURN_THREE");
+    expect(readFileSync(logPath)).toEqual(before);
+    expectWholeLog(fixture, copy);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);

@@ -444,7 +444,7 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Docto
                     continue;
                 },
             };
-            if (verified.damaged_at != null or verified.bad_snapshots > 0) try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
+            if (verified.damaged_at != null or verified.bad_snapshots > 0 or verified.bad_blobs > 0) try report.damaged.append(alloc, try alloc.dupe(u8, item.id));
         }
         cursor = page.next orelse break;
     }

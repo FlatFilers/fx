@@ -836,3 +836,50 @@ test "a resume sets its own wait for a held session, and none is Busy at once (D
     const reopened = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app, .lock_wait_ms = 0 });
     reopened.release();
 }
+
+test "a lost or damaged blob damages its session: verify counts it and a recover fork stops before it (D39)" {
+    for ([_]bool{ false, true }) |overwrite| {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        // Turn 1 names no blob, turn 2 names one, turn 3 names none.
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        _ = try s.append(&.{.turn_started});
+        const hash = try s.putBlob("the body of a long answer");
+        const refs = [_][]const u8{&hash};
+        _ = try s.append(&.{ .{ .item = .{ .type = "assistant", .data = "{}", .blobs = &refs } }, .turn_committed });
+        _ = try s.append(&.{ .turn_started, piece, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+        try testing.expectEqual(@as(u64, 0), (try m.verify(id)).bad_blobs);
+
+        var root = try f.dir();
+        defer root.close(io);
+        const path = try std.fmt.allocPrint(gpa, "{s}/blobs/{s}", .{ id, &hash });
+        defer gpa.free(path);
+        if (overwrite) {
+            try root.writeFile(io, .{ .sub_path = path, .data = "the body of a long ANSWER" });
+        } else {
+            try root.deleteFile(io, path);
+        }
+
+        // The log is intact; the blob it names is not.
+        const verified = try m.verify(id);
+        try testing.expectEqual(@as(u64, 1), verified.bad_blobs);
+        try testing.expectEqual(@as(?u64, null), verified.damaged_at);
+        try testing.expectError(if (overwrite) error.Corrupt else error.NotFound, m.getBlob(gpa, id, &hash));
+
+        // Recover copies turn 1 only; a fork past turn 1 is refused.
+        const copy = try m.openFork(.{ .source = id, .at = .last_good, .workspace = "/w", .host = .app });
+        var st = try copy.state(gpa);
+        defer st.deinit(gpa);
+        try testing.expectEqual(@as(u64, 1), st.last_turn);
+        copy.release();
+        try testing.expectError(error.InvalidForkPoint, m.openFork(.{ .source = id, .at = .{ .turn = 3 }, .workspace = "/w", .host = .app }));
+        const early = try m.openFork(.{ .source = id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app });
+        early.release();
+    }
+}
