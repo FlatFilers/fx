@@ -1693,7 +1693,11 @@ fn promptWorkerMain(active: *ActivePrompt) void {
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
-            .message = @errorName(err),
+            // v2 names a storage fault (D29); v1 keeps the error name.
+            .message = if (active.state.sessions_v2 != null)
+                sessions.v2StorageFaultMessage("Session could not be saved", err) orelse @errorName(err)
+            else
+                @errorName(err),
         },
     };
     if (active.state.active_session) |*session| {

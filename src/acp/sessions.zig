@@ -1114,6 +1114,26 @@ fn activateSession(
     }
 }
 
+/// A v2 storage fault as one sentence after `what`, such as "Session could
+/// not be loaded: the disk is full"; null for any other error.
+pub fn v2StorageFaultMessage(comptime what: []const u8, err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.AccessDenied => what ++ ": permission denied",
+        error.ReadOnlyFileSystem => what ++ ": the disk is read-only",
+        error.NoSpaceLeft => what ++ ": the disk is full",
+        error.FileTooBig => what ++ ": a file-size limit was reached",
+        else => null,
+    };
+}
+
+test "a v2 storage fault reads as its cause, and other errors have no such message" {
+    try std.testing.expectEqualStrings("Session could not be loaded: permission denied", v2StorageFaultMessage("Session could not be loaded", error.AccessDenied).?);
+    try std.testing.expectEqualStrings("Session could not be saved: the disk is read-only", v2StorageFaultMessage("Session could not be saved", error.ReadOnlyFileSystem).?);
+    try std.testing.expectEqualStrings("Session could not be saved: the disk is full", v2StorageFaultMessage("Session could not be saved", error.NoSpaceLeft).?);
+    try std.testing.expectEqualStrings("Session could not be saved: a file-size limit was reached", v2StorageFaultMessage("Session could not be saved", error.FileTooBig).?);
+    try std.testing.expect(v2StorageFaultMessage("Session could not be loaded", error.SessionBusy) == null);
+}
+
 fn handleLoadFailure(
     state: *server.ServerState,
     alloc: Allocator,
@@ -1125,6 +1145,12 @@ fn handleLoadFailure(
         "session operation=load outcome=failed error={s}",
         .{@errorName(err)},
     );
+    // v2 names a storage fault (D29); v1 keeps its messages below.
+    if (state.sessions_v2 != null) {
+        if (v2StorageFaultMessage("Session could not be loaded", err)) |message| {
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = message });
+        }
+    }
     if (err == error.SessionWorkspaceRebindFailed) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
