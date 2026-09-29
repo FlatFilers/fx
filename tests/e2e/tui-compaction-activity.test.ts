@@ -15,7 +15,9 @@ const {
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const HEAD = "HISTORY_HEAD_29b7";
 const TAIL = "HISTORY_TAIL_16d3";
-const HANDOFF = `INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
+// A fact entry, which the compacted conversation keeps whatever the turn
+// numbers.
+const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
 const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
@@ -719,9 +721,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       mkdirSync(workspace);
       copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), image);
       copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), queuedImage);
+      // After an overflow the whole request, fx's own instructions included,
+      // must fit a fifth of the rejected one, so the newest reads are small
+      // enough to stay: the six newest steps are kept, the one before is not.
       for (let step = 2; step <= 24; step++) {
         writeFileSync(join(workspace, `probe-${step}.txt`),
-          Array.from({ length: 80 }, (_, line) =>
+          Array.from({ length: step >= 20 ? 2 : 80 }, (_, line) =>
             `READ_PROBE_BEFORE_OVERFLOW_67e step=${step} line=${line} long evidence for retained context boundary\n`).join(""));
       }
       writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({

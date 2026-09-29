@@ -2850,10 +2850,12 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     defer alloc.free(old_assistant);
     @memset(old_assistant, 'a');
     @memcpy(old_assistant[0..old_marker.len], old_marker);
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = old_assistant }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("OLD_USER_REQUEST_KEPT_EXACTLY") },
-            .assistant = old_assistant,
+            .assistant = @constCast("OLD_FINAL_REPLY_KEPT_EXACTLY"),
+            .execution = .{ .tool_steps = &old_steps },
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("NEW_HISTORY_USER") },
@@ -2868,7 +2870,7 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
         ),
     }};
     const completions = [_]FakeCompletion{
-        .{ .content = "The earlier assistant work is summarized." },
+        .{ .content = "Turn 1\nIn between: The earlier assistant work is summarized." },
         .{ .content = "Done" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -2891,10 +2893,11 @@ test "processQueuedPrompt uses one available capability snapshot for compaction 
     try expectBodyNotContains(&gateway, 0, "NEW_HISTORY_ASSISTANT");
     try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":16000");
     try expectBodyContains(&gateway, 1, "compacted_conversation");
-    // The user message stays exact; the reply is too long to show word for
-    // word, so it is summarized with the turn.
+    // The user message and final reply stay exact; the work in between is
+    // summarized.
     try expectBodyContains(&gateway, 1, "User 1:\\nOLD_USER_REQUEST_KEPT_EXACTLY");
-    try expectBodyContains(&gateway, 1, "Assistant 1, summary of its work:\\nThe earlier assistant work is summarized.");
+    try expectBodyContains(&gateway, 1, "Assistant 1, in between:\\nThe earlier assistant work is summarized.");
+    try expectBodyContains(&gateway, 1, "Assistant 1, final reply:\\nOLD_FINAL_REPLY_KEPT_EXACTLY");
     try expectBodyNotContains(&gateway, 1, old_marker);
     try expectBodyContains(&gateway, 1, "NEW_HISTORY_USER");
     try expectBodyContains(&gateway, 1, "NEW_HISTORY_ASSISTANT");
@@ -2909,10 +2912,12 @@ test "processQueuedPrompt compacts with the selected working model" {
     const old_assistant = try alloc.alloc(u8, 48_000);
     defer alloc.free(old_assistant);
     @memset(old_assistant, 'a');
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = old_assistant }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = old_user },
-            .assistant = old_assistant,
+            .assistant = @constCast("old final reply"),
+            .execution = .{ .tool_steps = &old_steps },
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("recent user") },
@@ -3006,8 +3011,9 @@ test "compaction writes the summary with the least reasoning each model accepts"
     const old_assistant = try alloc.alloc(u8, 96_000);
     defer alloc.free(old_assistant);
     @memset(old_assistant, 'a');
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = old_assistant }};
     var history = [_]HistoryTurn{
-        .{ .assistant = .{ .user = .{ .text = @constCast("older request") }, .assistant = old_assistant } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("older request") }, .assistant = @constCast("older answer"), .execution = .{ .tool_steps = &old_steps } } },
         .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent answer") } },
     };
     const effort = types.ReasoningEffort.literal;
@@ -3114,7 +3120,7 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         "{\"path\":\"first.txt\"}",
     )};
     const completions = [_]FakeCompletion{
-        .{ .content = "Finish after the verified read and return the result." },
+        .{ .content = "Turn 1\nIn between: Finish after the verified read and return the result." },
         .{ .tool_calls = &first_calls },
         .{ .content = "Automatic compaction complete." },
     };
@@ -3157,13 +3163,14 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         .truncated = true,
     }};
     var restored_steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 150_000)),
         .tool_calls = &restored_calls,
         .tool_results = &restored_results,
     }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("AUTO_HISTORY_USER_SENTINEL") },
-            .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 150_000)),
+            .assistant = @constCast("AUTO_HISTORY_FINAL_SENTINEL"),
             .execution = .{ .tool_steps = &restored_steps },
         } },
         .{ .assistant = .{
@@ -3186,9 +3193,10 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     ) != null);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "AUTO_HISTORY_ASSISTANT_SENTINEL");
+    try expectBodyContains(&gateway, 1, "Assistant 1, final reply:\\nAUTO_HISTORY_FINAL_SENTINEL");
     try expectBodyContains(&gateway, 0, "AUTO_RESTORED_AVAILABLE_BYTES");
-    try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&gateway, 0, "\"tools\":[]");
+    try expectBodyContains(&gateway, 0, "AUTO_COMPACTION_HOST_INSTRUCTIONS");
+    try expectNotesAfterConversation(&gateway, 0, 1);
     try expectBodyContains(&gateway, 1, "compacted_conversation");
     try expectBodyContains(&gateway, 1, "User 1:\\nAUTO_HISTORY_USER_SENTINEL");
     try std.testing.expect((try prompt_context.measureProviderRequest(alloc, gateway.request_bodies.items[1], .{
@@ -3290,7 +3298,7 @@ test "processQueuedPrompt delivers steering queued during in-turn compaction wit
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectNotesAfterConversation(&gateway, 0, 1);
     // The first post-compaction request already carries the steering guidance.
     // (Before the boundary fix it only appeared in the reply after it.)
     try expectBodyContainsInOrder(&gateway, 1, &.{ "compacted_conversation", "user_steering", "STEER_DURING_COMPACT_SENTINEL" });
@@ -3301,7 +3309,22 @@ test "processQueuedPrompt delivers steering queued during in-turn compaction wit
     try std.testing.expect(hooks.history_turns.items[1] == .assistant);
 }
 
-test "automatic compaction keeps the newest turns unchanged" {
+/// The compaction request `index` follows the agent's own request, so the
+/// provider can reuse what it cached: the same tools as the agent's request
+/// `agent_index` and its tool choice, then the notes request.
+fn expectNotesAfterConversation(gateway: *FakeGateway, index: usize, agent_index: usize) !void {
+    const body = gateway.request_bodies.items[index];
+    const agent = gateway.request_bodies.items[agent_index];
+    try std.testing.expect(std.mem.find(u8, body, "Write the compaction notes for the turns of the conversation above") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"toolChoice\":{\"type\":\"auto\"}") != null);
+    const tools_start = std.mem.find(u8, agent, "\"tools\":") orelse return error.TestUnexpectedResult;
+    const tools_end = std.mem.findPos(u8, agent, tools_start, ",\"toolChoice\"") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, body, agent[tools_start..tools_end]) != null);
+}
+
+/// Compacts three turns, the oldest one large, behind a system prompt of
+/// `system_bytes`, and returns how many turns the checkpoint replaced.
+fn compactBehindSystemPrompt(comptime system_bytes: usize) !usize {
     const alloc = std.testing.allocator;
     var gateway = FakeGateway.init(alloc, &.{
         .{ .content = "The earlier work is complete. Preserve the recent facts." },
@@ -3315,11 +3338,12 @@ test "automatic compaction keeps the newest turns unchanged" {
     hooks.available_capability_overrides = &overrides;
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.system_prompt = "i" ** 104_000;
+    config.system_prompt = "i" ** system_bytes;
     var job = fixture.job();
     job.model = @constCast(model);
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("OLD_BUDGET_FACT " ++ ("h" ** 380_000)) }};
     var history = [_]HistoryTurn{
-        .{ .assistant = .{ .user = .{ .text = @constCast("older") }, .assistant = @constCast("OLD_BUDGET_FACT " ++ ("h" ** 380_000)) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("older") }, .assistant = @constCast("older done"), .execution = .{ .tool_steps = &old_steps } } },
         .{ .assistant = .{ .user = .{ .text = @constCast("middle") }, .assistant = @constCast("MIDDLE_BUDGET_FACT " ++ ("m" ** 8_000)) } },
         .{ .assistant = .{ .user = .{ .text = @constCast("recent") }, .assistant = @constCast("RECENT_BUDGET_FACT " ++ ("r" ** 8_000)) } },
     };
@@ -3327,15 +3351,26 @@ test "automatic compaction keeps the newest turns unchanged" {
     try runFakePrompt(&gateway, &hooks, config, job);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "OLD_BUDGET_FACT");
-    try expectBodyNotContains(&gateway, 0, "MIDDLE_BUDGET_FACT");
-    try expectBodyNotContains(&gateway, 0, "RECENT_BUDGET_FACT");
+    // The newest turn stays as it is, so it is never listed for notes. It is
+    // in the request only when the notes follow the conversation itself.
+    try expectBodyContains(&gateway, 0, "\\nTurn 1 (");
+    try expectBodyNotContains(&gateway, 0, "\\nTurn 3 (");
+    if (std.mem.find(u8, gateway.request_bodies.items[0], "of the conversation above") == null) try expectBodyNotContains(&gateway, 0, "RECENT_BUDGET_FACT");
     try expectBodyContains(&gateway, 1, "compacted_conversation");
     try expectBodyNotContains(&gateway, 1, "OLD_BUDGET_FACT");
-    try expectBodyContains(&gateway, 1, "MIDDLE_BUDGET_FACT");
     try expectBodyContains(&gateway, 1, "RECENT_BUDGET_FACT");
-    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].compacted_summary.removed_turn_count);
+    return hooks.history_turns.items[0].compacted_summary.removed_turn_count;
+}
+
+test "automatic compaction keeps the newest turns unchanged" {
+    try std.testing.expectEqual(@as(usize, 1), try compactBehindSystemPrompt(20_000));
+}
+
+test "a large fixed part of the request leaves less room for the kept turns" {
+    // The system prompt alone fills most of the room after compaction, so
+    // only the newest turn stays.
+    try std.testing.expectEqual(@as(usize, 2), try compactBehindSystemPrompt(104_000));
 }
 
 test "compaction remeasures its rebuilt continuation after calibrated preflight" {
@@ -3694,10 +3729,12 @@ test "cancelled automatic compaction is retried by the next prompt" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.tool_result_dir = result_dir;
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ ("h" ** 150_000)) }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("CANCELLED_AUTO_HISTORY_USER") },
-            .assistant = @constCast("CANCELLED_AUTO_HISTORY_ASSISTANT\n" ++ ("h" ** 150_000)),
+            .assistant = @constCast("CANCELLED_AUTO_HISTORY_FINAL"),
+            .execution = .{ .tool_steps = &old_steps },
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("CANCELLED_AUTO_RECENT_USER") },
@@ -3746,7 +3783,7 @@ test "cancelled automatic compaction is retried by the next prompt" {
 
     try std.testing.expectEqual(@as(usize, 2), follow_up_gateway.request_bodies.items.len);
     try expectBodyContains(&follow_up_gateway, 0, "CANCELLED_AUTO_HISTORY_ASSISTANT");
-    try expectBodyContains(&follow_up_gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectNotesAfterConversation(&follow_up_gateway, 0, 1);
     try expectBodyContains(&follow_up_gateway, 1, "compacted_conversation");
     try expectBodyNotContains(&follow_up_gateway, 1, "CANCELLED_AUTO_HISTORY_ASSISTANT");
     compacted_count = 0;
@@ -3766,9 +3803,11 @@ test "retained context automatic compaction archives oversized parallel results 
     const old_text = "OLDER_HISTORY_SENTINEL " ++ ("o" ** 52_000);
     const result_a = "RECENT_EXACT_A\n" ++ ("a" ** 13_000);
     const result_b = "RECENT_EXACT_B\n" ++ ("b" ** 13_000);
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(old_text) }};
     const history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("previous work") },
-        .assistant = @constCast(old_text),
+        .assistant = @constCast("previous work done"),
+        .execution = .{ .tool_steps = &old_steps },
     } }};
     const calls = [_]ToolCall{
         toolCall("retained-a", "read_file", "{\"path\":\"a.txt\"}"),
@@ -3857,8 +3896,9 @@ test "retained context compaction preserves recovered historical replay" {
         .tool_results = &results,
         .provider_replay = .{ .source = .{ .provider = .gateway, .model = model }, .parts_json = state },
     }};
+    var old_steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(old_text) }};
     var history = [_]HistoryTurn{
-        .{ .assistant = .{ .user = .{ .text = @constCast("earlier work") }, .assistant = @constCast(old_text) } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("earlier work") }, .assistant = @constCast("earlier work done"), .execution = .{ .tool_steps = &old_steps } } },
         .{ .assistant = .{ .user = .{ .text = @constCast("recent work") }, .assistant = @constCast(""), .execution = .{ .tool_steps = &steps } } },
     };
     const old_tokens = estimateTextTokens(old_text);
@@ -3895,7 +3935,7 @@ test "compaction summarizes an oversized only recent exchange without repeating 
     const original_result = "RECENT_ONLY\n" ++ ("r" ** 10_000);
     var gateway = FakeGateway.init(alloc, &.{
         .{ .tool_calls = &.{toolCall("recent-only", "read_file", "{\"path\":\"large.txt\"}")} },
-        .{ .content = "The read completed with RECENT_ONLY." },
+        .{ .content = "Turn in progress\nIn between: The read completed with RECENT_ONLY." },
         .{ .content = "Completed from the observed result." },
     });
     defer gateway.deinit();

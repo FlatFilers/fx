@@ -1,6 +1,7 @@
 //! Asks a model once for text: one system message and one user message, no
-//! tools. Also offers a conversation's connection to fx-compactor as its
-//! model caller.
+//! tools, or one more user message after a conversation sent exactly as the
+//! agent was about to send it. Also offers a conversation's connection to
+//! fx-compactor as its model caller.
 
 const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
@@ -32,6 +33,12 @@ pub const Request = struct {
     trace_ctx: debug_trace.TraceContext,
     system: []const u8,
     user: []const u8,
+    /// When set, `user` follows this request's messages, sent with its
+    /// instructions, tools and tool choice unchanged, so the provider can
+    /// reuse what it cached of them; `system` is not sent. Borrowed.
+    conversation: ?agent_stream_provider.RequestData = null,
+    /// Receives what the provider reported the request used.
+    usage_out: ?*types.Usage = null,
 };
 
 pub const Reason = enum {
@@ -61,7 +68,16 @@ pub const Error = error{ Cancelled, OutOfMemory };
 pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const instructions = [_]types.ChatMessage{.{ .role = .system, .content = request.system }};
-    const messages = [_]types.ChatMessage{.{ .role = .user, .content = request.user }};
+    const user: types.ChatMessage = .{ .role = .user, .content = request.user };
+    const alone = [_]types.ChatMessage{user};
+    const conversation = request.conversation;
+    const messages: []const types.ChatMessage = if (conversation) |sent| joined: {
+        const all = try alloc.alloc(types.ChatMessage, sent.messages.len + 1);
+        @memcpy(all[0..sent.messages.len], sent.messages);
+        all[sent.messages.len] = user;
+        break :joined all;
+    } else &alone;
+    defer if (conversation != null) alloc.free(messages);
     var capture = StreamCapture{ .alloc = alloc, .max_bytes = request.max_bytes };
     defer capture.deinit();
     var delivery = runtime_gateway_step.DeliveryCertainty.init();
@@ -74,10 +90,12 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
             .session_id = request.session_id,
             .model = request.model,
             .retry_count = request.retry_count,
-            .instructions = &instructions,
-            .messages = &messages,
-            .tools = .{},
-            .tool_choice = .none,
+            .instructions = if (conversation) |sent| sent.instructions else &instructions,
+            .messages = messages,
+            .tools = if (conversation) |sent| sent.tools else .{},
+            .tool_choice = if (conversation) |sent| sent.tool_choice else .none,
+            .vision_mode = if (conversation) |sent| sent.vision_mode else .unavailable,
+            .verified_images = if (conversation) |sent| sent.verified_images else null,
             .provider_options = request.provider_options,
             .max_output_tokens = request.max_output_tokens,
             .budget = .{ .cancel_flag = request.cancel_flag },
@@ -111,6 +129,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
         },
         .completed => |completed| completed.completion,
     };
+    if (request.usage_out) |usage| usage.* = completion.usage;
     if (capture.failed) return error.OutOfMemory;
     if (!capture.saw_content) if (completion.content) |content| capture.append(content) catch return error.OutOfMemory;
     if (capture.saw_tool_call or completion.tool_calls.len > 0) return failed(alloc, .tool_call, "", .{});
@@ -162,7 +181,8 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
 /// A conversation's connection to its model, offered to fx-compactor. Its own
 /// options and output limit apply to its own model; another model keeps the
 /// provider routing and prompt caching but gets only the reasoning asked for
-/// and its own output limit.
+/// and its own output limit. A request after the conversation keeps the
+/// conversation's options as they are.
 pub const CompactorCaller = struct {
     stream_provider: agent_stream_provider.Provider,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
@@ -182,6 +202,9 @@ pub const CompactorCaller = struct {
     capabilities_fn: *const fn (context: *anyopaque, model: []const u8) model_capabilities.Capabilities,
     usage: ?*session_usage.Usage = null,
     usage_allocator: Allocator = std.heap.c_allocator,
+    /// The request the agent was about to send. A request after the
+    /// conversation repeats it unchanged before its own message. Borrowed.
+    conversation: ?agent_stream_provider.RequestData = null,
 
     /// Borrows `self`, which must outlive the compaction.
     pub fn caller(self: *CompactorCaller) compactor.ModelCaller {
@@ -191,6 +214,7 @@ pub const CompactorCaller = struct {
             .model = self.model,
             .provider = self.provider,
             .credential_source = self.credential_source,
+            .sends_after_conversation = self.conversation != null,
         };
     }
 
@@ -202,14 +226,24 @@ pub const CompactorCaller = struct {
     fn send(context: *anyopaque, alloc: Allocator, call: compactor.Call) compactor.CallError!compactor.Reply {
         const self: *CompactorCaller = @ptrCast(@alignCast(context));
         const own = std.mem.eql(u8, call.model, self.model);
-        // Another model keeps the user's provider routing but none of the
-        // options chosen for this one.
-        var options: model_capabilities.ResolvedProviderOptions = if (own) self.provider_options else .{
+        // Only the conversation's own model reads it; the request is built
+        // for that model.
+        var conversation: ?agent_stream_provider.RequestData = null;
+        if (call.after_conversation) {
+            if (!own or self.conversation == null) return .{ .failed = .{ .reason = .provider, .detail = try alloc.dupe(u8, "kind=no_conversation") } };
+            conversation = self.conversation;
+        }
+        // After the conversation, the agent's own options, reasoning too: the
+        // provider reuses its cache only for the same settings. Another model
+        // keeps the user's provider routing but none of the options chosen
+        // for this one.
+        var options: model_capabilities.ResolvedProviderOptions = if (conversation) |sent| sent.provider_options else if (own) self.provider_options else .{
             .prompt_caching = self.provider_options.prompt_caching,
             .provider_order = self.provider_options.provider_order,
             .provider_strict = self.provider_options.provider_strict,
         };
-        options.reasoning = call.reasoning;
+        if (conversation == null) options.reasoning = call.reasoning;
+        var usage: types.Usage = .{};
         const outcome = try complete(alloc, .{
             .stream_provider = self.stream_provider,
             .cooperative_pulse = self.cooperative_transport_pulse,
@@ -231,6 +265,12 @@ pub const CompactorCaller = struct {
             .trace_ctx = call.trace_ctx,
             .system = call.system,
             .user = call.user,
+            .conversation = conversation,
+            .usage_out = &usage,
+        });
+        compactor.traceLog(false, "compaction model call model={s} after_conversation={} input_tokens={any} cache_read_tokens={any} cache_write_tokens={any} output_tokens={any}", .{
+            call.model,               call.after_conversation, usage.input_tokens, usage.cache_read_tokens,
+            usage.cache_write_tokens, usage.output_tokens,
         });
         return switch (outcome) {
             .text => |text| .{ .text = text },
@@ -247,3 +287,82 @@ pub const CompactorCaller = struct {
         };
     }
 };
+
+test "a compactor request after the conversation sends it unchanged, then the request" {
+    const testing = std.testing;
+    const Fake = struct {
+        instruction: []const u8 = "",
+        instructions: usize = 0,
+        messages: usize = 0,
+        last_message: []const u8 = "",
+        tools: usize = 0,
+        tool_choice: types.ToolChoice = .required,
+        reasoning: ?types.ReasoningEffort = null,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !runtime_gateway_step.StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.reasoning = request.provider_options.reasoning;
+            self.instructions = request.instructions.len;
+            self.instruction = request.instructions[0].content.?;
+            self.messages = request.messages.len;
+            self.last_message = request.messages[request.messages.len - 1].content.?;
+            self.tools = request.tools.advertised_names.len;
+            self.tool_choice = request.tool_choice;
+            return .{ .completed = .{
+                .completion = .{ .content = try alloc.dupe(u8, "notes"), .finish_reason = .stop },
+                .ownership = .owned,
+            } };
+        }
+
+        fn capabilities(_: *anyopaque, _: []const u8) model_capabilities.Capabilities {
+            return .{};
+        }
+    };
+    var fake: Fake = .{};
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "the agent's instructions" }};
+    const history = [_]types.ChatMessage{ .{ .role = .user, .content = "fix the build" }, .{ .role = .assistant, .content = "Fixed." } };
+    var summary_model: CompactorCaller = .{
+        .stream_provider = .{ .context = &fake, .stream_fn = Fake.stream },
+        .provider = .gateway,
+        .model = "m",
+        .api_key = "fixture-key",
+        .retry_count = 1,
+        .capabilities_context = &fake,
+        .capabilities_fn = Fake.capabilities,
+        .conversation = .{ .model = "m", .instructions = &instructions, .messages = &history, .tools = .{ .advertised_names = &.{"shell"} }, .tool_choice = .auto, .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") } },
+    };
+    const caller = summary_model.caller();
+    try testing.expect(caller.sends_after_conversation);
+    var cancel = std.atomic.Value(bool).init(false);
+    var call: compactor.Call = .{ .model = "m", .reasoning = types.ReasoningEffort.literal("none"), .system = "the compactor's instructions", .user = "write the notes", .after_conversation = true, .max_bytes = 1024, .cancel_flag = &cancel, .trace_ctx = .{} };
+
+    const after = try caller.vtable.send(caller.context, testing.allocator, call);
+    defer testing.allocator.free(after.text);
+    try testing.expectEqualStrings("notes", after.text);
+    try testing.expectEqualStrings("the agent's instructions", fake.instruction);
+    try testing.expectEqual(@as(usize, 3), fake.messages);
+    try testing.expectEqualStrings("write the notes", fake.last_message);
+    try testing.expectEqual(@as(usize, 1), fake.tools);
+    try testing.expectEqual(types.ToolChoice.auto, fake.tool_choice);
+    // The provider reuses its cache only for the agent's own reasoning.
+    try testing.expect(fake.reasoning.?.eql(types.ReasoningEffort.literal("high")));
+
+    // Without it, one system message and one user message, no tools, at the
+    // reasoning asked for.
+    call.after_conversation = false;
+    const alone = try caller.vtable.send(caller.context, testing.allocator, call);
+    defer testing.allocator.free(alone.text);
+    try testing.expectEqualStrings("the compactor's instructions", fake.instruction);
+    try testing.expectEqual(@as(usize, 1), fake.messages);
+    try testing.expectEqual(@as(usize, 0), fake.tools);
+    try testing.expectEqual(types.ToolChoice.none, fake.tool_choice);
+    try testing.expect(fake.reasoning.?.eql(types.ReasoningEffort.literal("none")));
+
+    // Another model never reads the conversation.
+    call.after_conversation = true;
+    call.model = "other";
+    const other = try caller.vtable.send(caller.context, testing.allocator, call);
+    defer testing.allocator.free(other.failed.detail);
+    try testing.expect(other.failed.reason == .provider);
+}

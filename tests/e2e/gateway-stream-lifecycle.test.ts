@@ -220,6 +220,22 @@ function checkpointCount(events: string): number {
     .filter((line) => JSON.parse(line).event?.context_checkpoint).length;
 }
 
+// Automatic compaction first asks right after the conversation, which keeps
+// the agent's instructions and tools so the provider can reuse its cache.
+const NOTES_AFTER_CONVERSATION = "Write the compaction notes for the turns of the conversation above";
+
+/// A compaction request after the conversation, the agent's own request
+/// with the notes request appended.
+function isNotesAfterConversation(body: string): boolean {
+  return body.includes(NOTES_AFTER_CONVERSATION);
+}
+
+/// Any compaction request: after the conversation, or the turns written out
+/// with no tools.
+function isSummaryRequest(body: string): boolean {
+  return isNotesAfterConversation(body) || JSON.parse(body).tools.length === 0;
+}
+
 async function compactAndWait(tui: TmuxSession, root: FixtureRoot, timeoutMs: number) {
   const eventsPath = compactionEventsPath(root);
   const before = readFileSync(eventsPath, "utf8");
@@ -6037,11 +6053,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     let ordinary = 0;
     let summaries = 0;
     const gateway = startDynamicFakeGateway((body) => {
-      const request = JSON.parse(body);
-      if (request.tools.length === 0) {
+      if (isSummaryRequest(body)) {
         summaries++;
-        expect(body).not.toContain("LARGE_REASONING_");
-        expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
+        if (isNotesAfterConversation(body)) {
+          // The agent's own request, reasoning included, as it was about to
+          // send it.
+          expect(summaries).toBe(1);
+          expect(body).toContain("LARGE_REASONING_5");
+        } else {
+          expect(body).not.toContain("LARGE_REASONING_");
+          expect(body).not.toContain("RECENT_REASONING_SIGNATURE");
+        }
         expect(body).toContain("REPLAY_RESULT_SENTINEL");
         return fakeGatewayFinalText("The prior reads completed. Preserve REPLAY_RESULT_SENTINEL and continue without repeating completed reads.");
       }
@@ -6126,9 +6148,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         let compactions = 0;
         let sourceHandle = "";
         const gateway = startDynamicFakeGateway((body) => {
-          const request = JSON.parse(body);
-          if (request.tools.length === 0) {
-            expect(body).not.toContain(replaySignature);
+          if (isSummaryRequest(body)) {
+            // Only a request after the conversation carries its reasoning.
+            if (isNotesAfterConversation(body)) expect(body).toContain(replaySignature);
+            else expect(body).not.toContain(replaySignature);
             compactions++;
             // The compacted command keeps the handle of its whole output.
             expect(sourceHandle).not.toBe("");
@@ -6195,9 +6218,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             await compactAndWait(tui, root, 20000);
           }
           expect(compactions).toBe(2);
-          const summaryRequests = gateway.requests.filter((entry) => JSON.parse(entry.body).tools.length === 0);
+          const summaryRequests = gateway.requests.filter((entry) => isSummaryRequest(entry.body));
           expect(summaryRequests).toHaveLength(2);
-          expect(summaryRequests[1]!.body).toBe(summaryRequests[0]!.body);
+          if (trigger === "automatic") {
+            // After the empty reply to the request after the conversation,
+            // the turns are written out instead.
+            expect(isNotesAfterConversation(summaryRequests[0]!.body)).toBe(true);
+            expect(JSON.parse(summaryRequests[1]!.body).tools).toHaveLength(0);
+          } else {
+            expect(summaryRequests[1]!.body).toBe(summaryRequests[0]!.body);
+          }
           await tui.sendText("/quit");
           expect(await tui.waitForSessionEnd(15000)).toBe(true);
           tui = null;
@@ -6459,12 +6489,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         };
         expect(secondCompactRequest.tools).toEqual([]);
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
-        expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        // The model writes notes only for the turns after the first
+        // compaction; what that compaction kept stays as it is.
+        expect(secondCompactText).not.toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
-        // The turn shown by the first compaction now folds into the earlier summary.
-        expect(secondCompactText).toContain("[Turn 1, from the previous compaction]\\n[User]\\nFIRST_PROMPT_COMPACTION_SENTINEL");
-        expect(secondCompactText).toContain("Earlier:\\nOne summary of turn 1.");
-        expect(secondCompactText).toContain("Continue the compacted session.");
+        expect(secondCompactText).toContain("Write the compaction notes for the new turns above");
+        expect(secondCompactText).not.toContain("Continue the compacted session.");
         expect(secondCompactText).not.toContain("compacted_conversation");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
@@ -6478,7 +6508,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         };
         const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
         expect(secondSummary).toContain("Second compaction preserved the restored session.");
+        expect(secondSummary).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondSummary).not.toContain("operation sequence");
+        // The first compaction's notes stay unchanged in the second.
+        expect(secondSummary).toContain("Continue the compacted session.");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();

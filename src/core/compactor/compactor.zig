@@ -8,11 +8,15 @@
 //!
 //! Inside:
 //! - window.zig chooses what to compact; the newest turns stay unchanged.
-//! - summarize.zig keeps user messages exact, summarizes the assistant, and
-//!   gives every turn (M1, M2, ...) and tool call (T1, T2, ...) a handle.
+//! - summarize.zig keeps user messages and final replies exact, adds the
+//!   model's notes for the new turns, and gives every turn (M1, M2, ...) and
+//!   tool call (T1, T2, ...) a handle.
+//! - ledger.zig asks for the notes and reads what the model wrote.
+//! - lint.zig checks every note and entry against the saved turns and tool
+//!   calls, and marks what it cannot confirm.
 //! - model.zig asks the conversation's model, at its lowest reasoning, with a
 //!   fallback model.
-//! - records.zig saves the M and T records and searches them.
+//! - records.zig saves the M, T and L records and searches them.
 //! - checkpoint.zig is the saved format; settings.zig is the threshold setting.
 //!
 //! Saving the checkpoint into the session and showing progress stay with the
@@ -21,6 +25,7 @@
 const std = @import("std");
 const window = @import("window.zig");
 const summarize = @import("summarize.zig");
+const ledger = @import("ledger.zig");
 const model = @import("model.zig");
 const checkpoint = @import("checkpoint.zig");
 const records = @import("records.zig");
@@ -171,6 +176,7 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         return error.ContextCompactionUnavailable;
     }
     try Progress.report(request.progress, .summarizing);
+    trace.log(false, "room after compaction after_tokens={d} fixed_tokens={any} kept_tokens={d} kept_used={d} compacted_tokens={d}", .{ request.size.afterTokens(), request.size.fixed_tokens, chosen.kept_tokens, chosen.kept_used, request.size.compactedTokens(chosen.kept_used) });
 
     const earlier = try earlierFrom(out, request.records, chosen.earlier);
     const turns = try turnsFrom(out, chosen.older);
@@ -184,12 +190,12 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .earlier = earlier,
         .turns = turns,
         .last_turn_open = chosen.splitsLastTurn(),
-        // The newest compacted turns get the same room as the kept turns.
-        .exact_tokens = chosen.kept_tokens,
         .max_prompt_tokens = request.size.summaryRequestTokens(),
+        .conversation_room = if (caller.sends_after_conversation) request.size.roomAfterConversation() else null,
+        .max_text_tokens = request.size.compactedTokens(chosen.kept_used),
     }, summarizer.model(), request.records);
     defer summary.deinit();
-    trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} earlier_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.earlier.len, summarizer.fallback_used orelse "none" });
+    trace.info(trace_ctx, .provider_completed, "model={s} summaries={d} shown_turns={d} turns={d} tools={d} entries={d} used={d} text_bytes={d} fallback={s}", .{ caller.model, summarizer.summaries, summary.compacted.turns.len, summary.compacted.turn_count, summary.compacted.tool_count, summary.compacted.entries.len, summary.compacted.used.len, summary.text.len, summarizer.fallback_used orelse "none" });
 
     return .{
         .arena = arena,
@@ -277,6 +283,7 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
             .name = message.tool_name orelse "",
             .output = content,
             .saved_output = savedOutputHandle(message.tool_result_memory, content),
+            .failed = message.tool_result_status == .failure,
         } }),
     }
 }
@@ -304,6 +311,7 @@ test "a clipped result keeps the handle of its saved whole output" {
 test {
     _ = window;
     _ = summarize;
+    _ = ledger;
     _ = model;
     _ = checkpoint;
     _ = records;

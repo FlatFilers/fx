@@ -1,7 +1,10 @@
 //! How fx-compactor asks a model for the summary: the conversation's own
 //! model, with the least reasoning it accepts. If that call fails, refuses,
 //! or returns nothing, the gateway tries once more with another model family.
-//! The caller of fx-compactor hands in the `ModelCaller` that reaches them.
+//! A request right after the conversation instead keeps the agent's own
+//! settings, reasoning too: the provider reuses its cache only for the same
+//! settings. The caller of fx-compactor hands in the `ModelCaller` that
+//! reaches them.
 
 const std = @import("std");
 const summarize = @import("summarize.zig");
@@ -25,6 +28,10 @@ pub const ModelCaller = struct {
     model: []const u8,
     provider: model_provider.ProviderId,
     credential_source: ?types.CredentialSource,
+    /// The caller can send a request right after the conversation, exactly
+    /// as the agent was about to send it, so the provider can reuse what it
+    /// cached of it.
+    sends_after_conversation: bool = false,
 
     pub const VTable = struct {
         /// What `model` accepts.
@@ -34,12 +41,16 @@ pub const ModelCaller = struct {
     };
 };
 
-/// One request: a system message and one user message, no tools.
+/// One request: a system message and one user message, no tools. Or, with
+/// `after_conversation`, the conversation as the agent sends it, with the
+/// agent's own settings, then `user` as one more user message; `system` and
+/// `reasoning` are not used.
 pub const Call = struct {
     model: []const u8,
     reasoning: ?types.ReasoningEffort,
     system: []const u8,
     user: []const u8,
+    after_conversation: bool = false,
     /// Longest reply kept; a longer one counts as truncated.
     max_bytes: usize,
     cancel_flag: *std.atomic.Value(bool),
@@ -92,6 +103,9 @@ pub const Summarizer = struct {
     fn summarizeWith(context: *anyopaque, alloc: Allocator, prompt: summarize.Prompt) summarize.ModelError![]u8 {
         const self: *Summarizer = @ptrCast(@alignCast(context));
         self.summaries += 1;
+        // Only the conversation's own model has it cached; when it fails,
+        // the summary step writes the turns out instead.
+        if (prompt.after_conversation) return self.ask(alloc, prompt, prompt.model);
         var primary_error: ?summarize.ModelError = null;
         if (self.ask(alloc, prompt, prompt.model)) |text| {
             if (std.mem.trim(u8, text, " \t\r\n").len > 0) return text;
@@ -121,9 +135,10 @@ pub const Summarizer = struct {
         const caller = self.caller;
         const reply = try caller.vtable.send(caller.context, alloc, .{
             .model = model_name,
-            .reasoning = lowestReasoningEffort(caller.vtable.capabilities(caller.context, model_name)),
+            .reasoning = if (prompt.after_conversation) null else lowestReasoningEffort(caller.vtable.capabilities(caller.context, model_name)),
             .system = prompt.system,
             .user = prompt.user,
+            .after_conversation = prompt.after_conversation,
             .max_bytes = max_summary_bytes,
             .cancel_flag = self.cancel_flag,
             .trace_ctx = self.trace_ctx,
@@ -216,4 +231,18 @@ test "a failed or empty summary falls back to another family at its lowest reaso
     const summary_model = summarizer.model();
     try std.testing.expectError(error.ModelFailed, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
     try std.testing.expectEqual(@as(usize, 1), direct.calls.items.len);
+}
+
+test "a request after the conversation goes to its own model only, with the agent's settings" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "", .user = "u", .after_conversation = true };
+    var scripted: ScriptedCaller = .{ .replies = &.{ null, "summary" } };
+    defer scripted.calls.deinit(std.testing.allocator);
+    var summarizer: Summarizer = .{ .caller = scripted.caller(.gateway), .cancel_flag = &cancel, .trace_ctx = .{} };
+    const summary_model = summarizer.model();
+    try std.testing.expectError(error.ModelFailed, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
+    try std.testing.expectEqual(@as(usize, 1), scripted.calls.items.len);
+    try std.testing.expect(scripted.calls.items[0].after_conversation);
+    try std.testing.expect(scripted.calls.items[0].reasoning == null);
+    try std.testing.expect(summarizer.fallback_used == null);
 }

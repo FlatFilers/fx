@@ -1,12 +1,15 @@
 //! The saved form of a context compaction checkpoint.
 //!
 //! A checkpoint's `summary` string holds `marker` followed by the JSON of a
-//! `Payload`: one summary of the earlier conversation, the newest compacted
-//! turns with their user messages and final replies exact, and how many turns
-//! and tool calls are saved word for word (M1 through M<turn_count>, T1
-//! through T<tool_count>). Every session codec keeps treating the string as
-//! opaque text. Checkpoints written before this format hold model-visible text
-//! directly and keep working.
+//! `Payload`: every compacted turn with its user messages and final reply
+//! exact, a summary of what the assistant did in between and a line for each
+//! tool call; the session's rules, facts, decisions and status as entries
+//! that are only ever added; the skills and MCP tools it used; and how many
+//! turns and tool calls are saved word for word (M1 through M<turn_count>, T1
+//! through T<tool_count>). Payloads written earlier may hold one summary of
+//! the earlier conversation, and keep being shown. Every session codec keeps
+//! treating the string as opaque text. Checkpoints written before this format
+//! hold model-visible text directly and keep working.
 //!
 //! This file is the one place that tells the formats apart and renders what
 //! the model reads.
@@ -21,14 +24,26 @@ pub const marker = "fx-compactor-v1\n";
 /// How checkpoints written by the previous compactor begin.
 const legacy_handoff_open = "<context_handoff>";
 
-/// One compacted turn, shown word for word except for the summary of its
-/// work.
+/// One tool call as the compacted conversation lists it.
+pub const Tool = struct {
+    /// Saved whole as T<number>.
+    number: usize,
+    /// What code knows of the call: the tool, what it was given and how it
+    /// ended.
+    line: []const u8,
+    /// Why it was used and what it showed, from the model; may be empty.
+    why: []const u8 = "",
+};
+
+/// One compacted turn: its user messages and final reply word for word, what
+/// the assistant did in between, and a line for each tool call. Once written
+/// it never changes.
 pub const Turn = struct {
     /// Saved word for word as M<number>. Zero only for user messages carried
     /// over from an older checkpoint format, which have no saved turn.
     number: usize = 0,
     /// The message that started the turn, then any the user added while it
-    /// ran. Exact.
+    /// ran, exact.
     users: []const []const u8 = &.{},
     /// What the assistant did before its final reply, summarized.
     work: []const u8 = "",
@@ -39,6 +54,8 @@ pub const Turn = struct {
     /// it made none.
     first_tool: usize = 0,
     last_tool: usize = 0,
+    /// A line for each tool call. Empty in payloads written before them.
+    tools: []const Tool = &.{},
 };
 
 /// The turn that was still running when it was compacted. Its first user
@@ -53,12 +70,68 @@ pub const OpenTurn = struct {
     text: []const u8 = "",
     first_tool: usize = 0,
     last_tool: usize = 0,
+    tools: []const Tool = &.{},
+};
+
+/// The letters of entry IDs, in the order their sections are shown: rules,
+/// facts, decisions, status, open.
+pub const entry_kinds = "RFDSO";
+
+/// The IDs an entry says it replaces, like `S1` in `...; replaces S1`.
+/// `arena` owns the list.
+pub fn replacedIds(arena: Allocator, text: []const u8) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var at: usize = 0;
+    while (std.ascii.findIgnoreCasePos(text, at, "replaces ")) |found| {
+        at = found + "replaces ".len;
+        var words = std.mem.tokenizeAny(u8, text[at..], " ,;");
+        while (words.next()) |raw| {
+            const word = std.mem.trimEnd(u8, raw, ".)]");
+            if (std.mem.eql(u8, word, "and")) continue;
+            if (!isEntryId(word)) break;
+            try out.append(arena, word);
+        }
+    }
+    return out.items;
+}
+
+fn isEntryId(word: []const u8) bool {
+    if (word.len < 2 or std.mem.findScalar(u8, entry_kinds, word[0]) == null) return false;
+    for (word[1..]) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+/// One entry of the session's rules, facts, decisions or status. Entries are
+/// only ever added; a newer one may say it replaces an older one.
+pub const Entry = struct {
+    /// Like `R3`. Its letter names its section.
+    id: []const u8,
+    /// The whole entry as written, starting with its ID.
+    text: []const u8,
+};
+
+/// A skill or MCP tool the work used, found in its tool calls.
+pub const Used = struct {
+    kind: Kind,
+    /// A skill's location as the agent loaded it, or an MCP tool's name like
+    /// `mcp_linear_list_issues`.
+    name: []const u8,
+    calls: usize = 1,
+    first_tool: usize = 0,
+    last_tool: usize = 0,
+
+    pub const Kind = enum { skill, mcp };
 };
 
 pub const Payload = struct {
-    /// One summary of everything before `turns`.
+    /// The session's rules, facts, decisions and status, oldest first.
+    entries: []const Entry = &.{},
+    /// Skills and MCP tools used, in the order first used.
+    used: []const Used = &.{},
+    /// One summary of everything before `turns`, from payloads written
+    /// before the entries.
     earlier: []const u8 = "",
-    /// The newest compacted turns, oldest first.
+    /// The compacted turns, oldest first.
     turns: []const Turn = &.{},
     open: ?OpenTurn = null,
     /// Turns and tool calls are numbered through these counts.
@@ -163,29 +236,26 @@ pub fn parse(arena: Allocator, summary: []const u8) Allocator.Error!?Payload {
 pub fn render(alloc: Allocator, payload: Payload) Allocator.Error![]u8 {
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(alloc);
-    try text.appendSlice(alloc,
-        \\<compacted_conversation>
-        \\This is the earlier part of this conversation, compacted. The user's messages and the assistant's final replies shown here are exact. The rest of the assistant's work is summarized, and tool calls were removed.
-        \\
-        \\
-    );
+    try text.appendSlice(alloc, "<compacted_conversation>\nThis is the earlier part of this conversation, compacted. The user's messages and the assistant's final replies shown here are exact. " ++
+        "What the assistant did in between is summarized, and each tool call has a line saying what it was and what it showed.\n\n");
     if (payload.earlier.len > 0) try text.print(alloc, "Earlier summary:\n{s}\n\n", .{payload.earlier});
     for (payload.turns) |turn| try renderTurn(alloc, &text, turn);
     if (payload.open) |open| {
-        if (open.work.len > 0) try text.print(alloc, "The turn still in progress, whose user message follows this, summary of its work so far:\n{s}\n\n", .{open.work});
-        for (open.users) |user| try text.print(alloc, "User, added while the assistant worked on the turn in progress:\n{s}\n\n", .{user});
-        if (open.first_tool > 0) {
-            try text.appendSlice(alloc, "Its tools so far: ");
-            try appendRange(alloc, &text, 'T', open.first_tool, open.last_tool);
-            try text.appendSlice(alloc, "\n\n");
-        }
+        try text.appendSlice(alloc, "Turn in progress, whose first user message follows this:\n");
+        for (open.users) |user| try text.print(alloc, "User, added while the assistant worked:\n{s}\n\n", .{user});
+        if (open.work.len > 0) try text.print(alloc, "Assistant, in between so far:\n{s}\n\n", .{open.work});
+        try appendTools(alloc, &text, "Its tools so far", open.tools, open.first_tool, open.last_tool);
     }
+    try appendEntries(alloc, &text, payload.entries);
+    try appendUsed(alloc, &text, payload.used);
+    try appendCheckNote(alloc, &text, payload);
     try appendSavedLine(alloc, &text, payload);
     try text.appendSlice(alloc, "</compacted_conversation>\n");
     return text.toOwnedSlice(alloc);
 }
 
 fn renderTurn(alloc: Allocator, text: *std.ArrayList(u8), turn: Turn) Allocator.Error!void {
+    if (turn.number > 0) try text.print(alloc, "Turn {d}\n", .{turn.number});
     for (turn.users, 0..) |user, index| {
         try appendLabel(alloc, text, "User", turn.number);
         if (index > 0) try text.appendSlice(alloc, ", added while the assistant worked");
@@ -193,17 +263,90 @@ fn renderTurn(alloc: Allocator, text: *std.ArrayList(u8), turn: Turn) Allocator.
     }
     if (turn.work.len > 0) {
         try appendLabel(alloc, text, "Assistant", turn.number);
-        try text.print(alloc, ", summary of its work:\n{s}\n\n", .{turn.work});
+        try text.print(alloc, ", in between:\n{s}\n\n", .{turn.work});
     }
+    try appendTools(alloc, text, "Tools", turn.tools, turn.first_tool, turn.last_tool);
     if (turn.final.len > 0) {
         try appendLabel(alloc, text, "Assistant", turn.number);
         try text.print(alloc, ", final reply:\n{s}\n\n", .{turn.final});
     }
-    if (turn.first_tool > 0) {
-        try text.appendSlice(alloc, "Tools: ");
-        try appendRange(alloc, text, 'T', turn.first_tool, turn.last_tool);
+}
+
+/// A line for each tool call, or only their range in payloads written
+/// before the lines.
+fn appendTools(alloc: Allocator, text: *std.ArrayList(u8), heading: []const u8, tools: []const Tool, first: usize, last: usize) Allocator.Error!void {
+    if (tools.len > 0) {
+        try text.print(alloc, "{s}:\n", .{heading});
+        for (tools) |tool| {
+            try text.print(alloc, "  T{d} {s}", .{ tool.number, tool.line });
+            if (tool.why.len > 0) try text.print(alloc, ": {s}", .{tool.why});
+            try text.append(alloc, '\n');
+        }
+        try text.append(alloc, '\n');
+    } else if (first > 0) {
+        try text.print(alloc, "{s}: ", .{heading});
+        try appendRange(alloc, text, 'T', first, last);
         try text.appendSlice(alloc, "\n\n");
     }
+}
+
+/// The session's entries under their sections, each in the order added, an
+/// entry a later one replaces marked so.
+fn appendEntries(alloc: Allocator, text: *std.ArrayList(u8), entries: []const Entry) Allocator.Error!void {
+    var scratch_state: std.heap.ArenaAllocator = .init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const replaced_by = try scratch.alloc(?[]const u8, entries.len);
+    @memset(replaced_by, null);
+    for (entries) |entry| for (try replacedIds(scratch, entry.text)) |id| {
+        for (entries, replaced_by) |older, *slot| if (std.mem.eql(u8, older.id, id)) {
+            slot.* = entry.id;
+        };
+    };
+    const Section = struct { heading: []const u8, kinds: []const u8 };
+    const sections = [_]Section{
+        .{ .heading = "Rules of the session:", .kinds = "R" },
+        .{ .heading = "Facts of the session:", .kinds = "F" },
+        .{ .heading = "Decisions:", .kinds = "D" },
+        .{ .heading = "Status and open:", .kinds = "SO" },
+    };
+    for (sections) |section| {
+        var written: usize = 0;
+        for (entries, replaced_by) |entry, replacer| {
+            if (entry.id.len == 0 or std.mem.findScalar(u8, section.kinds, entry.id[0]) == null) continue;
+            if (written == 0) try text.print(alloc, "{s}\n", .{section.heading});
+            try text.appendSlice(alloc, entry.text);
+            if (replacer) |id| try text.print(alloc, " (replaced by {s})", .{id});
+            try text.append(alloc, '\n');
+            written += 1;
+        }
+        if (written > 0) try text.append(alloc, '\n');
+    }
+}
+
+/// What a note or entry that failed a check ends with.
+pub const check_mark = " [check: ";
+
+/// Says what check marks mean, when the payload has one.
+fn appendCheckNote(alloc: Allocator, text: *std.ArrayList(u8), payload: Payload) Allocator.Error!void {
+    if (!hasCheckMark(payload)) return;
+    try text.appendSlice(alloc, "A note or entry marked [check: ...] says something code could not confirm in the saved turns and tool calls; confirm it there before relying on it.\n");
+}
+
+fn hasCheckMark(payload: Payload) bool {
+    for (payload.entries) |entry| if (isMarked(entry.text)) return true;
+    for (payload.turns) |turn| if (isMarked(turn.work) or toolsMarked(turn.tools)) return true;
+    if (payload.open) |open| return isMarked(open.work) or toolsMarked(open.tools);
+    return false;
+}
+
+fn isMarked(text: []const u8) bool {
+    return std.mem.find(u8, text, check_mark) != null;
+}
+
+fn toolsMarked(tools: []const Tool) bool {
+    for (tools) |tool| if (isMarked(tool.why)) return true;
+    return false;
 }
 
 fn appendLabel(alloc: Allocator, text: *std.ArrayList(u8), who: []const u8, number: usize) Allocator.Error!void {
@@ -217,23 +360,119 @@ fn appendRange(alloc: Allocator, text: *std.ArrayList(u8), prefix: u8, first: us
     if (last > first) try text.print(alloc, "–{c}{d}", .{ prefix, last });
 }
 
+/// The skills and MCP tools the work used, each with its calls.
+fn appendUsed(alloc: Allocator, text: *std.ArrayList(u8), used: []const Used) Allocator.Error!void {
+    if (used.len == 0) return;
+    try text.appendSlice(alloc, "Skills and MCP tools used:\n");
+    for (used) |entry| {
+        try text.print(alloc, "- {s} {s}: ", .{ if (entry.kind == .skill) "skill" else "MCP tool", entry.name });
+        if (entry.calls == 1) {
+            try text.print(alloc, "1 call, T{d}\n", .{entry.first_tool});
+        } else {
+            try text.print(alloc, "{d} calls, first T{d}, last T{d}\n", .{ entry.calls, entry.first_tool, entry.last_tool });
+        }
+    }
+    try text.appendSlice(alloc, "\n");
+}
+
 fn appendSavedLine(alloc: Allocator, text: *std.ArrayList(u8), payload: Payload) Allocator.Error!void {
-    if (!payload.saved or (payload.turn_count == 0 and payload.tool_count == 0)) return;
+    if (!payload.saved) return;
+    const Part = struct { count: usize, one: []const u8, many: []const u8, letter: u8 };
+    const parts = [_]Part{
+        .{ .count = payload.turn_count, .one = "turn ", .many = "turns ", .letter = 'M' },
+        .{ .count = payload.tool_count, .one = "tool call ", .many = "tool calls ", .letter = 'T' },
+    };
+    var shown: usize = 0;
+    for (parts) |part| shown += @intFromBool(part.count > 0);
+    if (shown == 0) return;
     try text.appendSlice(alloc, "Saved word for word: ");
-    if (payload.turn_count > 0) {
-        try text.appendSlice(alloc, if (payload.turn_count == 1) "turn " else "turns ");
-        try appendRange(alloc, text, 'M', 1, payload.turn_count);
-        if (payload.tool_count > 0) try text.appendSlice(alloc, " and ");
-    }
-    if (payload.tool_count > 0) {
-        try text.appendSlice(alloc, if (payload.tool_count == 1) "tool call " else "tool calls ");
-        try appendRange(alloc, text, 'T', 1, payload.tool_count);
-    }
+    var index: usize = 0;
+    for (parts) |part| if (part.count > 0) {
+        if (index > 0) try text.appendSlice(alloc, if (index + 1 == shown) " and " else ", ");
+        try text.appendSlice(alloc, if (part.count == 1) part.one else part.many);
+        try appendRange(alloc, text, part.letter, 1, part.count);
+        index += 1;
+    };
     try text.appendSlice(alloc, ". Search them by text, or open one by its ID (like ");
-    if (payload.turn_count > 0) try text.print(alloc, "M{d}", .{payload.turn_count});
-    if (payload.turn_count > 0 and payload.tool_count > 0) try text.appendSlice(alloc, " or ");
-    if (payload.tool_count > 0) try text.print(alloc, "T{d}", .{payload.tool_count});
+    index = 0;
+    for (parts) |part| if (part.count > 0) {
+        if (index > 0) try text.appendSlice(alloc, if (index + 1 == shown) " or " else ", ");
+        try text.print(alloc, "{c}{d}", .{ part.letter, part.count });
+        index += 1;
+    };
     try text.appendSlice(alloc, "), with read_tool_result.\n");
+}
+
+/// The first way `payload` breaks the checkpoint's shape in what it keeps of
+/// `earlier` and what it adds, or null. Code, not the model, writes the
+/// shape, so a problem here is a bug and the checkpoint must not be saved:
+/// - what `earlier` kept is unchanged, turn by turn and entry by entry;
+/// - the new turns are numbered on from `earlier` through `turn_count`, each
+///   with its user message;
+/// - every new tool call has one line, in order within its turn, and they
+///   run through `tool_count`;
+/// - every entry has a well-formed ID of its own that starts its text.
+pub fn shapeProblem(earlier: Payload, payload: Payload) ?[]const u8 {
+    if (payload.turns.len < earlier.turns.len) return "an earlier turn is missing";
+    for (earlier.turns, payload.turns[0..earlier.turns.len]) |before, after| {
+        if (!sameTurn(before, after)) return "an earlier turn changed";
+    }
+    if (payload.entries.len < earlier.entries.len) return "an earlier entry is missing";
+    for (earlier.entries, payload.entries[0..earlier.entries.len]) |before, after| {
+        if (!std.mem.eql(u8, before.id, after.id) or !std.mem.eql(u8, before.text, after.text)) return "an earlier entry changed";
+    }
+    var next_turn = earlier.turn_count + 1;
+    var previous_tool: usize = 0;
+    var new_tools: usize = 0;
+    for (payload.turns[earlier.turns.len..]) |turn| {
+        if (turn.number != next_turn) return "the new turns are not numbered in order";
+        next_turn += 1;
+        if (turn.users.len == 0) return "a new turn has no user message";
+        if (toolsProblem(turn.tools, turn.first_tool, turn.last_tool, payload.tool_count, &previous_tool)) |problem| return problem;
+        new_tools += linesAbove(turn.tools, earlier.tool_count);
+    }
+    if (next_turn - 1 != payload.turn_count) return "the turn count does not match the turns";
+    if (payload.open) |open| {
+        if (toolsProblem(open.tools, open.first_tool, open.last_tool, payload.tool_count, &previous_tool)) |problem| return problem;
+        new_tools += linesAbove(open.tools, earlier.tool_count);
+    }
+    if (earlier.tool_count + new_tools != payload.tool_count) return "a new tool call has no line";
+    for (payload.entries, 0..) |entry, index| {
+        if (!isEntryId(entry.id)) return "an entry has a malformed ID";
+        if (!std.mem.startsWith(u8, entry.text, entry.id)) return "an entry does not start with its ID";
+        for (payload.entries[0..index]) |other| if (std.mem.eql(u8, other.id, entry.id)) return "two entries share an ID";
+    }
+    return null;
+}
+
+fn sameTurn(a: Turn, b: Turn) bool {
+    if (a.number != b.number or a.first_tool != b.first_tool or a.last_tool != b.last_tool) return false;
+    if (!std.mem.eql(u8, a.work, b.work) or !std.mem.eql(u8, a.final, b.final)) return false;
+    if (a.users.len != b.users.len or a.tools.len != b.tools.len) return false;
+    for (a.users, b.users) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    for (a.tools, b.tools) |x, y| {
+        if (x.number != y.number or !std.mem.eql(u8, x.line, y.line) or !std.mem.eql(u8, x.why, y.why)) return false;
+    }
+    return true;
+}
+
+/// Tool lines numbered within T<first> through T<last>, in order, each after
+/// `previous.*`, which moves to the last of them.
+fn toolsProblem(tools: []const Tool, first: usize, last: usize, count: usize, previous: *usize) ?[]const u8 {
+    if (first > last or last > count) return "a turn's tool calls are out of range";
+    for (tools) |tool| {
+        if (tool.number < first or tool.number > last) return "a tool line is outside its turn";
+        if (tool.number <= previous.*) return "the tool lines are out of order";
+        if (tool.line.len == 0) return "a tool line is empty";
+        previous.* = tool.number;
+    }
+    return null;
+}
+
+fn linesAbove(tools: []const Tool, number: usize) usize {
+    var count: usize = 0;
+    for (tools) |tool| count += @intFromBool(tool.number > number);
+    return count;
 }
 
 /// Model-visible text for a payload checkpoint, or null for older formats.
@@ -259,14 +498,24 @@ const sample_payload: Payload = .{
             .final = "Fixed. The build and all 12 tests pass.",
             .first_tool = 4,
             .last_tool = 5,
+            .tools = &.{
+                .{ .number = 4, .line = "shell zig build (failed, exit 1, 3 lines)", .why = "built to see the failure; a missing semicolon at src/a.zig:4" },
+                .{ .number = 5, .line = "shell zig build test (exit 0, 12 lines)" },
+            },
         },
         .{ .number = 3, .users = &.{"thanks"}, .final = "You're welcome." },
+    },
+    .entries = &.{
+        .{ .id = "S1", .text = "S1: the build and tests pass (T5)" },
+        .{ .id = "R1", .text = "R1 [M2]: \"also check the tests\"" },
+        .{ .id = "F1", .text = "F1 (T4): src/a.zig:4 was missing a semicolon" },
+        .{ .id = "O1", .text = "O1: nothing open" },
     },
     .turn_count = 3,
     .tool_count = 5,
 };
 
-test "payload checkpoints round trip and render exact users and final replies" {
+test "payload checkpoints round trip and render each turn in order, then the entries" {
     const alloc = testing.allocator;
     const saved = try encode(alloc, sample_payload);
     defer alloc.free(saved);
@@ -278,6 +527,8 @@ test "payload checkpoints round trip and render exact users and final replies" {
     const back = (try parse(arena.allocator(), saved)).?;
     try testing.expectEqual(@as(usize, 2), back.turns.len);
     try testing.expectEqualStrings("also check the tests", back.turns[0].users[1]);
+    try testing.expectEqualStrings("shell zig build test (exit 0, 12 lines)", back.turns[0].tools[1].line);
+    try testing.expectEqualStrings("F1", back.entries[2].id);
     try testing.expectEqual(@as(usize, 5), back.tool_count);
     try testing.expect(back.open == null);
 
@@ -287,6 +538,7 @@ test "payload checkpoints round trip and render exact users and final replies" {
         \\Earlier summary:
         \\The assistant set up the repo and verified the build [M1].
         \\
+        \\Turn 2
         \\User 2:
         \\Fix the build.
         \\It fails on main.
@@ -294,19 +546,32 @@ test "payload checkpoints round trip and render exact users and final replies" {
         \\User 2, added while the assistant worked:
         \\also check the tests
         \\
-        \\Assistant 2, summary of its work:
+        \\Assistant 2, in between:
         \\Found a missing semicolon (T4), fixed it, and ran the tests (T5).
+        \\
+        \\Tools:
+        \\  T4 shell zig build (failed, exit 1, 3 lines): built to see the failure; a missing semicolon at src/a.zig:4
+        \\  T5 shell zig build test (exit 0, 12 lines)
         \\
         \\Assistant 2, final reply:
         \\Fixed. The build and all 12 tests pass.
         \\
-        \\Tools: T4–T5
-        \\
+        \\Turn 3
         \\User 3:
         \\thanks
         \\
         \\Assistant 3, final reply:
         \\You're welcome.
+        \\
+        \\Rules of the session:
+        \\R1 [M2]: "also check the tests"
+        \\
+        \\Facts of the session:
+        \\F1 (T4): src/a.zig:4 was missing a semicolon
+        \\
+        \\Status and open:
+        \\S1: the build and tests pass (T5)
+        \\O1: nothing open
         \\
         \\Saved word for word: turns M1–M3 and tool calls T1–T5. Search them by text, or open one by its ID (like M3 or T5), with read_tool_result.
         \\</compacted_conversation>
@@ -320,17 +585,78 @@ test "payload checkpoints round trip and render exact users and final replies" {
 
 test "the turn in progress shows its summary, added messages and tools" {
     const alloc = testing.allocator;
+    // Written before tool lines, so its tools show as a range.
     const text = try render(alloc, .{
         .turns = &.{},
         .open = .{ .users = &.{"use the staging db"}, .work = "Ran the migration dry run (T1).", .text = "exact text", .first_tool = 1, .last_tool = 1 },
         .tool_count = 1,
     });
     defer alloc.free(text);
-    try testing.expect(std.mem.find(u8, text, "summary of its work so far:\nRan the migration dry run (T1).\n") != null);
-    try testing.expect(std.mem.find(u8, text, "turn in progress:\nuse the staging db\n") != null);
+    try testing.expect(std.mem.find(u8, text, "Turn in progress, whose first user message follows this:\nUser, added while the assistant worked:\nuse the staging db\n") != null);
+    try testing.expect(std.mem.find(u8, text, "Assistant, in between so far:\nRan the migration dry run (T1).\n") != null);
     try testing.expect(std.mem.find(u8, text, "Its tools so far: T1\n") != null);
     try testing.expect(std.mem.find(u8, text, "exact text") == null);
     try testing.expect(std.mem.find(u8, text, "Saved word for word: tool call T1. Search them by text, or open one by its ID (like T1)") != null);
+}
+
+test "an entry a later one replaces is shown replaced, and check marks are explained" {
+    const alloc = testing.allocator;
+    const marked = try render(alloc, .{ .entries = &.{
+        .{ .id = "S1", .text = "S1 (T1): tests fail" },
+        .{ .id = "D1", .text = "D1 (M1): cache the index" },
+        .{ .id = "S2", .text = "S2 (T2): tests pass; replaces S1 and D1." },
+        .{ .id = "F1", .text = "F1 (T2): 142 tests [check: not in the saved record: 142]" },
+    }, .turn_count = 1, .tool_count = 2 });
+    defer alloc.free(marked);
+    try testing.expect(std.mem.find(u8, marked, "S1 (T1): tests fail (replaced by S2)\n") != null);
+    try testing.expect(std.mem.find(u8, marked, "D1 (M1): cache the index (replaced by S2)\n") != null);
+    try testing.expect(std.mem.find(u8, marked, "S2 (T2): tests pass; replaces S1 and D1.\n") != null);
+    try testing.expect(std.mem.find(u8, marked, "A note or entry marked [check: ...]") != null);
+
+    const clean = try render(alloc, .{ .entries = &.{.{ .id = "F1", .text = "F1 (T2): 141 tests" }}, .turn_count = 1, .tool_count = 2 });
+    defer alloc.free(clean);
+    try testing.expect(std.mem.find(u8, clean, "[check:") == null);
+    try testing.expect(std.mem.find(u8, clean, "replaced by") == null);
+}
+
+test "the shape check passes what compaction builds and names what breaks it" {
+    const first_tools = [_]Tool{.{ .number = 1, .line = "shell make (2 bytes)" }};
+    const earlier: Payload = .{
+        .turns = &.{.{ .number = 1, .users = &.{"build it"}, .final = "Built.", .first_tool = 1, .last_tool = 1, .tools = &first_tools }},
+        .entries = &.{.{ .id = "F1", .text = "F1 (T1): make works" }},
+        .turn_count = 1,
+        .tool_count = 1,
+    };
+    const new_tools = [_]Tool{ .{ .number = 2, .line = "shell make test (3 lines)" }, .{ .number = 3, .line = "read_file a.zig (9 lines)" } };
+    const good: Payload = .{
+        .turns = &.{ earlier.turns[0], .{ .number = 2, .users = &.{"test it"}, .final = "Tested.", .first_tool = 2, .last_tool = 3, .tools = &new_tools } },
+        .entries = &.{ earlier.entries[0], .{ .id = "S1", .text = "S1 (T2): tests pass" } },
+        .turn_count = 2,
+        .tool_count = 3,
+    };
+    try testing.expect(shapeProblem(earlier, good) == null);
+
+    var bad = good;
+    bad.turns = &.{ .{ .number = 1, .users = &.{"build it again"}, .final = "Built.", .first_tool = 1, .last_tool = 1, .tools = &first_tools }, good.turns[1] };
+    try testing.expectEqualStrings("an earlier turn changed", shapeProblem(earlier, bad).?);
+    bad = good;
+    bad.entries = &.{ .{ .id = "F1", .text = "F1 (T1): make is broken" }, good.entries[1] };
+    try testing.expectEqualStrings("an earlier entry changed", shapeProblem(earlier, bad).?);
+    bad = good;
+    bad.turns = &.{ earlier.turns[0], .{ .number = 3, .users = &.{"test it"}, .first_tool = 2, .last_tool = 3, .tools = &new_tools } };
+    try testing.expectEqualStrings("the new turns are not numbered in order", shapeProblem(earlier, bad).?);
+    bad = good;
+    bad.turns = &.{ earlier.turns[0], .{ .number = 2, .users = &.{"test it"}, .first_tool = 2, .last_tool = 3, .tools = new_tools[0..1] } };
+    try testing.expectEqualStrings("a new tool call has no line", shapeProblem(earlier, bad).?);
+    bad = good;
+    bad.turn_count = 5;
+    try testing.expectEqualStrings("the turn count does not match the turns", shapeProblem(earlier, bad).?);
+    bad = good;
+    bad.entries = &.{ earlier.entries[0], .{ .id = "F1", .text = "F1 (T2): again" } };
+    try testing.expectEqualStrings("two entries share an ID", shapeProblem(earlier, bad).?);
+    bad = good;
+    bad.entries = &.{ earlier.entries[0], .{ .id = "S1", .text = "tests pass" } };
+    try testing.expectEqualStrings("an entry does not start with its ID", shapeProblem(earlier, bad).?);
 }
 
 test "the saved line names only what can be opened" {

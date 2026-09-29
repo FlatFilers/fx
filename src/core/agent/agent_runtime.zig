@@ -39,6 +39,7 @@ pub const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 pub const Config = runtime_config.Config;
 pub const processAgentPrompt = runtime_orchestrator.processAgentPrompt;
 pub const compactContext = runtime_orchestrator.compactContext;
+pub const compactionSize = runtime_orchestrator.compactionSize;
 pub const CompactorCaller = @import("runtime/text_completion.zig").CompactorCaller;
 pub const persistedStatusForCurrentFxLocalResult = runtime_execution_memory.persistedStatusForCurrentFxLocalResult;
 pub const classifyProviderExecutedResultStatus = runtime_execution_memory.classifyProviderExecutedResultStatus;
@@ -53,5 +54,6 @@ test {
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");
     _ = @import("runtime/orchestrator.zig");
+    _ = @import("runtime/text_completion.zig");
     _ = @import("runtime/vision_contracts.zig");
 }

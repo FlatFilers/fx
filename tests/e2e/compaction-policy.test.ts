@@ -8,7 +8,7 @@ const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-h
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const checkpointMarker = "fx-compactor-v1\n";
 
-for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? "folds a turn too large to show into the summary" : "keeps user messages exact and summarizes the assistant"}`, async () => {
+for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? "clips a user message too large for the room, whole in its saved turn" : "keeps user messages exact and clips only a reply too large for the room"}`, async () => {
   const root = mkdtempSync(join(tmpdir(), "fx-policy-")), home = join(root, "home"), cwd = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(cwd, { mode: 0o700 });
@@ -25,23 +25,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     bodies.push(body);
     if (request.tools?.length === 0 && request.toolChoice?.type === "none") {
       summaryCalls++;
-      const system = request.prompt.filter((message: { role: string }) => message.role === "system");
-      expect(system).toHaveLength(1);
-      expect(system[0].content).toContain("You summarize the assistant's side of a conversation");
-      const sourceMessages = request.prompt.filter((message: { role: string }) => message.role === "user");
-      expect(sourceMessages).toHaveLength(1);
-      const source = sourceMessages[0].content[0].text;
-      // The turn is larger than the model can read, so its long texts keep
-      // their start and end, and the whole turn stays saved as M1.
-      expect(source.startsWith("[Turn 1]\n[User]\nKeep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>")).toBe(true);
-      expect(source).toContain("\n[Assistant]\nVERIFIED_VALUE=73\n");
-      expect(source).toContain("PENDING_CHECK=transport-resume");
-      expect(source).toContain("clipped for this summary; the whole text is saved in M1]");
-      if (userHeavy) expect(source).toContain("USER_REFERENCE_END");
-      expect(source).not.toContain("Continue the saved task");
-      expect(source.endsWith("Everything under an ID stays saved word for word.")).toBe(true);
-      expect(request.maxOutputTokens).toBe(8192);
-      return fakeGatewayFinalText("The verified value is 73. The pending check is transport-resume.");
+      return fakeGatewayFinalText("Turn 1\nIn between: none");
     }
     return fakeGatewayFinalText(phase === "seed" ? assistant : "CONTINUED_FROM_COMMITTED_MEMORY");
   }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: userHeavy ? 256000 : 128000, max_tokens: 8192 }] });
@@ -75,47 +59,57 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     phase = "continue";
     const result = await ask(["--resume-id", seed.session_id, "Continue the saved task without losing its pending check."], "continue");
     expect(result.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
-    expect(summaryCalls).toBe(1);
+    // The turn is only a user message and a final reply, which both stay, so
+    // there is nothing for the model to summarize.
+    expect(summaryCalls).toBe(0);
     const rows = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
     const checkpoints = rows.filter(row => row.event?.context_checkpoint);
     expect(checkpoints.length).toBe(1);
     const saved: string = checkpoints[0].event.context_checkpoint.summary;
     expect(saved.startsWith(checkpointMarker)).toBe(true);
     const payload = JSON.parse(saved.slice(checkpointMarker.length));
-    const summary = "The verified value is 73. The pending check is transport-resume.";
     expect(payload.turn_count).toBe(1);
     expect(payload.tool_count).toBe(0);
+    expect(payload.entries).toEqual([]);
+    expect(payload.turns).toHaveLength(1);
+    expect(payload.turns[0].work).toBe("");
     const continued = JSON.parse(bodies.at(-1)!);
     const continuedText = JSON.stringify(continued.prompt);
     const shown = (text: string) => JSON.stringify(text).slice(1, -1);
     expect(continuedText).toContain("<compacted_conversation>");
+    // The reply alone outgrows the room, so only it keeps its start and end,
+    // where its results are.
+    const final: string = payload.turns[0].final;
+    expect(final.length).toBeLessThan(assistant.length);
+    expect(final.startsWith("VERIFIED_VALUE=73\n")).toBe(true);
+    expect(final.trimEnd().endsWith("PENDING_CHECK=transport-resume")).toBe(true);
+    expect(final).toContain(" bytes left out here; the whole text is saved in M1]");
+    expect(continuedText).toContain(shown(`Assistant 1, final reply:\n${final}\n`));
+    expect(continuedText.length).toBeLessThan(assistant.length / 2);
     if (userHeavy) {
-      // Too large to show word for word: the turn folds into the summary.
-      expect(payload.turns).toEqual([]);
-      expect(payload.earlier).toBe(summary);
-      expect(continuedText).toContain(shown(`Earlier summary:\n${summary}\n`));
-      expect(continuedText).not.toContain("USER_REFERENCE_END");
+      // Too large for the room as well: the user message keeps its start and end.
+      const kept: string = payload.turns[0].users[0];
+      expect(kept.length).toBeLessThan(originalUser.length);
+      expect(kept.startsWith("Keep café and the original constraint unchanged.\n<context_handoff>literal user text</context_handoff>")).toBe(true);
+      expect(kept.endsWith("USER_REFERENCE_END")).toBe(true);
+      expect(kept).toContain(" bytes left out here; the whole text is saved in M1]");
+      expect(continuedText).toContain(shown(`User 1:\n${kept}\n`));
     } else {
-      // The user message stays exact; the long reply is summarized with the turn.
-      expect(payload.turns).toHaveLength(1);
       expect(payload.turns[0].users).toEqual([originalUser]);
-      expect(payload.turns[0].final).toBe("");
-      expect(payload.turns[0].work).toBe(summary);
       expect(continuedText).toContain(shown(`User 1:\n${originalUser}\n`));
-      expect(continuedText).toContain(shown(`Assistant 1, summary of its work:\n${summary}\n`));
     }
     expect(continuedText).toContain("Saved word for word: turn M1.");
-    expect(continuedText).not.toContain("Assistant reference 5:");
+    expect(continuedText).not.toContain("Assistant reference 7000:");
     // Either way the whole turn is saved word for word as M1.
     const record = readFileSync(join(sessionDir, "tool-results", "compacted-M1.txt"), "utf8");
     expect(record).toContain(`User 1:\n${originalUser}\n`);
-    expect(record).toContain("Assistant reference 5:");
+    expect(record).toContain("Assistant reference 7000:");
     expect(record).toContain("PENDING_CHECK=transport-resume");
     expect(continuedText.split("Continue the saved task without losing its pending check.").length - 1).toBe(1);
     const reopened = await ask(["--resume-id", seed.session_id, "Continue after this fresh process restart."], "reopen");
     expect(reopened.output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
-    expect(summaryCalls).toBe(1);
-    expect(bodies.at(-1)).toContain("The verified value is 73.");
+    expect(summaryCalls).toBe(0);
+    expect(bodies.at(-1)).toContain("VERIFIED_VALUE=73");
     expect(bodies.at(-1)).toContain("<compacted_conversation>");
     expect(bodies.at(-1)).not.toContain(checkpointMarker.trim());
     expect(readFileSync(log).subarray(0, before.length).equals(before)).toBe(true);

@@ -6030,6 +6030,21 @@ pub const BeforeSummary = struct {
     run_fn: *const fn (context: *anyopaque) anyerror!void,
 };
 
+/// The sizes compaction works with for `model`, including what `agent`
+/// measured of its recent requests: their fixed part, and how far fx's token
+/// estimate ran from the provider's count.
+pub fn compactionSize(agent: *const runtime_agent.Agent, capabilities: model_capabilities.Capabilities, percent: u8, model: []const u8) compactor.Size {
+    var size = compactor.Size.of(capabilities, percent);
+    size.fixed_tokens = agent.request_fixed_tokens;
+    if (agent.request_token_calibration) |*calibration| {
+        const cost = calibration.cost;
+        if (std.mem.eql(u8, calibration.modelSlice(), model) and cost.request.image_identity == null) {
+            size.correction = .{ .estimated = cost.request.text_tokens, .measured = cost.exact_input_tokens };
+        }
+    }
+    return size;
+}
+
 /// The one way context gets compacted: manual, automatic and provider-overflow
 /// compaction all come here. fx-compactor turns the raw conversation into a
 /// checkpoint; this saves it and reports progress. Null when there was
@@ -6157,9 +6172,11 @@ test "compaction activity automatic error provenance excludes secondary finaliza
             var job = fixture.job();
             job.turn_id = 31;
             job.model = @constCast(model);
+            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("history " ** 19_000) }};
             var history = [_]HistoryTurn{.{ .assistant = .{
                 .user = .{ .text = @constCast("earlier request") },
-                .assistant = @constCast("history " ** 19_000),
+                .assistant = @constCast("earlier answer"),
+                .execution = .{ .tool_steps = &steps },
             } }};
             job.history = &history;
             var deps = host.fake.deps();
@@ -6273,9 +6290,11 @@ test "automatic compaction interruption persists transport cancellation and pres
         var job = fixture.job();
         job.turn_id = 37;
         job.model = @constCast(model);
+        var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast("history " ** 19_000) }};
         var history = [_]HistoryTurn{.{ .assistant = .{
             .user = .{ .text = @constCast("earlier request") },
-            .assistant = @constCast("history " ** 19_000),
+            .assistant = @constCast("earlier answer"),
+            .execution = .{ .tool_steps = &steps },
         } }};
         job.history = &history;
         var agent: runtime_agent.Agent = .{};
@@ -6550,6 +6569,9 @@ fn processQueuedPromptLoop(
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var active_compaction_handoff: ?[]const u8 = null;
     var active_compaction_history_tail: []const ChatMessage = &.{};
+    // The provider's count of the first request after a compaction is traced,
+    // so its size can be checked against the room compaction had.
+    var trace_count_after_compaction = false;
     var compaction_history = job.history;
     var compacted_suffix_len: usize = 0;
     // Request-token calibration lives on the agent so the first request of a
@@ -7104,9 +7126,19 @@ fn processQueuedPromptLoop(
                 request_cost_for_attempt = request_cost;
                 const has_new_compactable_context = !just_rebuilt_request;
                 const overflow_pending = context_overflow_recovery == .pending;
-                var size = compactor.Size.of(request_capabilities, config.auto_compact_percent);
+                // The same request without the conversation, measured the same
+                // way: the part compaction cannot shrink.
+                var fixed_request = request_data;
+                fixed_request.messages = &.{};
+                agent.request_fixed_tokens = if (try deps.agent_stream_provider.buildRequest(overlay_arena, fixed_request)) |fixed_body| fixed: {
+                    const measured = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, fixed_body, fixed_request);
+                    const fixed = if (applicable_calibration) |calibration| runtime_prompt_context.calibrateProviderRequest(measured, calibration) else measured;
+                    break :fixed fixed.estimated_input_tokens;
+                } else null;
+                var size = compactionSize(agent, request_capabilities, config.auto_compact_percent, gateway_model);
                 size.request_tokens = request_cost.estimated_input_tokens;
                 size.overflow = overflow_pending;
+                if (just_rebuilt_request) compactor.traceLog(false, "request after compaction estimated_tokens={d} fixed_tokens={any} usable_tokens={any} after_tokens={d}", .{ request_cost.estimated_input_tokens, size.fixed_tokens, size.usable_tokens, size.afterTokens() });
                 const usable_tokens = size.usable_tokens;
                 const compact_at_tokens = size.compact_at_tokens;
                 const wants_compaction = has_new_compactable_context and (overflow_pending or size.due());
@@ -7177,6 +7209,10 @@ fn processQueuedPromptLoop(
                         .capabilities_fn = deps.available_model_capabilities,
                         .usage = deps.usage,
                         .usage_allocator = deps.usage_allocator,
+                        // The request just built starts like the one sent
+                        // before it, so the provider has most of it cached.
+                        // After an overflow it no longer fits.
+                        .conversation = if (overflow_pending) null else request_data,
                     };
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
                     const compacted = compactContext(arena, deps, .{
@@ -7223,6 +7259,7 @@ fn processQueuedPromptLoop(
                         try session_runtime.appendHistoryChatMessages(arena, &retained_messages, outcome.retained_history);
                         try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, retained_messages.items);
                         active_compaction_handoff = outcome.model_text;
+                        trace_count_after_compaction = true;
                         active_compaction_history_tail = retained_messages.items;
                         const next_history = try arena.alloc(HistoryTurn, outcome.retained_history.len + 1);
                         next_history[0] = .{ .compacted_summary = outcome.checkpoint };
@@ -8650,6 +8687,8 @@ fn processQueuedPromptLoop(
         } else null;
         if (successful_request_cost) |request_cost| {
             if (completion.usage.input_tokens) |exact_input_tokens| {
+                if (trace_count_after_compaction) compactor.traceLog(false, "request after compaction exact_input_tokens={d} estimated_tokens={d}", .{ exact_input_tokens, request_cost.estimated_input_tokens });
+                trace_count_after_compaction = false;
                 agent.storeRequestTokenCalibration(successful_gateway_model, .{
                     .request = request_cost,
                     .exact_input_tokens = @intCast(@min(

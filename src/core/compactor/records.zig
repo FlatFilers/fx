@@ -60,6 +60,14 @@ pub const Kind = enum {
             .turn => 'M',
         };
     }
+
+    fn noun(kind: Kind, count: usize) []const u8 {
+        const one = count == 1;
+        return switch (kind) {
+            .tool => if (one) "tool call" else "tool calls",
+            .turn => if (one) "turn" else "turns",
+        };
+    }
 };
 
 /// T12 is tool call 12; M12 is turn 12.
@@ -161,6 +169,8 @@ const Doc = struct {
     file_bytes: usize,
     length: usize = 0,
     score: f64 = 0,
+    /// Bit `n` is set when the record holds every word of query `n`.
+    complete: u32 = 0,
 
     /// Conversation outranks tool output on equal scores, then newer first.
     fn better(_: void, a: Doc, b: Doc) bool {
@@ -177,7 +187,17 @@ const Doc = struct {
 const Query = struct {
     terms: []const []const u8,
     phrases: []const []const usize,
+    /// Each query with any words, as typed, and its words.
+    texts: []const []const u8 = &.{},
+    words: []const []const usize = &.{},
 };
+
+/// Only this many queries are told apart by `Doc.complete`.
+const max_counted_queries = 32;
+
+comptime {
+    std.debug.assert(max_search_phrases <= max_counted_queries);
+}
 
 /// Searches every saved turn and tool call, and earlier conversation
 /// archives, for `queries` and returns the best `limit` results as text for
@@ -212,7 +232,55 @@ pub fn search(alloc: Allocator, store: Store, queries: []const []const u8, limit
     std.mem.sort(Doc, docs.items, {}, Doc.better);
     var found: usize = 0;
     while (found < @min(limit, docs.items.len) and docs.items[found].score > 0) found += 1;
-    return formatResults(alloc, arena, queries, query, weights, docs.items[0..found]);
+    return formatResults(alloc, arena, queries, query, weights, docs.items, found);
+}
+
+/// For each query, how many records hold all of its words, and the first and
+/// last of each kind. IDs count up in time order, so this finds the earliest
+/// and latest of look-alike records even when the best matches are others.
+fn writeCoverage(writer: *std.Io.Writer, query: Query, docs: []const Doc) !void {
+    var any = false;
+    for (query.texts, 0..) |text, query_index| {
+        const bit = @as(u32, 1) << @intCast(query_index);
+        const Span = struct { count: usize = 0, first: usize = std.math.maxInt(usize), last: usize = 0 };
+        var spans = std.EnumArray(Kind, Span).initFill(.{});
+        var archive_parts: usize = 0;
+        for (docs) |doc| {
+            if (doc.complete & bit == 0) continue;
+            const id = doc.id orelse {
+                archive_parts += 1;
+                continue;
+            };
+            const span = spans.getPtr(id.kind);
+            span.count += 1;
+            span.first = @min(span.first, id.number);
+            span.last = @max(span.last, id.number);
+        }
+        try writer.writeAll("Every word of ");
+        try std.json.Stringify.value(text, .{}, writer);
+        var parts: usize = 0;
+        for ([_]Kind{ .turn, .tool }) |kind| {
+            const span = spans.get(kind);
+            if (span.count == 0) continue;
+            try writer.writeAll(if (parts == 0) " is in " else ", ");
+            try writer.print("{d} {s}", .{ span.count, kind.noun(span.count) });
+            if (span.count == 1) {
+                try writer.print(" ({c}{d})", .{ kind.letter(), span.first });
+            } else {
+                try writer.print(" (first {c}{d}, last {c}{d})", .{ kind.letter(), span.first, kind.letter(), span.last });
+            }
+            parts += 1;
+        }
+        if (archive_parts > 0) {
+            try writer.writeAll(if (parts == 0) " is in " else ", ");
+            try writer.print("{d} earlier archive {s}", .{ archive_parts, if (archive_parts == 1) "part" else "parts" });
+            parts += 1;
+        }
+        if (parts == 0) try writer.writeAll(" is in no saved record");
+        try writer.writeAll(".\n");
+        any = any or parts > 0;
+    }
+    if (any) try writer.writeAll("IDs count up in time order: a lower number came earlier.\n");
 }
 
 /// Transcripts of earlier conversation saved by the previous compactor. They
@@ -274,6 +342,8 @@ const Tokens = struct {
 fn prepareQuery(arena: Allocator, queries: []const []const u8) !Query {
     var terms: std.ArrayList([]const u8) = .empty;
     var phrases: std.ArrayList([]const usize) = .empty;
+    var texts: std.ArrayList([]const u8) = .empty;
+    var all_words: std.ArrayList([]const usize) = .empty;
     for (queries) |text| {
         var words: std.ArrayList(usize) = .empty;
         var tokens: Tokens = .{ .text = text };
@@ -286,8 +356,12 @@ fn prepareQuery(arena: Allocator, queries: []const []const u8) !Query {
             try words.append(arena, index);
         }
         if (words.items.len > 1) try phrases.append(arena, words.items);
+        if (words.items.len > 0 and texts.items.len < max_counted_queries) {
+            try texts.append(arena, std.mem.trim(u8, text, " \t\r\n"));
+            try all_words.append(arena, words.items);
+        }
     }
-    return .{ .terms = terms.items, .phrases = phrases.items };
+    return .{ .terms = terms.items, .phrases = phrases.items, .texts = texts.items, .words = all_words.items };
 }
 
 fn termIndex(terms: []const []const u8, token: []const u8) ?usize {
@@ -371,6 +445,12 @@ fn score(arena: Allocator, docs: []Doc, query: Query) ![]const f64 {
             };
         }
         doc.score = total;
+        for (query.words, 0..) |words, query_index| {
+            const all = for (words) |term| {
+                if (doc_counts[term] == 0) break false;
+            } else true;
+            if (all) doc.complete |= @as(u32, 1) << @intCast(query_index);
+        }
     }
     return weights;
 }
@@ -389,14 +469,17 @@ fn termWeights(arena: Allocator, doc_count: usize, counts: []const u32, terms: u
     return weights;
 }
 
-fn formatResults(alloc: Allocator, arena: Allocator, queries: []const []const u8, query: Query, weights: []const f64, docs: []const Doc) ![]u8 {
+/// The best `found` of `all`, which is sorted best first, after the coverage
+/// of each query over all of them.
+fn formatResults(alloc: Allocator, arena: Allocator, queries: []const []const u8, query: Query, weights: []const f64, all: []const Doc, found: usize) ![]u8 {
+    const docs = all[0..found];
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("<saved_search query=");
     try std.json.Stringify.value(queries, .{}, writer);
     try writer.print(" matches=\"{d}\">\n", .{docs.len});
-    if (docs.len == 0) try writer.writeAll("(no saved turns or tool calls match)\n");
+    if (docs.len == 0) try writer.writeAll("(no saved turns or tool calls match)\n") else try writeCoverage(writer, query, all);
     for (docs, 1..) |doc, rank| {
         try writer.print("\n[{d}] ", .{rank});
         if (doc.id != null) {
@@ -635,6 +718,34 @@ test "a phrase found whole outranks its words found apart, and index lines count
     try testing.expect(std.mem.find(u8, found, "[1] T3 shell").? < std.mem.find(u8, found, "[2] T2 read_file").?);
     try testing.expect(std.mem.find(u8, found, "[2] T2 read_file").? < std.mem.find(u8, found, "[3] T1 read_file").?);
     try testing.expect(std.mem.find(u8, found, "T4 shell") == null);
+}
+
+test "each search says which records hold all its words, first and last, beyond the results shown" {
+    const alloc = testing.allocator;
+    var memory: MemoryStore = .{ .alloc = alloc };
+    defer memory.deinit();
+    const store = memory.store();
+    try save(alloc, store, .{ .kind = .tool, .number = 1 }, "T1 shell: zig build test\nResult:\n8199/8199 tests passed\n");
+    try save(alloc, store, .{ .kind = .tool, .number = 2 }, "T2 shell: zig build test\nResult:\n8195/8199 tests passed (2 failed)\n");
+    try save(alloc, store, .{ .kind = .tool, .number = 3 }, "T3 shell: zig build test\nResult:\n8202/8206 tests passed (2 failed)\n");
+    try save(alloc, store, .{ .kind = .tool, .number = 5 }, "T5 shell: zig build test\nResult:\ntests failed, tests failed, tests failed\n");
+    try save(alloc, store, .{ .kind = .turn, .number = 1 }, "M1 turn: fix it\nUser 1:\nfix it\n\nAssistant, final reply:\nThe tests failed twice.\n");
+
+    // The best match is the latest look-alike; the first one is still named.
+    const found = try search(alloc, store, &.{ "tests failed", "zebra" }, 1);
+    defer alloc.free(found);
+    try testing.expect(std.mem.find(u8, found, "[1] T5 shell") != null);
+    try testing.expect(std.mem.find(u8, found, "[2]") == null);
+    try testing.expect(std.mem.find(u8, found, "Every word of \"tests failed\" is in 1 turn (M1), 3 tool calls (first T2, last T5).\n") != null);
+    try testing.expect(std.mem.find(u8, found, "Every word of \"zebra\" is in no saved record.\n") != null);
+    try testing.expect(std.mem.find(u8, found, "IDs count up in time order: a lower number came earlier.\n") != null);
+    // The coverage comes before the results.
+    try testing.expect(std.mem.find(u8, found, "Every word of").? < std.mem.find(u8, found, "[1] T5").?);
+
+    const none = try search(alloc, store, &.{"zebra"}, 5);
+    defer alloc.free(none);
+    try testing.expect(std.mem.find(u8, none, "Every word of") == null);
+    try testing.expect(std.mem.find(u8, none, "IDs count up") == null);
 }
 
 test "long records show the lines that match best" {
