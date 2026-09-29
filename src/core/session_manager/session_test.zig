@@ -511,6 +511,14 @@ test "a failed write or sync reports its OS cause, and every later call reports 
     // The close does not sync again: the failed sync's bytes stay unknown.
     try testing.expectEqual(@as(usize, 1), t.fault.closed_unsynced);
     t.fault.closed_unsynced = 0;
+
+    // A permission denial on the first turn, before the session exists.
+    const n = try newRoot(&t);
+    t.fault.fail_error = error.Refused;
+    t.fault.next_write = .{ .keep = 0, .then = .fail };
+    try testing.expectError(error.AccessDenied, n.append(&.{ .turn_started, item }));
+    try testing.expectError(error.AccessDenied, n.append(&.{.turn_started}));
+    try closeAndDestroy(n);
 }
 
 // ---------------------------------------------------------------------------

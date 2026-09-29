@@ -407,7 +407,11 @@ pub const Session = struct {
     /// session always has a durable first line (`tla/Lifecycle.tla`).
     fn publish(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
         const gpa = session.env.gpa;
-        errdefer session.phase = .{ .failed = null };
+        // Nothing is visible; later calls name the cause (D40).
+        errdefer |err| {
+            session.phase = .{ .failed = null };
+            if (session.fault == null) session.fault = asIoFault(err);
+        }
 
         // Frame everything first: line 1, the held lines, then the batch.
         session.batch.clearRetainingCapacity();
@@ -843,6 +847,18 @@ fn faultCode(fault: storage.IoFault) FaultCode {
         error.AccessDenied => .access_denied,
         error.ReadOnlyFileSystem => .read_only,
         error.FileTooBig => .too_big,
+    };
+}
+
+/// The I/O fault an append failed with, if it was one.
+fn asIoFault(err: AppendError) ?storage.IoFault {
+    return switch (err) {
+        error.Io => error.Io,
+        error.NoSpaceLeft => error.NoSpaceLeft,
+        error.AccessDenied => error.AccessDenied,
+        error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
+        error.FileTooBig => error.FileTooBig,
+        else => null,
     };
 }
 
