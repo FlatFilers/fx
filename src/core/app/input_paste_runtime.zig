@@ -572,7 +572,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
 
             const consume_image_slash = app.pending_images.items.len == 0 and
                 app.input_runtime.edit_state.selectionRange() == null and
-                app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len and
+                start == app.input_runtime.edit_state.input.items.len and
                 isBareImageSlashPrefix(app.input_runtime.edit_state.input.items);
             if (consume_image_slash) {
                 debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_image_attachment", .{});
