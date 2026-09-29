@@ -159,14 +159,22 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
       const parsed = JSON.parse(body) as { tools?: unknown[] };
       const compacting = (parsed.tools?.length ?? 0) === 0;
       if (!compacting) workingRequests += 1;
-      if (!compacting && workingRequests === 2) {
+      if (!compacting && workingRequests === 3) {
         return Response.json({ error: { code: "context_length_exceeded", message: "maximum context length exceeded" } }, { status: 400 });
       }
-      // The first reply is too long to keep word for word, so compaction
-      // must ask this provider for a summary.
+      // The first turn reads a file before its reply, so compaction has work
+      // to note and must ask this provider for the notes.
+      if (!compacting && workingRequests === 1) {
+        return new Response(
+          `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: "call_provider_facts", name: "read_file" } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 0, arguments: JSON.stringify({ path: "provider-facts.txt" }) })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.completed", response: { id: `response-${bodies.length}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
       const text = compacting
-        ? "The earlier request established the saved facts."
-        : workingRequests === 1 ? "SAVED_PROVIDER_FACTS ".repeat(2_000) : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
+        ? "Turn 1\nIn between: Read the saved provider facts.\nT1: read the saved provider facts"
+        : workingRequests === 2 ? "SAVED_PROVIDER_FACTS ".repeat(2_000) : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
           `data: ${JSON.stringify({ type: "response.completed", response: { id: `response-${bodies.length}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
@@ -6244,6 +6252,7 @@ test(
             : { provider, grok_model: direct.workingModel }) + "\n",
           { mode: 0o600 },
         );
+        writeFileSync(join(testHome, "provider-facts.txt"), "Provider facts.\n");
         const options = {
             cwd: testHome,
             env: {
@@ -6278,10 +6287,13 @@ test(
             body_lengths: direct.bodies.map((body) => body.length),
           }),
         )
-          .toEqual(Array(4).fill(direct.workingModel));
-        expect(direct.authorizations).toEqual(Array(4).fill(`Bearer ${direct.accessToken}`));
+          .toEqual(Array(5).fill(direct.workingModel));
+        // The fourth request is the compaction's own, sent without tools.
+        expect(direct.bodies.map((body) => ((JSON.parse(body) as { tools?: unknown[] }).tools?.length ?? 0) === 0))
+          .toEqual([false, false, false, true, false]);
+        expect(direct.authorizations).toEqual(Array(5).fill(`Bearer ${direct.accessToken}`));
         if (provider === "grok") {
-          expect(direct.modelOverrides).toEqual(Array(4).fill(direct.workingModel));
+          expect(direct.modelOverrides).toEqual(Array(5).fill(direct.workingModel));
         }
         expect(testGateway.requests).toHaveLength(0);
       } finally {

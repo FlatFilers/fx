@@ -51,11 +51,15 @@ pub const Asked = struct {
     after_conversation: bool = false,
 };
 
+/// A request that follows the conversation reads like the user's next
+/// message, so the model is told not to note it.
+const from_fx = " This request comes from fx, not from the user, so leave it and the writing of these notes out of every note and entry.";
+
 /// Appends the request for the notes. It lists the exact headings to write,
 /// since a model given an example heading may copy it instead.
 pub fn writeRequest(alloc: Allocator, text: *std.ArrayList(u8), asked: Asked) Allocator.Error!void {
     try text.appendSlice(alloc, if (asked.after_conversation)
-        "Write the compaction notes for the turns of the conversation above that are listed below; the turns after them stay in the conversation as they are. Answer with text only and call no tools."
+        "Write the compaction notes for the turns of the conversation above that are listed below; the turns after them stay in the conversation as they are. Answer with text only and call no tools." ++ from_fx
     else
         "Write the compaction notes for the new turns above.");
     try text.appendSlice(alloc, " The user's messages and the assistant's final replies stay in the conversation word for word, so do not repeat them.");
@@ -70,13 +74,19 @@ pub fn writeRequest(alloc: Allocator, text: *std.ArrayList(u8), asked: Asked) Al
         try text.appendSlice(alloc, "\nUnder each heading:\n" ++ in_between_label ++
             " one to three sentences on what the assistant did before its final reply: what it looked at, what it found, what it changed or decided. Leave out what the final reply already says. Write \"none\" when there was nothing.\n" ++
             "Then one line for every tool call of the turn, starting with its ID like `T<number>:`, at most 15 words: why it was used and what it showed that matters. Calls with one purpose may share a line that starts `T<first>\u{2013}T<last>:`.\n");
-        if (asked.open != null) try text.appendSlice(alloc, "For the turn in progress, give its notes so far.\n");
+        if (asked.open != null) try text.appendSlice(alloc, if (asked.after_conversation)
+            "For the turn in progress, give its notes so far, through the last tool call listed under its heading; the calls after it stay in the conversation.\n"
+        else
+            "For the turn in progress, give its notes so far.\n");
         try text.append(alloc, '\n');
     } else {
         try text.appendSlice(alloc, "\n\n");
     }
     try text.appendSlice(alloc, "Then only the new entries of these sections, each starting with its ID and the turn or tool call it comes from, like `F<number> (T<number>):`:\n\n");
-    try text.print(alloc, "Rules:\nR1, R2, ...: each new instruction, rule or preference from the user, quoted word for word in double quotes, with {s}.\n\n", .{if (asked.saved) "the ID of its turn, like M<number>" else "the number of its turn"});
+    try text.print(alloc, "Rules:\nR1, R2, ...: each new instruction, rule or preference from the user, quoted word for word in double quotes, with {s}{s}.\n\n", .{
+        if (asked.saved) "the ID of its turn, like M<number>" else "the number of its turn",
+        if (asked.open != null) ", or `(turn in progress)` for the turn still in progress" else "",
+    });
     try text.appendSlice(alloc, "Facts:\nF1, F2, ...: facts the work depends on, from these turns: names, paths, values, results, causes.\n\n" ++
         "Decisions:\nD1, D2, ...: each decision and why. When it changes an earlier entry, end with \"replaces\" and that entry's ID.\n\n" ++
         "Status:\nS1, S2, ...: where each part of the work stands now. When it updates an earlier entry, end with \"replaces\" and that entry's ID.\n\n" ++
@@ -93,7 +103,7 @@ const entry_kinds = checkpoint.entry_kinds;
 pub fn writeFollowUp(alloc: Allocator, text: *std.ArrayList(u8), missing: []const Heading, entries: []const checkpoint.Entry, after_conversation: bool) Allocator.Error!void {
     try text.appendSlice(alloc, "Your notes on the turns above left some out. Write the notes for only these turns now, each heading followed by its notes:\n\n");
     try writeHeadings(alloc, text, missing, null);
-    if (after_conversation) try text.appendSlice(alloc, "\nUnder each heading above are the turn's tool calls, so you can find them; do not copy those lines. Answer with text only and call no tools.\n");
+    if (after_conversation) try text.appendSlice(alloc, "\nUnder each heading above are the turn's tool calls, so you can find them; do not copy those lines. Answer with text only and call no tools." ++ from_fx ++ "\n");
     try text.appendSlice(alloc, "\nUnder each heading, " ++ in_between_label ++ " with what the assistant did before its final reply, then a line for every tool call, starting with its ID, on why it was used and what it showed.\n\n" ++
         "Then any new entries from those turns under the same sections, each starting with its ID and the turn or tool call it comes from.");
     try writeHighestIds(alloc, text, entries);
@@ -465,7 +475,7 @@ pub fn read(arena: Allocator, reply: []const u8, known: Known, earlier: []const 
             written.repeated += 1;
             continue;
         }
-        try entries.append(arena, .{ .id = item.id, .text = withoutBullet(item.text) });
+        try entries.append(arena, .{ .id = item.id, .text = try entryText(arena, item) });
     }
     written.entries = entries.items;
     return written;
@@ -590,9 +600,14 @@ fn isToolsLabel(plain: []const u8) bool {
     return startsWithIgnoreCase(plain, "T:") or startsWithIgnoreCase(plain, "Tools:");
 }
 
-fn withoutBullet(text: []const u8) []const u8 {
-    const start = std.mem.trimStart(u8, text, " \t");
-    return if (std.mem.startsWith(u8, start, "- ") or std.mem.startsWith(u8, start, "* ")) start[2..] else start;
+/// An entry's text from its ID on, without the bullet, check box or bold
+/// mark around the ID, like `- [x] **F1** (T3): ...` saved as `F1 (T3): ...`.
+fn entryText(arena: Allocator, item: Item) Allocator.Error![]const u8 {
+    // Nothing that may come before an ID contains one.
+    const at = std.mem.find(u8, item.text, item.id).?;
+    var rest = item.text[at + item.id.len ..];
+    if (std.mem.startsWith(u8, rest, "**")) rest = rest[2..];
+    return std.mem.concat(arena, u8, &.{ item.id, rest });
 }
 
 const Item = struct {

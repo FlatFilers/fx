@@ -1314,6 +1314,8 @@ test "after the conversation the model reads only the request, with every turn f
     try testing.expect(std.mem.find(u8, seen, "[Turn 1]") == null);
     try testing.expect(std.mem.find(u8, seen, "missing semicolon") == null);
     try testing.expect(std.mem.find(u8, seen, "Answer with text only and call no tools.") != null);
+    // Read as the user's next message, the request could end up in the notes.
+    try testing.expect(std.mem.find(u8, seen, "This request comes from fx, not from the user") != null);
     // Turn 2 has nothing in between but is listed for its number.
     try testing.expect(std.mem.find(u8, seen, "each followed by its notes:\n\n" ++
         "Turn 1 (T1), which begins \u{201c}Fix the build. It fails on main.\u{201d}\n  T1 shell: zig build\n" ++
@@ -1396,6 +1398,25 @@ test "the model's notes are checked against the turns and tool calls they name" 
     try testing.expectEqualStrings("F2 (T1): the failures are in src/parser.zig [check: not in the saved turns or tool calls: src/parser.zig]", entries[1].text);
     try testing.expectEqualStrings("F3 (T7): the build is slow [check: T7 does not exist]", entries[2].text);
     try testing.expect(std.mem.find(u8, result.text, "A note or entry marked [check: ...]") != null);
+}
+
+test "entries with a bold or checked ID are saved from the ID on" {
+    var store = MemoryStore{ .alloc = testing.allocator };
+    defer store.deinit();
+    const turns = [_]Turn{.{ .user = "run the tests", .items = &.{
+        .{ .tool_call = .{ .id = "c1", .name = "shell", .arguments = "{\"command\":\"zig build test\"}" } },
+        .{ .tool_result = .{ .call_id = "c1", .name = "shell", .output = "{\"exit_code\":1,\"output\":\"3 of 120 tests failed in src/lexer.zig\"}" } },
+        .{ .assistant = "Three tests fail in the lexer." },
+    } }};
+    var model = FakeModel{ .reply = "Turn 1\nIn between: Ran the suite.\nT1: ran the tests\n\nFacts:\n- **F1** (T1): 3 of 120 tests fail in src/lexer.zig\n\nStatus:\n- [x] S1 (T1): fixing the lexer" };
+    defer model.deinit();
+    var result = try compact(testing.allocator, .{ .model = "m", .turns = &turns }, model.model(), store.store());
+    defer result.deinit();
+
+    const entries = result.compacted.entries;
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("F1 (T1): 3 of 120 tests fail in src/lexer.zig", entries[0].text);
+    try testing.expectEqualStrings("S1 (T1): fixing the lexer", entries[1].text);
 }
 
 test "the tool line says what code knows: the call, how it ended and its size" {

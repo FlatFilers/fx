@@ -7690,6 +7690,7 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewayFinalText("EARLIER_VISIBLE_RESPONSE"),
       fakeGatewayFinalText("MIDDLE_VISIBLE_RESPONSE"),
       fakeGatewayFinalText("LATEST_VISIBLE_RESPONSE"),
+      fakeGatewayFinalText(`Rules:\n- R1 (M1): "${earlierRequest}"`),
       fakeGatewayFinalText("AFTER_COMPACTED_RESUME_OK"),
     ]);
     let active: TmuxSession | null = null;
@@ -7722,14 +7723,17 @@ test.skipIf(!tmuxAvailable())(
       const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
       expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
       expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
-      // Plain turns have nothing to summarize: no model call, and the
-      // checkpoint keeps the earlier message and reply word for word.
-      expect(gateway.requests).toHaveLength(3);
+      // Plain turns have nothing to summarize, but the earlier message may set
+      // a rule, so the one model call files it; the checkpoint keeps the
+      // earlier message and reply word for word.
+      expect(gateway.requests).toHaveLength(4);
+      expect(gateway.requests[3].body).toContain(JSON.stringify(`- M1: "${earlierRequest}"`).slice(1, -1));
       const saved: string = records.find((record) => record.event.context_checkpoint).event.context_checkpoint.summary;
       expect(saved.startsWith("fx-compactor-v1\n")).toBe(true);
       const payload = JSON.parse(saved.slice("fx-compactor-v1\n".length));
       expect(payload.turns[0].users).toEqual([earlierRequest]);
       expect(payload.turns[0].final).toBe("EARLIER_VISIBLE_RESPONSE");
+      expect(payload.entries.map((entry: { text: string }) => entry.text)).toEqual([`R1 (M1): "${earlierRequest}"`]);
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
       await active.kill();
