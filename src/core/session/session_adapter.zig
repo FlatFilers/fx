@@ -811,7 +811,15 @@ pub const Session = struct {
     /// A piece's bytes, from its blob when the line holds a reference.
     fn pieceData(self: *Session, pa: Allocator, piece: sm.Body.Piece) ![]const u8 {
         if (piece.blobs.len != 1 or !std.mem.startsWith(u8, piece.data, "{\"" ++ blob_ref_key ++ "\":")) return piece.data;
-        return self.store.manager.getBlob(pa, self.id(), piece.blobs[0]);
+        return self.store.manager.getBlob(pa, self.id(), piece.blobs[0]) catch |err| switch (err) {
+            // A blob the log names that is gone or damaged damages the
+            // session, as a bad line does (D39).
+            error.NotFound, error.Corrupt => {
+                debug_trace.logf("session", "event=sessions_v2_blob_unreadable session={s} err={s}", .{ self.id(), @errorName(err) });
+                return error.InvalidSessionFormat;
+            },
+            else => |e| return e,
+        };
     }
 };
 

@@ -469,6 +469,28 @@ test("a flipped byte inside the log stops resume and leaves the file as it was",
   }
 }, TIMEOUT * 3);
 
+test("a blob that went missing stops resume as damage, not as a missing session", async () => {
+  const fixture = createFixture("fx-v2-lost-blob-");
+  const big = "LOST_BLOB_START " + "blob-body ".repeat(30_000) + "LOST_BLOB_END";
+  const gateway = startFakeGateway([fakeGatewayFinalText(big)]);
+  try {
+    const created = await ask(fixture, gateway, ["Answer at great length."]);
+    expect(created.code).toBe(0);
+    const id = JSON.parse(created.stdout).session_id;
+    const referenced = (logLines(fixture, id) as any[]).find((line) => Array.isArray(line.blobs) && line.blobs.length === 1);
+    rmSync(join(v2Root(fixture), id, "blobs", referenced.blobs[0]));
+
+    const resumed = await ask(fixture, gateway, ["--resume-id", id, "Continue after the lost blob."]);
+    expect(resumed.code).toBe(1);
+    expect(resumed.stdout + resumed.stderr).toContain("InvalidSessionFormat");
+    expect(resumed.stdout + resumed.stderr).not.toContain("NotFound");
+    expect(gateway.requests).toHaveLength(1);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test("a second process on an open session is refused and writes nothing", async () => {
   const fixture = createFixture("fx-v2-busy-");
   let stalled: () => void = () => {};
