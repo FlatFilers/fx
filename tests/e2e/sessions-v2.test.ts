@@ -3335,3 +3335,489 @@ test("a named child whose log is damaged fails that message, and the parent turn
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }, TIMEOUT * 2);
+
+// ---------------------------------------------------------------------------
+// The fault grid: every way a run leaves a session, every fault, and every
+// way back in. Each case copies a saved home, applies one fault and enters
+// once. A refusal must name its cause and leave the log as it was; a fault
+// that can clear must give way once it has; and whatever comes back must be
+// the history the run left.
+
+type GridExit = "committed" | "cancelled" | "crashed" | "crashed-mid-tool";
+type GridFault = "none" | "torn-tail" | "flipped-byte" | "lost-blob" | "read-only" | "full-disk" | "busy";
+type GridEntry = "ask-id" | "ask-last" | "app-id" | "app-last" | "acp-load" | "acp-resume" | "ask-new" | "app-new" | "acp-new";
+type GridHost = "ask" | "app" | "acp";
+
+const GRID_EXITS: GridExit[] = ["committed", "cancelled", "crashed", "crashed-mid-tool"];
+const GRID_FAULTS: GridFault[] = ["none", "torn-tail", "flipped-byte", "lost-blob", "read-only", "full-disk", "busy"];
+const GRID_ENTRIES: GridEntry[] = ["ask-id", "ask-last", "app-id", "app-last", "acp-load", "acp-resume"];
+const gridHost = (entry: GridEntry) => entry.slice(0, entry.indexOf("-")) as GridHost;
+
+/// macOS fills a real disk image; elsewhere a file-size limit stands in.
+const REAL_FULL_DISK = process.platform === "darwin";
+
+/// What each host says when it refuses, by cause.
+const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost, RegExp>> = {
+  damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
+  denied: { ask: /AccessDenied/, app: /cannot be opened for writing: permission denied|AccessDenied/, acp: /permission denied/ },
+  busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  full: REAL_FULL_DISK
+    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
+    : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },
+};
+
+/// A first reply over the blob limit, so every base session has a blob.
+const GRID_BIG = `GRID_BIG_START ${"grid-body ".repeat(30_000)}GRID_BIG_END`;
+
+/// One saved home per exit and host, made once and copied into every case.
+/// The first turn is always `fx ask`'s; the app's `-c` continues only a
+/// session the app has opened, so its bases end their second turn in the app.
+const gridBases = new Map<string, Promise<{ fixture: Fixture; id: string }>>();
+
+function gridBase(exit: GridExit, by: "ask" | "app") {
+  const key = `${exit}:${by}`;
+  let base = gridBases.get(key);
+  if (!base) {
+    base = makeGridBase(exit, by);
+    gridBases.set(key, base);
+  }
+  return base;
+}
+
+async function makeGridBase(exit: GridExit, by: "ask" | "app") {
+  const fixture = createFixture(`fx-v2-grid-${by}-${exit}-`);
+  let stall: () => void = () => {};
+  const stalled = new Promise<void>((resolve) => (stall = resolve));
+  const hold: Hold = { started: false, cancelled: false };
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (!body.includes("Grid second.")) return fakeGatewayFinalText(GRID_BIG);
+    if (exit === "committed") return fakeGatewayFinalText("GRID_SECOND_ANSWER");
+    if (exit === "crashed-mid-tool") {
+      if (!body.includes("GRID_FAST_TOOL_OUTPUT")) return fakeShellRun("grid-fast-1", "echo GRID_FAST_TOOL_OUTPUT");
+      stall();
+      return fakeShellRun("grid-slow-2", "sleep 5");
+    }
+    stall();
+    // The app shows a streamed line once the next begins.
+    if (by === "app" && exit === "cancelled") return heldReply(hold, "GRID_PARTIAL\nGRID_STILL_STREAMING\n");
+    return new Promise<Response>(() => {});
+  });
+  try {
+    const first = await ask(fixture, gateway, ["Grid first."]);
+    expect(first.code, `${exit} base by ${by}: signal ${first.signal}: ${first.stderr}`).toBe(0);
+    const id: string = JSON.parse(first.stdout).session_id;
+    if (by === "ask" && exit === "committed") {
+      expect((await ask(fixture, gateway, ["--resume-id", id, "Grid second."])).code).toBe(0);
+    } else if (by === "ask") {
+      const run = spawnAsk(fixture, gateway, ["--resume-id", id, "Grid second."]);
+      await stalled;
+      if (exit === "crashed-mid-tool") await waitForLog(fixture, id, "grid-slow-2");
+      run.child.kill(exit === "cancelled" ? "SIGINT" : "SIGKILL");
+      await run.exited;
+    } else {
+      const app = await startApp(fixture, gateway, ["--resume", id], true, { FX_PERMISSION_MODE: "full-access" });
+      try {
+        // Typed while the resumed history still draws, a prompt's turn can
+        // go undrawn (F33), so wait for the screen to settle.
+        await app.session.waitForStableComposer(TIMEOUT, 300);
+        await app.session.sendText("Grid second.");
+        if (exit === "committed") {
+          await app.session.waitForText("GRID_SECOND_ANSWER", TIMEOUT);
+          await app.session.waitForComposer(TIMEOUT);
+          await quitApp(app);
+        } else if (exit === "cancelled") {
+          // Mid-reply by the gateway and the log, not the screen: an open
+          // stream may not draw after a large resume (F33).
+          await until(() => hold.started, "the held reply");
+          await waitForLog(fixture, id, "Grid second.");
+          await app.session.sendKeys("Escape");
+          await app.session.waitForText("esc again to interrupt", TIMEOUT);
+          await app.session.sendKeys("Escape");
+          await until(() => hold.cancelled, "the cancel to reach the gateway");
+          await app.session.waitForComposer(TIMEOUT);
+          await quitApp(app);
+        } else {
+          await stalled;
+          if (exit === "crashed-mid-tool") await waitForLog(fixture, id, "grid-slow-2");
+          Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
+        }
+      } finally {
+        await app.session.kill();
+      }
+    }
+    // A crash leaves its turn open, for the next open to end.
+    const kinds = logLines(fixture, id).map((line) => line.kind);
+    const ended = kinds.filter((kind) => kind === "turn_committed" || kind === "turn_interrupted").length;
+    expect(kinds.filter((kind) => kind === "turn_started").length - ended).toBe(exit.startsWith("crashed") ? 1 : 0);
+    return { fixture, id };
+  } finally {
+    gateway.stop();
+  }
+}
+
+/// Answers `Grid token T.` with `GRID_ANSWER_T`, by the newest token in the
+/// request, so history never answers for the prompt. `hold(T)` keeps T's
+/// reply until the returned release runs.
+function gridGateway() {
+  const holds = new Map<string, { reached: () => void; released: Promise<void> }>();
+  const gateway = startDynamicFakeGateway(async (body) => {
+    const token = [...body.matchAll(/Grid token (\w+)\./g)].at(-1)?.[1];
+    if (token === undefined) return fakeGatewayFinalText("GRID_NO_TOKEN");
+    const hold = holds.get(token);
+    if (hold) {
+      hold.reached();
+      await hold.released;
+    }
+    return fakeGatewayFinalText(`GRID_ANSWER_${token}`);
+  });
+  const hold = (token: string) => {
+    let reached: () => void = () => {};
+    let release: () => void = () => {};
+    const reachedHold = new Promise<void>((resolve) => (reached = resolve));
+    holds.set(token, { reached, released: new Promise<void>((resolve) => (release = resolve)) });
+    return { reached: reachedHold, release };
+  };
+  /// The request that asked for `token`, if one reached the gateway.
+  const asked = (token: string) =>
+    gateway.requests.filter((request: any) => [...request.body.matchAll(/Grid token (\w+)\./g)].at(-1)?.[1] === token).at(-1)?.body as string | undefined;
+  return { gateway, hold, asked };
+}
+
+/// `harness` holds the test's own files, never on a full disk.
+type GridCase = { fixture: Fixture; id: string; log: string; harness: string };
+
+/// A fresh copy of a base home as `under/name`, modes kept, with its
+/// harness folder in `outside`.
+function gridCopy(base: { fixture: Fixture; id: string }, under: string, outside: string, name: string): GridCase {
+  const root = join(under, name);
+  const harness = join(outside, `${name}-harness`);
+  mkdirSync(root);
+  mkdirSync(harness);
+  const copied = Bun.spawnSync(["cp", "-Rp", base.fixture.home, join(root, "home")]);
+  if (copied.exitCode !== 0) throw new Error(`cp: ${copied.stderr}`);
+  const fixture = { root, home: realpathSync(join(root, "home")), workspace: base.fixture.workspace };
+  return { fixture, id: base.id, log: join(v2Root(fixture), base.id, "log.jsonl"), harness };
+}
+
+/// A small HFS+ disk image mounted at `mountpoint`, which `fillDisk` fills.
+function attachDiskImage(image: string, mountpoint: string) {
+  const made = Bun.spawnSync(["hdiutil", "create", "-size", "24m", "-fs", "HFS+", "-volname", "fxgrid", "-layout", "NONE", image]);
+  if (made.exitCode !== 0) throw new Error(`hdiutil create: ${made.stderr}`);
+  mkdirSync(mountpoint, { recursive: true });
+  const attached = Bun.spawnSync(["hdiutil", "attach", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", mountpoint, image]);
+  if (attached.exitCode !== 0) throw new Error(`hdiutil attach: ${attached.stderr}`);
+  return () => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (Bun.spawnSync(["hdiutil", "detach", "-force", mountpoint]).exitCode === 0) return;
+      Bun.sleepSync(200);
+    }
+  };
+}
+
+function fillDisk(mountpoint: string) {
+  Bun.spawnSync(["/bin/sh", "-c", `head -c 100000000 /dev/zero > '${mountpoint}/.filler' 2>/dev/null; true`]);
+}
+
+type GridAttempt = { entered: boolean; said: string };
+
+/// Enters the case through `entry` and asks for `token`. Under `limit`, the
+/// host runs with that file-size limit.
+async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: string, limit?: number): Promise<GridAttempt> {
+  const prompt = `Grid token ${token}.`;
+  const answer = `GRID_ANSWER_${token}`;
+  switch (gridHost(entry)) {
+    case "ask": {
+      const args = entry === "ask-id" ? ["--resume-id", c.id, prompt] : entry === "ask-last" ? ["--resume", "last", prompt] : [prompt];
+      const result = limit === undefined ? await ask(c.fixture, gateway, args) : await askWithSizeLimit(c.fixture, gateway, limit, args);
+      let json: any;
+      try {
+        json = JSON.parse(result.stdout);
+      } catch {}
+      return { entered: result.code === 0 && json?.output === answer, said: `${json?.error ?? ""} ${result.stderr}` };
+    }
+    case "app": {
+      const args = entry === "app-id" ? `--resume ${c.id}` : entry === "app-last" ? "-c" : "";
+      const stderrPath = join(c.harness, `stderr-${token}.log`);
+      writeFileSync(stderrPath, "");
+      let cmd = `${FX_BIN} --sessions-v2 ${args}`;
+      if (limit !== undefined) {
+        cmd = join(c.harness, `limited-${token}.sh`);
+        writeFileSync(cmd, `#!/bin/sh\ntrap '' XFSZ\nulimit -f ${limit}\nexec '${FX_BIN}' --sessions-v2 ${args}\n`, { mode: 0o700 });
+      }
+      const session = await TmuxSession.create({ cmd, cwd: c.fixture.workspace, env: { ...env(c.fixture, gateway, false), NO_COLOR: "1" }, stderrPath, remainOnExit: true });
+      // The pane stays after fx exits, so its end is the pane dying.
+      const exit = async (what: string) => {
+        const deadline = Date.now() + TIMEOUT;
+        while (!session.paneStatus().dead) {
+          if (Date.now() > deadline) throw new Error(`${entry}: the app did not exit ${what}`);
+          await Bun.sleep(50);
+        }
+      };
+      try {
+        // Either the composer shows or the app refuses and exits.
+        let settled = false;
+        const died = (async () => {
+          while (!settled && !session.paneStatus().dead) await Bun.sleep(50);
+          return "exited";
+        })();
+        let started = await Promise.race([session.waitForComposer(TIMEOUT).then(() => "composer", () => "neither"), died]);
+        settled = true;
+        if (started === "neither" && session.paneStatus().dead) started = "exited";
+        if (started === "exited") return { entered: false, said: readFileSync(stderrPath, "utf8") };
+        if (started === "neither") throw new Error(`${entry}: the app neither showed its composer nor exited`);
+        await session.waitForStableComposer(TIMEOUT, 300);
+        await session.sendText(prompt);
+        let screen = "";
+        const deadline = Date.now() + TIMEOUT;
+        while (Date.now() < deadline) {
+          screen = await session.captureFullScrollback();
+          if (screen.includes(answer) || /✗ .*|could not save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
+          await Bun.sleep(100);
+        }
+        // The reply shows even when saving it fails, so read the turn's end.
+        await session.waitForComposer(TIMEOUT);
+        screen = await session.captureFullScrollback();
+        const turn = screen.slice(screen.lastIndexOf(prompt));
+        await session.sendText("/quit");
+        await exit("after /quit");
+        return { entered: turn.includes(answer) && !/✗ |could not save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };
+      } finally {
+        await session.kill();
+      }
+    }
+    case "acp": {
+      const client = await AcpRpc.start(c.fixture, gateway, {}, limit);
+      try {
+        let sessionId = c.id;
+        if (entry === "acp-new") {
+          const created = await client.request("session/new", { cwd: c.fixture.workspace, mcpServers: [] });
+          if (created.error) return { entered: false, said: created.error.message };
+          sessionId = created.result.sessionId;
+        } else {
+          const method = entry === "acp-load" ? "session/load" : "session/resume";
+          const opened = await client.request(method, { sessionId, cwd: c.fixture.workspace, mcpServers: [] });
+          if (opened.error) return { entered: false, said: opened.error.message };
+        }
+        const prompted = await client.request("session/prompt", { sessionId, ...acpPrompt(prompt) });
+        if (prompted.error) return { entered: false, said: prompted.error.message };
+        return { entered: client.texts("agent_message_chunk").join("").includes(answer), said: "" };
+      } finally {
+        await client.close();
+      }
+    }
+  }
+}
+
+/// The history an entered session must show the model, by how the run left it.
+function expectGridHistory(exit: GridExit, body: string, label: string) {
+  // The blob comes back whole.
+  expect(body, label).toContain("GRID_BIG_END");
+  if (exit === "committed") expect(body, label).toContain("GRID_SECOND_ANSWER");
+  else expect(body, label).toContain("Grid second.");
+  if (exit === "crashed-mid-tool") {
+    // Every call keeps a result: the finished one its own, the running
+    // one an answer that it may have partly run.
+    expectPairedToolCalls(body);
+    expect(body, label).toContain("GRID_FAST_TOOL_OUTPUT");
+    expect(body, label).toContain("may have partly run");
+  }
+}
+
+/// A refused entry leaves the log as it was, except a lost blob: like a bad
+/// line that open does not read, it is found by the history read after a
+/// writable open, so that open has already ended a crashed turn, and its
+/// close is written (D39).
+function expectLogKept(faulted: Buffer, after: Buffer, exit: GridExit, fault: GridFault, label: string) {
+  if (fault !== "lost-blob") return expect(after.equals(faulted), `${label} log unchanged`).toBe(true);
+  expect(after.subarray(0, faulted.length).equals(faulted), `${label} log kept`).toBe(true);
+  const added = after.subarray(faulted.length).toString("utf8").trimEnd().split("\n").filter(Boolean).map((line) => JSON.parse(line).kind);
+  expect(added, label).toEqual(exit.startsWith("crashed") ? ["turn_interrupted", "closed"] : ["closed"]);
+}
+
+let gridTokens = 0;
+
+/// One exit through one entry under every fault.
+async function gridRow(exit: GridExit, entry: GridEntry) {
+  const host = gridHost(entry);
+  const base = await gridBase(exit, entry === "app-last" ? "app" : "ask");
+  const under = mkdtempSync(join(tmpdir(), `fx-v2-grid-${exit}-${entry}-`));
+  const { gateway, hold, asked } = gridGateway();
+  const volume = join(under, "volume");
+  const detach = REAL_FULL_DISK ? attachDiskImage(join(under, "disk.dmg"), volume) : () => {};
+  try {
+    for (const fault of GRID_FAULTS) {
+      const label = `${exit} / ${fault} / ${entry}`;
+      const c = gridCopy(base, fault === "full-disk" && REAL_FULL_DISK ? volume : under, under, fault);
+      const token = `T${++gridTokens}`;
+      const retry = `T${++gridTokens}`;
+      let limit: number | undefined;
+      let clear: () => Promise<void> = async () => {};
+      let holder: ReturnType<typeof spawnAsk> | undefined;
+      switch (fault) {
+        case "torn-tail":
+          tearTail(c.fixture, c.id);
+          break;
+        case "flipped-byte":
+          flipMiddleByte(c.log);
+          break;
+        case "lost-blob": {
+          const referenced = (logLines(c.fixture, c.id) as any[]).find((line) => Array.isArray(line.blobs) && line.blobs.length > 0);
+          rmSync(join(v2Root(c.fixture), c.id, "blobs", referenced.blobs[0]));
+          break;
+        }
+        case "read-only": {
+          const folder = join(v2Root(c.fixture), c.id);
+          chmodSync(c.log, 0o400);
+          chmodSync(folder, 0o500);
+          clear = async () => {
+            chmodSync(folder, 0o700);
+            chmodSync(c.log, 0o600);
+          };
+          break;
+        }
+        case "full-disk":
+          if (REAL_FULL_DISK) {
+            fillDisk(volume);
+            clear = async () => rmSync(join(volume, ".filler"));
+          } else {
+            limit = blocksJustPast(c.log);
+            clear = async () => {
+              limit = undefined;
+            };
+          }
+          break;
+        case "busy": {
+          const held = hold(`H${token}`);
+          holder = spawnAsk(c.fixture, gateway, ["--resume-id", c.id, `Grid token H${token}.`]);
+          await held.reached;
+          clear = async () => {
+            held.release();
+            await holder!.exited;
+          };
+          break;
+        }
+      }
+      const faulted = readFileSync(c.log);
+      try {
+        const first = await gridEnter(entry, c, gateway, token, limit);
+        if (fault === "none" || fault === "torn-tail") {
+          expect(first.entered, `${label}: ${first.said}`).toBe(true);
+          expectGridHistory(exit, asked(token)!, label);
+        } else if (fault === "full-disk" && first.entered) {
+          // Every write fit in space its files already held; nothing is lost.
+          expectGridHistory(exit, asked(token)!, label);
+        } else {
+          expect(first.entered, `${label} entered`).toBe(false);
+          const cause = fault === "flipped-byte" || fault === "lost-blob" ? "damaged" : fault === "read-only" ? "denied" : fault === "full-disk" ? "full" : "busy";
+          expect(first.said.trim(), label).toMatch(GRID_SAYS[cause][host]);
+          if (cause === "damaged" || cause === "denied" || cause === "busy") {
+            // Refused before the model: nothing asked, nothing written.
+            expect(asked(token), label).toBeUndefined();
+            if (cause !== "busy") expectLogKept(faulted, readFileSync(c.log), exit, fault, label);
+          }
+          if (cause !== "damaged") {
+            await clear();
+            clear = async () => {};
+            const second = await gridEnter(entry, c, gateway, retry, limit);
+            expect(second.entered, `${label} after the fault cleared: ${second.said}`).toBe(true);
+            expectGridHistory(exit, asked(retry)!, `${label} after the fault cleared`);
+          }
+        }
+        if (fault !== "flipped-byte" && fault !== "lost-blob") {
+          const tail = readFileSync(c.log).subarray(-160);
+          expect(tail.at(-1), `${label}: the log ends in ${JSON.stringify(tail.toString("utf8"))}`).toBe(0x0a);
+          expectWholeLog(c.fixture, c.id);
+          const reasons = logLines(c.fixture, c.id).filter((line) => line.kind === "turn_interrupted").map((line) => line.reason);
+          if (exit === "cancelled") expect(reasons, label).toContain("cancel");
+          if (exit === "crashed" || exit === "crashed-mid-tool") expect(reasons, label).toContain("crash");
+          expect(logLines(c.fixture, c.id).map((line) => line.kind).at(-1), label).toBe("closed");
+        }
+      } finally {
+        await clear();
+        if (holder) await holder.exited;
+        rmSync(c.fixture.root, { recursive: true, force: true });
+        rmSync(c.harness, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    gateway.stop();
+    detach();
+    rmSync(under, { recursive: true, force: true });
+  }
+}
+
+/// A new session beside a saved one, with nothing wrong, with the sessions
+/// folder read-only, and on a full disk. A refused turn creates nothing.
+async function gridNewRow(entry: GridEntry) {
+  const host = gridHost(entry);
+  const base = await gridBase("committed", "ask");
+  const under = mkdtempSync(join(tmpdir(), `fx-v2-grid-${entry}-`));
+  const { gateway, asked } = gridGateway();
+  const volume = join(under, "volume");
+  const detach = REAL_FULL_DISK ? attachDiskImage(join(under, "disk.dmg"), volume) : () => {};
+  try {
+    for (const fault of ["none", "read-only", "full-disk"] as const) {
+      const label = `new / ${fault} / ${entry}`;
+      const c = gridCopy(base, fault === "full-disk" && REAL_FULL_DISK ? volume : under, under, fault);
+      const root = v2Root(c.fixture);
+      const token = `T${++gridTokens}`;
+      const retry = `T${++gridTokens}`;
+      let limit: number | undefined;
+      let clear: () => void = () => {};
+      if (fault === "read-only") {
+        chmodSync(root, 0o500);
+        clear = () => chmodSync(root, 0o700);
+      } else if (fault === "full-disk" && REAL_FULL_DISK) {
+        fillDisk(volume);
+        clear = () => rmSync(join(volume, ".filler"));
+      } else if (fault === "full-disk") {
+        // Room for the new log's first lines, not for the turn.
+        limit = 1;
+        clear = () => {
+          limit = undefined;
+        };
+      }
+      const sessions = () => readdirSync(root).filter((name) => /^[A-Za-z0-9_-]{12}$/.test(name) && name !== c.id);
+      try {
+        const first = await gridEnter(entry, c, gateway, token, limit);
+        if (fault === "none" || (fault === "full-disk" && first.entered)) {
+          expect(first.entered, `${label}: ${first.said}`).toBe(true);
+        } else {
+          expect(first.entered, `${label} entered`).toBe(false);
+          expect(first.said.trim(), label).toMatch(GRID_SAYS[fault === "read-only" ? "denied" : "full"][host]);
+          if (fault === "read-only") expect(sessions(), `${label} created nothing`).toEqual([]);
+          clear();
+          clear = () => {};
+          const second = await gridEnter(entry, c, gateway, retry, limit);
+          expect(second.entered, `${label} after the fault cleared: ${second.said}`).toBe(true);
+        }
+        // A new session: none of the saved one's history.
+        expect(asked(first.entered ? token : retry), label).not.toContain("GRID_BIG_END");
+        const created = sessions();
+        expect(created.length, label).toBeGreaterThan(0);
+        for (const id of created) expectWholeLog(c.fixture, id);
+        expect(readFileSync(c.log, "utf8"), label).not.toContain("Grid token");
+      } finally {
+        clear();
+        rmSync(c.fixture.root, { recursive: true, force: true });
+        rmSync(c.harness, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    gateway.stop();
+    detach();
+    rmSync(under, { recursive: true, force: true });
+  }
+}
+
+for (const entry of ["ask-new", "app-new", "acp-new"] as const) {
+  const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable()) : test;
+  define(`fault grid: a new session by ${entry.slice(0, -4)}, with nothing wrong, a read-only folder and a full disk`, () => gridNewRow(entry), TIMEOUT * 6);
+}
+
+for (const exit of GRID_EXITS) {
+  for (const entry of GRID_ENTRIES) {
+    const define = gridHost(entry) === "app" ? test.skipIf(!tmuxAvailable()) : test;
+    define(`fault grid: a session ${exit}, entered by ${entry}, under every fault`, () => gridRow(exit, entry), TIMEOUT * 10);
+  }
+}
