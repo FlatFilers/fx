@@ -5092,6 +5092,10 @@ test "linked metadata FIFO is rejected before descriptor open" {
     var writer = BlockedWriter{ .path = fifo_path_z };
     const writer_thread = try std.Thread.spawn(.{}, BlockedWriter.run, .{&writer});
     defer {
+        // The reader stays open until the join. The blocked writer wakes
+        // only while a reader exists, so a reader closed at once can be
+        // gone before the writer runs, and the join then never returns.
+        var reader: ?std.Io.File = null;
         if (!writer.finished.load(.seq_cst)) {
             const reader_fd = std.posix.openatZ(
                 std.posix.AT.FDCWD,
@@ -5099,12 +5103,10 @@ test "linked metadata FIFO is rejected before descriptor open" {
                 .{ .ACCMODE = .RDONLY, .NONBLOCK = true },
                 0,
             ) catch -1;
-            if (reader_fd >= 0) {
-                var reader = std.Io.File{ .handle = reader_fd, .flags = .{ .nonblocking = true } };
-                reader.close(io_mod.getIo());
-            }
+            if (reader_fd >= 0) reader = std.Io.File{ .handle = reader_fd, .flags = .{ .nonblocking = true } };
         }
         writer_thread.join();
+        if (reader) |file| file.close(io_mod.getIo());
     }
     while (!writer.started.load(.seq_cst)) std.Thread.yield() catch {};
     for (0..1000) |_| std.Thread.yield() catch {};
