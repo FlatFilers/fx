@@ -17,6 +17,7 @@
 //!   `~/.fx/session-files/{id}/` until the default flips.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sm = @import("session_manager");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -99,12 +100,30 @@ pub const ChildLine = union(enum) {
 };
 
 // ---------------------------------------------------------------------------
+// Wiring trace
+
+/// One step of `Wiring.tla`, as a `wiring` trace line that trace validation
+/// reads back: the store opening and closing (the process's start and
+/// exit), a host session opening and closing, and the turn and child lines
+/// a host session writes. `pid` tells one process's steps from another's.
+fn traceWiring(comptime action: []const u8, session_id: []const u8, comptime detail: []const u8, pid: i64) void {
+    debug_trace.logf("wiring", "action=" ++ action ++ " session={s}" ++ detail ++ " pid={d}", .{ session_id, pid });
+}
+
+fn processId() i64 {
+    if (comptime builtin.os.tag == .wasi) return 0;
+    return std.c.getpid();
+}
+
+// ---------------------------------------------------------------------------
 // Store: one per process
 
 pub const Store = struct {
     manager: *sm.Manager,
     /// `$HOME`, owned: the base of `~/.fx/sessions/v2` and of the side folders.
     home: []u8,
+    /// Read once, for the wiring trace: not a call per append.
+    pid: i64,
 
     /// Touches no disk: a session's folder appears with its first turn.
     pub fn open(alloc: Allocator, home: []const u8) !Store {
@@ -126,7 +145,9 @@ pub const Store = struct {
             .root = root,
             .diagnostics = .{ .context = null, .emit = traceDiagnostic },
         });
-        return .{ .manager = manager, .home = owned_home };
+        const pid = processId();
+        traceWiring("StoreOpen", "-", "", pid);
+        return .{ .manager = manager, .home = owned_home, .pid = pid };
     }
 
     /// `$HOME` from the environment.
@@ -136,6 +157,7 @@ pub const Store = struct {
 
     /// Every Session must be closed first.
     pub fn deinit(store: *Store, alloc: Allocator) void {
+        traceWiring("StoreClose", "-", "", store.pid);
         store.manager.deinit();
         alloc.free(store.home);
         store.* = undefined;
@@ -535,6 +557,9 @@ pub const Session = struct {
     language: ?[]u8 = null,
     /// Started in this process: its first commit may name it.
     fresh: bool,
+    /// A host's own session, not a subagent child's: `Wiring.tla` models
+    /// only these.
+    root: bool = true,
     titled: bool = false,
     /// A usage-recovery marker protects a checkpoint still waiting for the
     /// profile ledger; it keeps its first time until nothing is pending.
@@ -555,6 +580,7 @@ pub const Session = struct {
         const self = try init(alloc, store, handle, true);
         errdefer self.destroyInner();
         try self.appendSeed(seed);
+        traceWiring("Open", self.id(), "", self.store.pid);
         return self;
     }
 
@@ -563,7 +589,7 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        _ = try self.handle.append(&.{
+        _ = try self.write(&.{
             .{ .set = .{ .key = .prefs, .value = try encodePreferences(a, seed.preferences, self.instructions) } },
             .{ .set = .{ .key = .permissions, .value = try session_codec.encodePermissionState(a, seed.permission_state) } },
             .{ .set = .{ .key = .language, .value = try jsonString(a, seed.language.view()) } },
@@ -581,6 +607,7 @@ pub const Session = struct {
             errdefer handle.release();
             const self = try init(alloc, store, handle, false);
             errdefer self.destroyInner();
+            self.root = false;
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
             const state = try handle.state(scratch.allocator());
@@ -602,6 +629,7 @@ pub const Session = struct {
         errdefer handle.release();
         const self = try init(alloc, store, handle, false);
         errdefer self.destroyInner();
+        self.root = false;
         if (seed.instructions.len > 0) self.instructions = try alloc.dupe(u8, seed.instructions);
         try self.appendSeed(seed);
         return self;
@@ -625,7 +653,7 @@ pub const Session = struct {
         errdefer self.alloc.free(owned);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        _ = try self.handle.append(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, owned) } }});
+        _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, owned) } }});
         if (self.instructions) |old| self.alloc.free(old);
         self.instructions = owned;
     }
@@ -659,6 +687,7 @@ pub const Session = struct {
         var state = try handle.state(alloc);
         defer state.deinit(alloc);
         self.last_turn = state.last_turn;
+        traceWiring("Open", self.id(), "", self.store.pid);
         return self;
     }
 
@@ -672,6 +701,21 @@ pub const Session = struct {
 
     pub fn id(self: *const Session) []const u8 {
         return self.handle.id();
+    }
+
+    /// Appends through the manager; a host session also traces the turn and
+    /// child lines `Wiring.tla` models.
+    fn write(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
+        const seq = try self.handle.append(events);
+        if (self.root) for (events) |event| switch (event) {
+            .turn_started => traceWiring("BeginTurn", self.id(), "", self.store.pid),
+            .turn_committed => traceWiring("EndTurn", self.id(), " end=commit", self.store.pid),
+            .turn_interrupted => traceWiring("EndTurn", self.id(), " end=interrupt", self.store.pid),
+            .child_spawned => traceWiring("Spawn", self.id(), "", self.store.pid),
+            .child_finished => traceWiring("ChildDone", self.id(), "", self.store.pid),
+            else => {},
+        };
+        return seq;
     }
 
     /// The session is on disk: it has a turn, ended or open.
@@ -699,6 +743,7 @@ pub const Session = struct {
     /// session must have joined (`tla/Wiring.tla` ParentOutlivesChildren).
     pub fn close(self: *Session) void {
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
+        if (self.root) traceWiring("Close", self.id(), "", self.store.pid);
         if (self.turn_open) debug_trace.logf("session", "event=sessions_v2_turn_closed_open session={s} streamed={d}", .{ self.id(), self.streamed.items.len });
         // Before `release`: the id lives in the handle.
         if (self.files_dir != null and !self.saved()) self.removeUnsavedFiles();
@@ -928,7 +973,7 @@ pub const Session = struct {
             try ids.append(a, call.id);
         }
         if (batch.items.len == 0) return;
-        _ = try self.handle.append(batch.items);
+        _ = try self.write(batch.items);
         try self.running.ensureUnusedCapacity(self.alloc, ids.items.len);
         for (ids.items) |call_id| self.running.appendAssumeCapacity(try self.alloc.dupe(u8, call_id));
     }
@@ -978,7 +1023,7 @@ pub const Session = struct {
                 if (bytes.len > max_inline_piece_bytes) break true;
             } else false;
             if (needs_blob) {
-                _ = try self.handle.append(batch.items);
+                _ = try self.write(batch.items);
                 self.startedTurn();
                 batch.clearRetainingCapacity();
             }
@@ -986,7 +1031,7 @@ pub const Session = struct {
         for (events, encoded) |event, bytes| try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
-        _ = try self.handle.append(batch.items);
+        _ = try self.write(batch.items);
         if (!self.turn_open) self.startedTurn();
     }
 
@@ -1006,7 +1051,7 @@ pub const Session = struct {
         } else true);
         if (same) return streamed.len;
         debug_trace.logf("session", "event=sessions_v2_stream_mismatch session={s} streamed={d} final={d} dropped=stale_turn", .{ self.id(), streamed.len, encoded.len });
-        _ = try self.handle.append(&.{
+        _ = try self.write(&.{
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
             .{ .turn_interrupted = .failed },
         });
@@ -1066,7 +1111,7 @@ pub const Session = struct {
             .compaction_count = summary.compaction_count,
             .keep_from_turn = keep_from,
         };
-        _ = try self.handle.append(&.{.{ .compacted = try jsonValue(arena.allocator(), data) }});
+        _ = try self.write(&.{.{ .compacted = try jsonValue(arena.allocator(), data) }});
         // fx's history is now the summary, then the retained turns.
         var kept: std.ArrayList(?u64) = .empty;
         errdefer kept.deinit(self.alloc);
@@ -1081,7 +1126,7 @@ pub const Session = struct {
     pub fn setPreferences(self: *Session, preferences: session_codec.DurableSessionPreferences) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        _ = try self.handle.append(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
+        _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
     }
 
     // -- children (D22) ------------------------------------------------------
@@ -1126,13 +1171,13 @@ pub const Session = struct {
             .spawned => |spawned| .{ .child_spawned = .{ .child = spawned.child, .work_id = spawned.work_id, .data = spawned.data } },
             .finished => |finished| .{ .child_finished = .{ .child = finished.child, .work_id = finished.work_id, .outcome = finished.outcome, .data = finished.data } },
         };
-        _ = try self.handle.append(events);
+        _ = try self.write(events);
     }
 
     pub fn setPermissions(self: *Session, state: session_permission_state.State) !void {
         const value = try session_codec.encodePermissionState(self.alloc, state);
         defer self.alloc.free(value);
-        _ = try self.handle.append(&.{.{ .set = .{ .key = .permissions, .value = value } }});
+        _ = try self.write(&.{.{ .set = .{ .key = .permissions, .value = value } }});
     }
 
     /// A title the user chose. It differs from the derived one, so a
@@ -1142,7 +1187,7 @@ pub const Session = struct {
         defer self.mutex.unlock(io_mod.getIo());
         const value = try jsonString(self.alloc, title);
         defer self.alloc.free(value);
-        _ = try self.handle.append(&.{.{ .set = .{ .key = .title, .value = value } }});
+        _ = try self.write(&.{.{ .set = .{ .key = .title, .value = value } }});
         self.titled = true;
     }
 
@@ -1165,7 +1210,7 @@ pub const Session = struct {
                 return false;
             }
         }
-        _ = try self.handle.append(&.{.{ .set = .{ .key = .title, .value = try jsonString(a, title) } }});
+        _ = try self.write(&.{.{ .set = .{ .key = .title, .value = try jsonString(a, title) } }});
         self.titled = true;
         return true;
     }
@@ -1188,7 +1233,7 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const value = try encodeUsage(arena.allocator(), snapshot, at_ms);
-        _ = try self.handle.append(&.{.{ .set = .{ .key = .usage, .value = value } }});
+        _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
         self.usage_at_ms = at_ms;
         if (pending) return;
         // Before the first turn a `set` waits in memory, not on disk.
