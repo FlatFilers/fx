@@ -4,9 +4,9 @@ const credentials = @import("../core/auth/credentials.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
-const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const model_catalog_http = @import("model_catalog_http.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
 const version_lookup = @import("provider_versions.zig");
 
@@ -98,19 +98,25 @@ fn fetchCatalogForProvider(
     };
     defer alloc.free(request_url);
 
-    var operation = FetchOperation{
+    var extra_headers: [3]std.http.Header = undefined;
+    var extra_len: usize = 0;
+    if (account_id) |id| {
+        extra_headers[extra_len] = .{ .name = "chatgpt-account-id", .value = id };
+        extra_len += 1;
+    }
+    extra_headers[extra_len] = .{ .name = "originator", .value = "fx" };
+    extra_len += 1;
+    extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
+    extra_len += 1;
+    var operation = model_catalog_http.Operation{
         .alloc = alloc,
         .url = request_url,
         .credential = request_auth.credential,
-        .account_id = account_id,
+        .extra_headers = extra_headers[0..extra_len],
+        .max_body_bytes = max_catalog_bytes,
+        .too_large_error = error.CodexModelCatalogTooLarge,
     };
-    var response = gateway_client.runBoundedHttpOperation(
-        FetchResponse,
-        alloc,
-        cancel_flag,
-        deadline,
-        &operation,
-    ) catch |err| {
+    var response = model_catalog_http.fetch(&operation, cancel_flag, deadline) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{
             .category = if (err == error.Cancelled) .cancellation else .transport,
@@ -157,68 +163,6 @@ fn catalogRequestAuth(access: credentials.CatalogAccess) ?CatalogRequestAuth {
             null,
     };
 }
-
-const FetchResponse = struct {
-    status: std.http.Status,
-    body: []u8,
-
-    pub fn deinit(self: *FetchResponse, alloc: std.mem.Allocator) void {
-        secret.zeroAndFree(alloc, self.body);
-        self.* = undefined;
-    }
-};
-
-const FetchOperation = struct {
-    alloc: std.mem.Allocator,
-    url: []const u8,
-    credential: ?[]const u8,
-    account_id: ?[]const u8,
-
-    pub fn run(self: *@This()) !FetchResponse {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
-        defer client.deinit();
-        var auth_header: ?[]u8 = null;
-        defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
-        var headers: std.http.Client.Request.Headers = .{
-            .user_agent = .{ .override = gateway_client.user_agent },
-            .accept_encoding = .omit,
-        };
-        if (self.credential) |credential| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
-            headers.authorization = .{ .override = auth_header.? };
-        }
-        const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
-        defer secret.zeroAndFree(self.alloc, body_buffer);
-        var response_writer = std.Io.Writer.fixed(body_buffer);
-        var extra_headers: [3]std.http.Header = undefined;
-        var extra_len: usize = 0;
-        if (self.account_id) |account_id| {
-            extra_headers[extra_len] = .{ .name = "chatgpt-account-id", .value = account_id };
-            extra_len += 1;
-        }
-        extra_headers[extra_len] = .{ .name = "originator", .value = "fx" };
-        extra_len += 1;
-        extra_headers[extra_len] = .{ .name = "accept", .value = "application/json" };
-        extra_len += 1;
-        const result = client.fetch(.{
-            .location = .{ .url = self.url },
-            .method = .GET,
-            .headers = headers,
-            .extra_headers = extra_headers[0..extra_len],
-            .response_writer = &response_writer,
-            .redirect_behavior = .unhandled,
-        }) catch |err| switch (err) {
-            error.WriteFailed => return error.CodexModelCatalogTooLarge,
-            else => return err,
-        };
-        const body = response_writer.buffered();
-        if (body.len > max_catalog_bytes) return error.CodexModelCatalogTooLarge;
-        return .{
-            .status = result.status,
-            .body = try self.alloc.dupe(u8, body),
-        };
-    }
-};
 
 fn modelsUrl(alloc: std.mem.Allocator, version: ?versions.Version) ![]u8 {
     const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;

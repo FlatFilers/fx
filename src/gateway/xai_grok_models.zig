@@ -4,9 +4,9 @@ const grok_session = @import("../core/auth/grok_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
-const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const model_catalog_http = @import("model_catalog_http.zig");
 const versions = @import("../core/gateway/provider_versions.zig");
 const version_lookup = @import("provider_versions.zig");
 
@@ -163,77 +163,33 @@ fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
     return .{ .category = .transport, .retryable = true };
 }
 
-const FetchResponse = struct {
-    status: std.http.Status,
-    body: []u8,
+const FetchResponse = model_catalog_http.Response;
 
-    pub fn deinit(self: *FetchResponse, alloc: std.mem.Allocator) void {
-        secret.zeroAndFree(alloc, self.body);
-        self.* = undefined;
-    }
-};
-
-const FetchOperation = struct {
-    alloc: std.mem.Allocator,
-    url: []const u8,
-    credential: ?[]const u8,
+fn catalogHeaders(
     account_id: ?[]const u8,
     include_subscription_headers: bool,
-    client_version: ?versions.Version = null,
-
-    pub fn run(self: *@This()) !FetchResponse {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
-        defer client.deinit();
-        var auth_header: ?[]u8 = null;
-        defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
-        var headers: std.http.Client.Request.Headers = .{
-            .user_agent = .{ .override = gateway_client.user_agent },
-            .accept_encoding = .omit,
-        };
-        if (self.credential) |credential| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
-            headers.authorization = .{ .override = auth_header.? };
-        }
-        const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
-        defer secret.zeroAndFree(self.alloc, body_buffer);
-        var response_writer = std.Io.Writer.fixed(body_buffer);
-        var extra_headers_buffer: [5]std.http.Header = undefined;
-        var extra_headers_len: usize = 0;
-        extra_headers_buffer[extra_headers_len] = .{ .name = "accept", .value = "application/json" };
-        extra_headers_len += 1;
-        if (self.include_subscription_headers) {
-            extra_headers_buffer[extra_headers_len] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
-            extra_headers_len += 1;
-        }
-        if (self.account_id) |account_id| {
-            extra_headers_buffer[extra_headers_len] = .{ .name = "x-userid", .value = account_id };
-            extra_headers_len += 1;
-        }
-        if (self.client_version) |*version| {
-            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-version", .value = version.slice() };
-            extra_headers_len += 1;
-            extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
-            extra_headers_len += 1;
-        }
-        const result = client.fetch(.{
-            .location = .{ .url = self.url },
-            .method = .GET,
-            .headers = headers,
-            .extra_headers = extra_headers_buffer[0..extra_headers_len],
-            .response_writer = &response_writer,
-            .redirect_behavior = .unhandled,
-        }) catch |err| switch (err) {
-            error.WriteFailed => return error.GrokModelCatalogTooLarge,
-            else => return err,
-        };
-        const body = response_writer.buffered();
-        try validateCatalogBodySize(body.len);
-        return .{
-            .status = result.status,
-            .body = try self.alloc.dupe(u8, body),
-        };
+    client_version: ?*const versions.Version,
+    buffer: *[5]std.http.Header,
+) []const std.http.Header {
+    var len: usize = 0;
+    buffer[len] = .{ .name = "accept", .value = "application/json" };
+    len += 1;
+    if (include_subscription_headers) {
+        buffer[len] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
+        len += 1;
     }
-};
+    if (account_id) |id| {
+        buffer[len] = .{ .name = "x-userid", .value = id };
+        len += 1;
+    }
+    if (client_version) |version| {
+        buffer[len] = .{ .name = "x-grok-client-version", .value = version.slice() };
+        len += 1;
+        buffer[len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
+        len += 1;
+    }
+    return buffer[0..len];
+}
 
 fn fetchCatalogResponse(
     alloc: std.mem.Allocator,
@@ -245,21 +201,19 @@ fn fetchCatalogResponse(
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !FetchResponse {
-    var operation = FetchOperation{
+    var header_buffer: [5]std.http.Header = undefined;
+    var version_copy = client_version;
+    const version_ptr = if (version_copy) |*version| version else null;
+    const headers = catalogHeaders(account_id, include_subscription_headers, version_ptr, &header_buffer);
+    var operation = model_catalog_http.Operation{
         .alloc = alloc,
         .url = url,
         .credential = credential,
-        .account_id = account_id,
-        .include_subscription_headers = include_subscription_headers,
-        .client_version = client_version,
+        .extra_headers = headers,
+        .max_body_bytes = max_catalog_bytes,
+        .too_large_error = error.GrokModelCatalogTooLarge,
     };
-    return gateway_client.runBoundedHttpOperation(
-        FetchResponse,
-        alloc,
-        cancel_flag,
-        deadline,
-        &operation,
-    );
+    return model_catalog_http.fetch(&operation, cancel_flag, deadline);
 }
 
 fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
@@ -425,10 +379,6 @@ fn validateModelId(id: []const u8) !void {
     for (id) |byte| {
         if (byte <= 0x20 or byte == 0x7f) return error.InvalidGrokModelCatalog;
     }
-}
-
-fn validateCatalogBodySize(size: usize) !void {
-    if (size > max_catalog_bytes) return error.GrokModelCatalogTooLarge;
 }
 
 fn validateCatalogModelCount(count: usize) !void {
@@ -783,12 +733,14 @@ fn fetchCatalogFixture(body: []const u8) !FetchResponse {
         .{fixture.port()},
     );
     defer std.testing.allocator.free(url);
-    var operation = FetchOperation{
+    var header_buffer: [5]std.http.Header = undefined;
+    var operation = model_catalog_http.Operation{
         .alloc = std.testing.allocator,
         .url = url,
         .credential = "grok-test-token",
-        .account_id = "acct_test",
-        .include_subscription_headers = true,
+        .extra_headers = catalogHeaders("acct_test", true, null, &header_buffer),
+        .max_body_bytes = max_catalog_bytes,
+        .too_large_error = error.GrokModelCatalogTooLarge,
     };
     const result = operation.run();
     fixture.deinit();
