@@ -14,6 +14,7 @@ const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -289,6 +290,13 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 return .{ .exit = 1 };
             },
             else => {
+                // v2 names a storage fault (D29); v1 reports it as it always has.
+                if (session_adapter.enabled(launch.modifiers.sessions_v2)) {
+                    if (v2StorageFaultMessage(err)) |message| {
+                        writeStderr(deps, message);
+                        return .{ .exit = 1 };
+                    }
+                }
                 reportUnexpectedInteractiveError(deps, err);
                 return err;
             },
@@ -537,6 +545,18 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8, sessions_v2: bool) 
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
     return std.fmt.bufPrint(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
+}
+
+/// A v2 session that cannot be written at startup, in one sentence; null
+/// for any other error.
+fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.AccessDenied => "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n",
+        error.ReadOnlyFileSystem => "fx: this session cannot be opened for writing: the disk is read-only.\n",
+        error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n",
+        error.FileTooBig => "fx: this session cannot be saved: a file-size limit was reached.\n",
+        else => null,
+    };
 }
 
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
@@ -1405,6 +1425,38 @@ test "app entry maps unavailable session state to one expected startup failure" 
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{"init:none"});
     }
+}
+
+test "app entry names a v2 storage fault at startup, and v1 keeps the bare error" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        init_error: anyerror,
+        message: []const u8,
+    }{
+        .{ .init_error = error.AccessDenied, .message = "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n" },
+        .{ .init_error = error.ReadOnlyFileSystem, .message = "fx: this session cannot be opened for writing: the disk is read-only.\n" },
+        .{ .init_error = error.NoSpaceLeft, .message = "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n" },
+        .{ .init_error = error.FileTooBig, .message = "fx: this session cannot be saved: a file-size limit was reached.\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{ .modifiers = .{ .sessions_v2 = true } } });
+        defer capture.deinit();
+        capture.init_error = case.init_error;
+        capture.fail_unexpected_format = true;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+    }
+
+    // Without the flag, v1 reports the bare error name as before.
+    if (session_adapter.enabled(false)) return error.SkipZigTest;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.init_error = error.AccessDenied;
+    try std.testing.expectError(error.AccessDenied, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: AccessDenied\n", capture.stderr.written());
 }
 
 test "app entry returns failure when terminal closure cannot save the session" {
