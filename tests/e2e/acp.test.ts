@@ -3266,6 +3266,29 @@ describe("acp: model-independent", () => {
         expect(secondSystem).toContain(`<client_instructions>\nYou are the assistant inside Mini, a macOS browser. ${marker}`);
         // This client did not opt out of the terminal prompt.
         expect(secondSystem).toContain("which fx renders in the terminal");
+
+        expect(client.stderr).toBe("");
+        await client.close();
+
+        // A stored prompt that cannot be read fails the load instead of
+        // running the session without the client's instructions. A fresh
+        // process reads it from disk; an already active session keeps its own.
+        writeFileSync(
+          join(root.home, ".fx", "sessions", sessionId, "client", "system-prompt.txt"),
+          "corrupt\u0000prompt",
+        );
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        const unreadable = await client.request("session/load", {
+          sessionId,
+          cwd: root.workspace,
+          mcpServers: [],
+        }, 12) as any;
+        expect(unreadable.error.code).toBe(-32603);
+        expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

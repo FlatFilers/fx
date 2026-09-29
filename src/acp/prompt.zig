@@ -238,7 +238,10 @@ const AcpContext = struct {
     /// before its server reconnects. A failure costs only replay detail.
     fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
-        const capability = if (session.writable) |*writable| writable.childCapability() catch null else null;
+        const capability = if (session.writable) |*writable| writable.childCapability() catch |err| blk: {
+            debug_trace.logf("acp", "tool identity kept in memory only tool={s} err={s}", .{ name, @errorName(err) });
+            break :blk null;
+        } else null;
         session.tool_identities.remember(self.state.alloc, capability, name, identity) catch |err| {
             debug_trace.logf("acp", "tool identity not recorded tool={s} err={s}", .{ name, @errorName(err) });
         };

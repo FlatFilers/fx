@@ -57,6 +57,8 @@ pub const Record = struct {
         const target = capability orelse return;
         const bytes = try self.serialize(alloc);
         defer alloc.free(bytes);
+        // Keep the stored record within what `load` accepts.
+        if (bytes.len > max_bytes) return error.ToolIdentityRecordFull;
         var entry = try target.atomicReplace(alloc, .client_context, file_name, bytes);
         entry.deinit(alloc);
     }
@@ -121,8 +123,7 @@ fn parse(alloc: Allocator, bytes: []const u8) !Record {
         const tool = stringField(object, "tool") orelse return error.InvalidToolIdentityRecord;
         const title: ?[]u8 = switch (object.get("title") orelse .null) {
             .null => null,
-            // Titles follow the live rule: no control characters.
-            .string => |text| if (hasControl(text)) null else @constCast(text),
+            .string => |text| if (mcp_runtime.usableDisplayTitle(text)) |usable| @constCast(usable) else null,
             else => return error.InvalidToolIdentityRecord,
         };
         try record.put(alloc, field.key_ptr.*, .{ .server = server, .tool = tool, .title = title });
@@ -134,11 +135,6 @@ fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]u8 {
     const value = object.get(key) orelse return null;
     if (value != .string or value.string.len == 0) return null;
     return @constCast(value.string);
-}
-
-fn hasControl(text: []const u8) bool {
-    for (text) |byte| if (std.ascii.isControl(byte)) return true;
-    return false;
 }
 
 fn identityEql(a: Identity, b: Identity) bool {

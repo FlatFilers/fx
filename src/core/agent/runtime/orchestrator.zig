@@ -2632,7 +2632,9 @@ fn prepareAvailabilityTerminal(
 
 /// Advertises live MCP tools the model called without loading them first, so
 /// those calls reach normal validation and MCP permission instead of failing
-/// as unselected. Names that do not resolve keep the unsupported-tool path.
+/// as unselected. Names that do not resolve, including lookups that fail or
+/// are cancelled, keep the unsupported-tool path, where the turn's normal
+/// cancellation handling still applies.
 fn advertiseUnselectedMcpCalls(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -2645,7 +2647,14 @@ fn advertiseUnselectedMcpCalls(
     for (calls) |call| {
         if (deps.tool_registry.lookup(call.name) != null) continue;
         if (containsToolName(advertised_names.*, call.name)) continue;
-        const definition = (try resolve(deps.ctx, arena, call.name)) orelse continue;
+        const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("mcp", "unselected MCP tool lookup failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                continue;
+            },
+        };
+        const definition = resolved orelse continue;
         if (!std.mem.eql(u8, definition.name, call.name) or definition.mcp_binding == null) continue;
         try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, definition);
         const tool = for (selected.items) |item| {

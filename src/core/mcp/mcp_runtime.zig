@@ -238,7 +238,9 @@ fn toolDisplayTitle(alloc: Allocator, tool: McpTool) Allocator.Error!?[]u8 {
     return try alloc.dupe(u8, value);
 }
 
-fn usableDisplayTitle(title: []const u8) ?[]const u8 {
+/// Returns the displayable part of a server-provided tool title, or null when
+/// it has none.
+pub fn usableDisplayTitle(title: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, title, " \t\r\n");
     if (trimmed.len == 0 or !std.unicode.utf8ValidateSlice(trimmed)) return null;
     for (trimmed) |byte| if (byte < 0x20 or byte == 0x7f) return null;

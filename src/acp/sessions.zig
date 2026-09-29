@@ -742,6 +742,16 @@ fn handleRestoreSession(
     const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, session_id);
     defer alloc.free(session_dir);
 
+    // Read before the active session is released, so an unreadable prompt
+    // fails this restore and leaves the current session untouched.
+    var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, &writable) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ClientSystemPromptUnreadable => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Session client system prompt could not be restored",
+        }),
+    };
+    defer if (client_system_prompt) |text| state.alloc.free(text);
     writable.releaseHydrationHistory(alloc);
     session_rt.configureWebFetchArtifacts(alloc, session_dir);
     server.cancelAndReapActivePrompt(state);
@@ -755,12 +765,14 @@ fn handleRestoreSession(
         .effort = writable.state.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
+        .client_system_prompt = client_system_prompt,
         .workspace = if (workspace) |*binding| binding else null,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Failed to save active session",
         });
+    client_system_prompt = null;
     writable_owned = false;
     store_owned = false;
     sid_owned = false;
@@ -1040,8 +1052,8 @@ const SessionActivation = struct {
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
     mcp: ?*mcp_runtime.McpRuntime,
-    /// Owned prompt for a new session. Restored sessions load their persisted
-    /// prompt instead.
+    /// Owned client prompt. The session takes it over on success; the caller
+    /// frees it when activation fails.
     client_system_prompt: ?[]u8 = null,
     /// Workspace named by the request's `cwd`, installed once the previous
     /// session is released. Left empty after a successful activation.
@@ -1057,23 +1069,31 @@ fn persistClientSystemPrompt(
     try client_instructions.persist(alloc, capability, text);
 }
 
-/// Returns the owned persisted client prompt of a restored session. A prompt
-/// that cannot be read is reported in the trace and left out.
+/// Returns the owned persisted client prompt of a restored session, or an
+/// empty slice when it has none. A session without a child store cannot have
+/// stored one. A stored prompt that cannot be read fails the restore instead
+/// of running the session without the client's instructions.
 fn restoredClientSystemPrompt(
     alloc: Allocator,
-    writable: ?*session_store.LoadedWritableSession,
-) Allocator.Error![]u8 {
-    const session = writable orelse return &.{};
-    const capability = session.childCapability() catch return &.{};
+    writable: *session_store.LoadedWritableSession,
+) error{ OutOfMemory, ClientSystemPromptUnreadable }![]u8 {
+    const capability = writable.childCapability() catch |err| {
+        debug_trace.logf(
+            "acp",
+            "no client system prompt to restore session={s} err={s}",
+            .{ writable.active_id, @errorName(err) },
+        );
+        return &.{};
+    };
     const text = client_instructions.load(alloc, capability) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_trace.logf(
                 "acp",
-                "dropped unreadable client system prompt session={s} err={s}",
-                .{ session.active_id, @errorName(err) },
+                "client system prompt unreadable session={s} err={s}",
+                .{ writable.active_id, @errorName(err) },
             );
-            return &.{};
+            return error.ClientSystemPromptUnreadable;
         },
     };
     return text orelse &.{};
@@ -1086,7 +1106,14 @@ fn restoredToolIdentities(
     writable: ?*session_store.LoadedWritableSession,
 ) Allocator.Error!tool_call_identities.Record {
     const session = writable orelse return .{};
-    const capability = session.childCapability() catch return .{};
+    const capability = session.childCapability() catch |err| {
+        debug_trace.logf(
+            "acp",
+            "no tool identity record to restore session={s} err={s}",
+            .{ session.active_id, @errorName(err) },
+        );
+        return .{};
+    };
     return tool_call_identities.load(alloc, capability) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -1107,11 +1134,7 @@ fn activateSession(
 ) !void {
     try server.releaseActiveSession(state);
     var restored_writable = activation.writable;
-    const client_system_prompt = activation.client_system_prompt orelse
-        try restoredClientSystemPrompt(state.alloc, &restored_writable);
-    errdefer if (activation.client_system_prompt == null and client_system_prompt.len > 0) {
-        state.alloc.free(client_system_prompt);
-    };
+    const client_system_prompt: []u8 = activation.client_system_prompt orelse &.{};
     if (activation.workspace) |binding| try workspace_binding.commit(state, binding);
     if (activation.credential) |credential| server.adoptServerCredential(state, credential);
     // Nothing after this load can fail before the session takes ownership.
@@ -1589,11 +1612,6 @@ fn planToolCallFrame(
     };
 }
 
-/// Maps a persisted execution memory onto the same session/update frame
-/// sequence the live prompt path emits: interleaved assistant text plus one
-/// tool_call announcement (and final tool_call_update) per tool call.
-/// The returned frames borrow from `execution` and `arena`; the caller owns
-/// the slice and must free it with the arena.
 fn hostChannel(state: *server.ServerState) ?message_carrier.Carrier {
     if (comptime host_target.is_wasm) return null;
     return mcp_carrier.carrier(state);
@@ -1605,6 +1623,12 @@ fn activeSessionMcp(state: *server.ServerState) ?*mcp_runtime.McpRuntime {
     return session.mcp;
 }
 
+/// Maps a persisted execution memory onto the same session/update frame
+/// sequence the live prompt path emits: interleaved assistant text plus one
+/// tool_call announcement (and final tool_call_update) per tool call, with
+/// absorbed steering replayed where the turn took it in.
+/// The returned frames borrow from `execution` and `arena`; the caller owns
+/// the slice and must free it with the arena.
 fn planExecutionReplay(
     arena: Allocator,
     registry: tool_dispatch.Registry,
