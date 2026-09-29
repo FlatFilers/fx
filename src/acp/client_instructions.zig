@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const acp_types = @import("types.zig");
+const io_mod = @import("../core/shared/io.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 
 const Allocator = std.mem.Allocator;
@@ -117,7 +118,9 @@ pub fn load(
         else => return err,
     };
     defer file.deinit();
-    const text = try file.readToEnd(alloc, max_bytes);
+    // The reader rejects a file that reaches its limit, so allow one byte
+    // more to accept a prompt of exactly `max_bytes`.
+    const text = try file.readToEnd(alloc, max_bytes + 1);
     errdefer alloc.free(text);
     if (text.len == 0 or !validText(text)) return error.InvalidSystemPromptText;
     return text;
@@ -191,4 +194,26 @@ test "client system prompt composes after host instructions" {
     const only_client = try compose(alloc, "", "client");
     defer alloc.free(only_client);
     try std.testing.expectEqualStrings("<client_instructions>\nclient\n</client_instructions>", only_client);
+}
+
+test "client system prompt of exactly the size limit survives a restore" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Session directories must be private for the child store to open them.
+    try tmp.dir.createDir(std.testing.io, "session", std.Io.File.Permissions.fromMode(0o700));
+    var session_dir = try tmp.dir.openDir(std.testing.io, "session", .{ .iterate = true, .follow_symlinks = false });
+    defer session_dir.close(std.testing.io);
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(alloc, session_dir, session_path, .writable, .{});
+    defer capability.deinit();
+
+    const text = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(text);
+    @memset(text, 'a');
+    try persist(alloc, &capability, text);
+    const restored = (try load(alloc, &capability)).?;
+    defer alloc.free(restored);
+    try std.testing.expectEqual(max_bytes, restored.len);
 }

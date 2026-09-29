@@ -243,7 +243,7 @@ const AcpContext = struct {
             break :blk null;
         } else null;
         session.tool_identities.remember(self.state.alloc, capability, name, identity) catch |err| {
-            debug_trace.logf("acp", "tool identity not recorded tool={s} err={s}", .{ name, @errorName(err) });
+            debug_trace.logf("acp", "tool identity not recorded for replay tool={s} err={s}", .{ name, @errorName(err) });
         };
     }
 

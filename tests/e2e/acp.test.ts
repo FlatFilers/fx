@@ -3183,6 +3183,7 @@ describe("acp: model-independent", () => {
       const gateway = startFakeGateway([
         finalText("I am the browser assistant."),
         finalText("Still the browser assistant."),
+        finalText("The other session still works."),
       ]);
       const systemText = (body: string) => acpGatewayRequest(body).prompt
         .filter((message) => message.role === "system")
@@ -3282,6 +3283,9 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         await client.request("initialize", { protocolVersion: 1 }, 10);
+        const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 11) as any;
+        expect(other.error).toBeUndefined();
+        await client.readLine();
         const unreadable = await client.request("session/load", {
           sessionId,
           cwd: root.workspace,
@@ -3289,6 +3293,10 @@ describe("acp: model-independent", () => {
         }, 12) as any;
         expect(unreadable.error.code).toBe(-32603);
         expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
+        // The session that was active before the failed load still runs.
+        const third = await runPrompt(client, "Still there?", TIMEOUT);
+        expect(third.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(3);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

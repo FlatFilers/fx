@@ -53,12 +53,13 @@ pub const Record = struct {
         if (self.entries.get(name)) |current| {
             if (identityEql(current, identity)) return;
         } else if (self.entries.count() >= max_entries) return;
+        const bytes = try self.serialize(alloc, name, identity);
+        defer alloc.free(bytes);
+        // The record stays within what `load` accepts, so memory and the
+        // stored copy never disagree.
+        if (bytes.len > max_bytes) return error.ToolIdentityRecordFull;
         try self.put(alloc, name, identity);
         const target = capability orelse return;
-        const bytes = try self.serialize(alloc);
-        defer alloc.free(bytes);
-        // Keep the stored record within what `load` accepts.
-        if (bytes.len > max_bytes) return error.ToolIdentityRecordFull;
         var entry = try target.atomicReplace(alloc, .client_context, file_name, bytes);
         entry.deinit(alloc);
     }
@@ -76,23 +77,35 @@ pub const Record = struct {
         try self.entries.put(alloc, key, owned);
     }
 
-    fn serialize(self: *const Record, alloc: Allocator) ![]u8 {
+    /// Serializes the record as it would be with `name` set to `identity`.
+    fn serialize(self: *const Record, alloc: Allocator, name: []const u8, identity: Identity) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
         const w = &out.writer;
         w.writeByte('{') catch return error.OutOfMemory;
-        for (self.entries.keys(), self.entries.values(), 0..) |name, identity, index| {
+        var replaced = false;
+        for (self.entries.keys(), self.entries.values(), 0..) |key, value, index| {
             if (index > 0) w.writeByte(',') catch return error.OutOfMemory;
-            std.json.Stringify.value(name, .{}, w) catch return error.OutOfMemory;
-            w.writeByte(':') catch return error.OutOfMemory;
-            std.json.Stringify.value(.{
-                .server = identity.server,
-                .tool = identity.tool,
-                .title = identity.title,
-            }, .{}, w) catch return error.OutOfMemory;
+            const current = std.mem.eql(u8, key, name);
+            replaced = replaced or current;
+            try writeEntry(w, key, if (current) identity else value);
+        }
+        if (!replaced) {
+            if (self.entries.count() > 0) w.writeByte(',') catch return error.OutOfMemory;
+            try writeEntry(w, name, identity);
         }
         w.writeByte('}') catch return error.OutOfMemory;
         return out.toOwnedSlice() catch error.OutOfMemory;
+    }
+
+    fn writeEntry(w: *std.Io.Writer, name: []const u8, identity: Identity) error{OutOfMemory}!void {
+        std.json.Stringify.value(name, .{}, w) catch return error.OutOfMemory;
+        w.writeByte(':') catch return error.OutOfMemory;
+        std.json.Stringify.value(.{
+            .server = identity.server,
+            .tool = identity.tool,
+            .title = identity.title,
+        }, .{}, w) catch return error.OutOfMemory;
     }
 };
 
@@ -103,7 +116,9 @@ pub fn load(alloc: Allocator, capability: *session_child_store.SessionChildCapab
         else => return err,
     };
     defer file.deinit();
-    const bytes = try file.readToEnd(alloc, max_bytes);
+    // The reader rejects a file that reaches its limit, so allow one byte
+    // more to accept a record of exactly `max_bytes`.
+    const bytes = try file.readToEnd(alloc, max_bytes + 1);
     defer alloc.free(bytes);
     return parse(alloc, bytes);
 }
@@ -175,7 +190,7 @@ test "tool identity record round-trips and skips unchanged names" {
     });
     try std.testing.expectEqual(@as(usize, 2), record.entries.count());
 
-    const bytes = try record.serialize(alloc);
+    const bytes = try record.serialize(alloc, "mcp_mini_browser_read", record.entries.get("mcp_mini_browser_read").?);
     defer alloc.free(bytes);
     var restored = try parse(alloc, bytes);
     defer restored.deinit(alloc);
@@ -202,4 +217,31 @@ test "tool identity record rejects malformed entries and control-character title
     defer arena_state.deinit();
     const identity = (try record.lookup(arena_state.allocator(), "mcp_a_b")).?;
     try std.testing.expectEqual(@as(?[]u8, null), identity.title);
+}
+
+test "tool identity record refuses names that would outgrow the stored record" {
+    const alloc = std.testing.allocator;
+    var record: Record = .{};
+    defer record.deinit(alloc);
+    const server_name = try alloc.alloc(u8, 4096);
+    defer alloc.free(server_name);
+    @memset(server_name, 's');
+
+    var name_buf: [32]u8 = undefined;
+    var accepted: usize = 0;
+    const full = for (0..max_entries) |index| {
+        const name = try std.fmt.bufPrint(&name_buf, "mcp_s_tool_{d}", .{index});
+        record.remember(alloc, null, name, .{ .server = server_name, .tool = @constCast("tool") }) catch |err| {
+            try std.testing.expectEqual(error.ToolIdentityRecordFull, err);
+            break name;
+        };
+        accepted += 1;
+    } else return error.TestExpectedFullRecord;
+
+    // The refused name is not kept in memory either.
+    try std.testing.expectEqual(accepted, record.entries.count());
+    try std.testing.expect(!record.entries.contains(full));
+    const bytes = try record.serialize(alloc, "mcp_s_tool_0", record.entries.get("mcp_s_tool_0").?);
+    defer alloc.free(bytes);
+    try std.testing.expect(bytes.len <= max_bytes);
 }

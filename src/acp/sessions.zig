@@ -743,7 +743,8 @@ fn handleRestoreSession(
     defer alloc.free(session_dir);
 
     // Read before the active session is released, so an unreadable prompt
-    // fails this restore and leaves the current session untouched.
+    // fails this restore without replacing a different active session. A
+    // same-session `cwd` rebind has already released it above.
     var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, &writable) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ClientSystemPromptUnreadable => return state.writer.writeError(alloc, msg.id, .{
