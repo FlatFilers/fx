@@ -12,6 +12,9 @@ pub const max_prompt_bytes: usize = 4096;
 
 pub const usage = "/every <interval> <prompt> | /every off | /every";
 
+/// File inside the session directory that holds the saved schedule.
+pub const sidecar_name = "every.txt";
+
 pub const Command = union(enum) {
     show,
     off,
@@ -123,6 +126,12 @@ pub const State = struct {
     }
 };
 
+/// The saved form of an active schedule: the same `<interval> <prompt>` text
+/// `/every` accepts, so restoring is `parse`. Caller owns the result.
+pub fn serialize(alloc: Allocator, state: *const State) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(alloc, "{s} {s}\n", .{ state.interval_label, state.prompt.? });
+}
+
 /// Text submitted as the user turn for a beat. Caller owns the result.
 pub fn beatPrompt(alloc: Allocator, state: *const State) Allocator.Error![]u8 {
     return std.fmt.allocPrint(alloc, "[every {s}] {s}", .{ state.interval_label, state.prompt.? });
@@ -173,6 +182,19 @@ test "tick fires when idle, skips when busy, and rearms each beat" {
     const text = try beatPrompt(alloc, &state);
     defer alloc.free(text);
     try std.testing.expectEqualStrings("[every 1m] check holding", text);
+}
+
+test "serialize round-trips through parse" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.start(alloc, parse("15m check status and manage work").set, 0);
+    const text = try serialize(alloc, &state);
+    defer alloc.free(text);
+    const restored = parse(text).set;
+    try std.testing.expectEqualStrings("15m", restored.interval_label);
+    try std.testing.expectEqualStrings("check status and manage work", restored.prompt);
+    try std.testing.expectEqual(@as(i64, 15 * std.time.ms_per_min), restored.interval_ms);
 }
 
 test "start replaces and clear stops an active heartbeat" {

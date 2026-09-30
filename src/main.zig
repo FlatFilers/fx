@@ -84,6 +84,7 @@ const app_mcp_menu_runtime = @import("core/app/app_mcp_menu_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const heartbeat = @import("core/heartbeat/heartbeat.zig");
+const session_store_for_heartbeat = @import("core/session/session_store.zig");
 const exit_events = @import("core/app/exit_events.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
 const hooks = @import("core/hooks/hooks.zig");
@@ -574,6 +575,8 @@ const App = struct {
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
     heartbeat: heartbeat.State = .{},
+    /// Session whose `/every` schedule `heartbeat` holds. Owned.
+    heartbeat_session_id: ?[]u8 = null,
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -969,6 +972,7 @@ const App = struct {
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
         self.heartbeat.deinit(self.alloc);
+        if (self.heartbeat_session_id) |id| self.alloc.free(id);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
@@ -1175,7 +1179,83 @@ const App = struct {
         try InputSubmitRuntime.submit(self, max_prompt_history);
     }
 
+    /// Path of a session's saved `/every` schedule. Caller owns the result.
+    fn heartbeatSidecarPath(self: *App, session_id: []const u8) !?[]u8 {
+        const store = self.session_persistence.store orelse return null;
+        const dir = try session_store_for_heartbeat.sessionDirPath(self.alloc, store.sessions_dir, session_id);
+        defer self.alloc.free(dir);
+        return try std.fs.path.join(self.alloc, &.{ dir, heartbeat.sidecar_name });
+    }
+
+    /// Saves the active `/every` schedule next to the current session, or
+    /// removes it when stopped, so resuming the session restores it.
+    pub fn persistHeartbeat(self: *App) void {
+        const session_id = SessionAppRuntime.activeSessionId(self) orelse return;
+        self.adoptHeartbeatSession(session_id);
+        const path = (self.heartbeatSidecarPath(session_id) catch |err| {
+            debug_trace.logf("every", "persist_path_failed err={s}", .{@errorName(err)});
+            return;
+        }) orelse return;
+        defer self.alloc.free(path);
+        if (!self.heartbeat.active()) {
+            std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => debug_trace.logf("every", "persist_delete_failed err={s}", .{@errorName(err)}),
+            };
+            return;
+        }
+        const text = heartbeat.serialize(self.alloc, &self.heartbeat) catch return;
+        defer self.alloc.free(text);
+        io_mod.writeFileAtomic(self.alloc, path, text) catch |err| {
+            debug_trace.logf("every", "persist_write_failed err={s}", .{@errorName(err)});
+        };
+    }
+
+    fn adoptHeartbeatSession(self: *App, session_id: []const u8) void {
+        if (self.heartbeat_session_id) |current| {
+            if (std.mem.eql(u8, current, session_id)) return;
+            self.alloc.free(current);
+        }
+        self.heartbeat_session_id = self.alloc.dupe(u8, session_id) catch null;
+    }
+
+    /// Follows session transitions (startup resume, /resume, /new): the
+    /// heartbeat belongs to one session, so switching drops it and loads the
+    /// schedule saved with the session being entered.
+    fn syncHeartbeatSession(self: *App) !void {
+        const current = SessionAppRuntime.activeSessionId(self);
+        const tracked = self.heartbeat_session_id;
+        if (current == null and tracked == null) return;
+        if (current != null and tracked != null and std.mem.eql(u8, current.?, tracked.?)) return;
+        if (tracked == null and self.heartbeat.active()) {
+            // Started before the session was first saved; it belongs here.
+            self.persistHeartbeat();
+            return;
+        }
+        if (tracked) |id| self.alloc.free(id);
+        self.heartbeat_session_id = null;
+        self.heartbeat.clear(self.alloc);
+        const session_id = current orelse return;
+        self.heartbeat_session_id = try self.alloc.dupe(u8, session_id);
+        const path = (try self.heartbeatSidecarPath(session_id)) orelse return;
+        defer self.alloc.free(path);
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return;
+        defer file.close(io_mod.getIo());
+        const text = io_mod.readFileToEnd(self.alloc, &file, heartbeat.max_prompt_bytes + 64) catch return;
+        defer self.alloc.free(text);
+        switch (heartbeat.parse(text)) {
+            .set => |set| {
+                try self.heartbeat.start(self.alloc, set, io_mod.milliTimestamp());
+                const body = try std.fmt.allocPrint(self.alloc, "restored every {s}: {s} (first beat in {s}; /every off to stop)", .{ set.interval_label, set.prompt, set.interval_label });
+                defer self.alloc.free(body);
+                try self.writeDomainNotice(.{ .topic = "every", .tone = .information, .body = body }, true);
+            },
+            else => debug_trace.logf("every", "restore_ignored_invalid_sidecar", .{}),
+        }
+    }
+
     fn collectHeartbeatFacts(self: *App) !void {
+        try self.syncHeartbeatSession();
         if (!self.heartbeat.active()) return;
         switch (self.heartbeat.tick(io_mod.milliTimestamp(), self.canSubmitAutonomousPrompt())) {
             .none => {},

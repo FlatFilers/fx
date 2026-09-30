@@ -3932,6 +3932,7 @@ fn handleEveryCommand(app: anytype, rest: []const u8, now_ms: i64) !void {
         .off => {
             const was_active = app.heartbeat.active();
             app.heartbeat.clear(app.alloc);
+            if (comptime @hasDecl(@TypeOf(app.*), "persistHeartbeat")) app.persistHeartbeat();
             try app.writeDomainNotice(.{
                 .topic = "every",
                 .tone = .information,
@@ -3940,6 +3941,7 @@ fn handleEveryCommand(app: anytype, rest: []const u8, now_ms: i64) !void {
         },
         .set => |set| {
             try app.heartbeat.start(app.alloc, set, now_ms);
+            if (comptime @hasDecl(@TypeOf(app.*), "persistHeartbeat")) app.persistHeartbeat();
             const body = try std.fmt.allocPrint(app.alloc, "every {s}: {s} (first beat in {s}; skipped while a turn runs or you are typing; /every off to stop)", .{
                 set.interval_label,
                 set.prompt,
