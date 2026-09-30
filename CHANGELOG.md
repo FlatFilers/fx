@@ -1,5 +1,11 @@
 # fx
 
+## Unreleased
+
+### New Features
+
+- `/every <interval> <prompt>` sends a prompt into the interactive session on a fixed interval (`10s` to `24h`), which is useful as an agent heartbeat. A beat is skipped when a turn is running or queued, or when you have text in the composer. `/every` shows the schedule and `/every off` stops it. The schedule lasts only for the current fx process.
+
 ## 0.0.12
 
 <!-- release:start -->

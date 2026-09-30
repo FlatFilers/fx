@@ -83,6 +83,7 @@ const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
 const app_mcp_menu_runtime = @import("core/app/app_mcp_menu_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
+const heartbeat = @import("core/heartbeat/heartbeat.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
 const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
@@ -570,6 +571,7 @@ const App = struct {
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
+    heartbeat: heartbeat.State = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -960,6 +962,7 @@ const App = struct {
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
+        self.heartbeat.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
@@ -1136,6 +1139,32 @@ const App = struct {
 
     fn fullTranscriptFocusedWorkActive(self: *App) bool {
         return self.shell.fullTranscriptFocusedWorkActive();
+    }
+
+    /// Idle means a submitted prompt cannot interrupt the user or a turn: no
+    /// turn running, queued, pending, or compacting, and nothing in the composer.
+    fn heartbeatIdle(self: *App) bool {
+        return !self.worker.isProcessing() and
+            self.worker.queuedPromptCount() == 0 and
+            self.submission.pending == null and
+            !self.submission.compaction_pending and
+            self.input_runtime.edit_state.input.items.len == 0 and
+            self.pending_images.items.len == 0;
+    }
+
+    fn collectHeartbeatFacts(self: *App) !void {
+        if (!self.heartbeat.active()) return;
+        switch (self.heartbeat.tick(io_mod.milliTimestamp(), self.heartbeatIdle())) {
+            .none => {},
+            .skipped => debug_trace.logf("every", "beat_skipped reason=busy skipped={d}", .{self.heartbeat.skipped_count}),
+            .fire => {
+                const text = try heartbeat.beatPrompt(self.alloc, &self.heartbeat);
+                defer self.alloc.free(text);
+                debug_trace.logf("every", "beat_fired count={d}", .{self.heartbeat.fired_count});
+                try self.input_runtime.edit_state.setText(self.alloc, text);
+                try InputSubmitRuntime.submit(self, max_prompt_history);
+            },
+        }
     }
 
     fn processNextCooperativePrompt(self: *App) !void {
@@ -3064,6 +3093,7 @@ const App = struct {
             try AuthAppRuntime.collectApiKeySaveFacts(self);
         }
         try self.processNextCooperativePrompt();
+        try self.collectHeartbeatFacts();
 
         const cols_before_resize = self.shell.layout.cols;
         if (self.terminal_input_runtime.native_clear_probe.active() or

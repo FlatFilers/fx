@@ -31,6 +31,7 @@ const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
+const heartbeat = @import("../heartbeat/heartbeat.zig");
 const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
@@ -389,6 +390,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
+                .handle_every = commandHandleEvery,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
@@ -2036,6 +2038,19 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleNotificationsCommand(app, rest);
+        }
+
+        fn commandHandleEvery(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !@hasField(App, "heartbeat")) {
+                try app.writeDomainNotice(.{
+                    .topic = "every",
+                    .tone = .@"error",
+                    .body = "/every is unavailable in this runtime",
+                }, true);
+                return;
+            }
+            try handleEveryCommand(app, rest, io_mod.milliTimestamp());
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {
@@ -3891,6 +3906,54 @@ fn parseSoundLevel(value: []const u8) ?SoundLevel {
     if (std.mem.eql(u8, value, "on")) return .on;
     if (std.mem.eql(u8, value, "max")) return .max;
     return null;
+}
+
+fn handleEveryCommand(app: anytype, rest: []const u8, now_ms: i64) !void {
+    switch (heartbeat.parse(rest)) {
+        .show => {
+            if (!app.heartbeat.active()) {
+                try app.writeDomainNotice(.{
+                    .topic = "every",
+                    .tone = .information,
+                    .body = "no heartbeat running. usage: " ++ heartbeat.usage,
+                }, true);
+                return;
+            }
+            const body = try std.fmt.allocPrint(app.alloc, "every {s}: {s} (next in {d}s, sent {d}, skipped {d})", .{
+                app.heartbeat.interval_label,
+                app.heartbeat.prompt.?,
+                app.heartbeat.secondsUntilNext(now_ms),
+                app.heartbeat.fired_count,
+                app.heartbeat.skipped_count,
+            });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "every", .tone = .information, .body = body }, true);
+        },
+        .off => {
+            const was_active = app.heartbeat.active();
+            app.heartbeat.clear(app.alloc);
+            try app.writeDomainNotice(.{
+                .topic = "every",
+                .tone = .information,
+                .body = if (was_active) "heartbeat stopped" else "no heartbeat running",
+            }, true);
+        },
+        .set => |set| {
+            try app.heartbeat.start(app.alloc, set, now_ms);
+            const body = try std.fmt.allocPrint(app.alloc, "every {s}: {s} (first beat in {s}; skipped while a turn runs or you are typing; /every off to stop)", .{
+                set.interval_label,
+                set.prompt,
+                set.interval_label,
+            });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "every", .tone = .information, .body = body }, true);
+        },
+        .invalid => |reason| {
+            const body = try std.fmt.allocPrint(app.alloc, "{s}. usage: {s}", .{ reason, heartbeat.usage });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "every", .tone = .@"error", .body = body }, true);
+        },
+    }
 }
 
 fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
