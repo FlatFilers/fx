@@ -5,6 +5,7 @@ const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
+const agent_steps = @import("core/config/agent_steps.zig");
 const host = @import("core/hosts/host.zig");
 const io_mod = @import("core/shared/io.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
@@ -31,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     io_mod.setEnvironMap(init.environ_map);
     try acp_server.run(std.heap.c_allocator, .{
         .default_model = builtin_gateway.default_model,
-        .default_agent_step_limit = 64,
+        .default_agent_step_limit = agent_steps.default_max_agent_steps,
         .gateway_retry_count = 0,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_models_path = builtin_gateway.models_path,

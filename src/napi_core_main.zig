@@ -4,6 +4,7 @@ const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
+const agent_steps = @import("core/config/agent_steps.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
 const io_mod = @import("core/shared/io.zig");
@@ -527,7 +528,7 @@ const Runtime = struct {
             self.alloc,
             .{
                 .default_model = builtin_gateway.default_model,
-                .default_agent_step_limit = 64,
+                .default_agent_step_limit = agent_steps.default_max_agent_steps,
                 .gateway_retry_count = 0,
                 .gateway_chat_url = self.gateway_chat_url,
                 .gateway_models_path = builtin_gateway.models_path,

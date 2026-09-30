@@ -110,9 +110,11 @@ const result = await turn.result;
 ```
 
 A turn has one event consumer. Breaking out of its iterator cancels the turn;
-`turn.cancel()` and `agent.close()` also release blocked output. Transport or
-message-decoding failures reject the result instead of returning success with
-missing text.
+`turn.cancel()` and `agent.close()` also release blocked output. Embedded agents
+have no implicit model-step cap, so hosts should cancel turns that exceed their
+own budgets. The CLI's `max_agent_steps` setting does not apply to
+`createFxAgent()`. Transport or message-decoding failures reject the result
+instead of returning success with missing text.
 
 Native transport buffers at most 8 MiB of output bytes. Unread SDK events apply
 backpressure at 1 MiB of encoded messages or 256 events. One message can exceed
