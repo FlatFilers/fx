@@ -1,8 +1,50 @@
 # fx
 
-## 0.0.11
+## 0.0.12
 
 <!-- release:start -->
+
+**Session listing is up to 560× faster, large stores resume in under a second, and GitHub-flavored Markdown now renders better throughout the terminal.**
+
+### Breaking Changes
+
+- libfx now uses `LIBFX_MODEL_UNSUPPORTED_EFFORT` and `LIBFX_MODEL_UNSUPPORTED_FAST` for unsupported model settings. Callers checking the old error codes must update.
+
+### New Features
+
+- libfx accepts `model: { id, effort, fast }` and supports `Blob` or `File` images directly.
+- Detached processes such as `tmux`, `ssh-agent`, and browser drivers now stay alive between shell calls.
+- `/mcp list` now opens the interactive Servers menu.
+
+### Improvements
+
+- In a 14,600-session benchmark, `fx sessions` dropped from 95 seconds to 0.17 seconds and `fx --resume last` from 33 seconds to 0.5 seconds.
+- `/new`, `/clear`, and `/reset` now preserve the previous conversation in terminal scrollback.
+- Oversized PNGs shrink before being sent without changing the original file. fx tells you when another image cannot be sent.
+- Structured replies now use GitHub-flavored Markdown. Wide tables wrap inside their cells, and long URLs stay clickable.
+- Steering stays intact through compaction and session recovery.
+- MCP startup errors now explain whether the server exited, timed out, or returned invalid output.
+
+### Bug Fixes
+
+- Prompt-too-long errors now trigger compaction and one retry.
+- Numpad keys now work in the composer, including digits, operators, Enter, and navigation.
+- Codex, Grok, and custom connections now start with `--model` or `FX_MODEL` even when no model is saved.
+- `/model` now identifies models from custom connection settings without suggesting a Gateway sign-in.
+- Clearing the terminal with `Cmd+K` or `Ctrl+L` no longer crashes conversations containing tool calls.
+- tmux's session switcher and copy mode now stay open during terminal resizing.
+- `fx pr --create` and `fx issue --create` now publish the final response instead of earlier progress text.
+- Messages sent after interrupting a response now wait for the previous turn to close.
+- Malformed tool arguments no longer break the next model request.
+
+### Security
+
+- Slack MCP sign-in now requests only approved fx scopes and rejects unexpected OAuth resources or scope changes.
+- Symlinked skills outside fx's usual directories can now be allowed through `skill_symlink_authorities` in profile settings. Project settings cannot grant that access.
+
+<!-- release:end -->
+
+## 0.0.11
 
 **fx now supports custom model connections and themes. Resume, file lookup and request handling are up to 100× faster, long turns use 17× less memory, and libfx adds steering, images, web search and model controls.**
 
@@ -63,8 +105,6 @@
 - **Custom connection credentials:** Custom connections read credentials only from their named environment variable, and committed project configuration cannot define model endpoints. Saved sessions refuse to resume against a changed endpoint or authentication identity.
 - **Review model:** Set `review_model` or `FX_REVIEW_MODEL` to choose the model used for auto-mode safety reviews. Review transport failures and malformed replies retry once; cautions never retry for approval, and an unresolved action stays blocked.
 - **Safe tool errors:** Tool failure details now redact secrets and escape terminal control sequences before rendering.
-
-<!-- release:end -->
 
 ## 0.0.10
 
