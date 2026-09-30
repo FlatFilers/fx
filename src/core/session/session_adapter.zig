@@ -228,6 +228,9 @@ pub const Store = struct {
                 errdefer types.freeHistoryTurn(sink.alloc, value);
                 try sink.history.append(sink.alloc, value);
             }
+
+            /// A child's history is its turns only.
+            fn summary(_: *@This(), _: []const u8) !void {}
         };
         var sink: Sink = .{ .alloc = alloc, .history = &history };
         try replay(.{ .store = store, .id = child_id }, alloc, alloc, .start, null, &sink);
@@ -304,7 +307,8 @@ pub fn commandError(err: anyerror) CommandError {
 }
 
 /// A saved root session as v1's state, read without its lock while another
-/// process may hold it (D37), for `fx session {id}`. A missing session, a
+/// process may hold it (D37), for `fx session {id}`: every turn, with each
+/// compaction's summary where it happened (D32). A missing session, a
 /// child, or an id that cannot name one is `error.SessionNotFound`. Caller
 /// owns the result.
 pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
@@ -316,8 +320,9 @@ pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     if (peeked.role != .root) return error.SessionNotFound;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
-    var restored = try restoreFrom(.{ .store = store, .id = id }, alloc, scratch.allocator(), peeked.state, null);
+    var restored = try settingsFrom(alloc, scratch.allocator(), peeked.state);
     defer restored.deinit(alloc);
+    restored.history = try detailHistory(.{ .store = store, .id = id }, alloc);
     return resumedOf(alloc, &restored, id, peeked.workspace);
 }
 
@@ -1273,6 +1278,9 @@ pub const Session = struct {
                 defer types.freeHistoryTurn(sink.alloc, value);
                 try sink.visitor.append(value);
             }
+
+            /// The transcript shows turns only, as v1's does.
+            fn summary(_: *@This(), _: []const u8) !void {}
         };
         var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
         try replay(self.source(), alloc, alloc, .start, null, &sink);
@@ -1420,18 +1428,8 @@ const TurnNumbers = struct {
 /// comes back interrupted: `failed` after a crash, `cancelled` after a
 /// close. Caller owns the result.
 fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, numbers: ?TurnNumbers) !Restored {
-    const language = if (state.language) |raw| try decodeLanguage(sa, raw) else types.ConversationLanguage.default();
-    var restored: Restored = .{
-        .history = &.{},
-        .language = language,
-        .created_at_ms = std.math.cast(i64, state.created_ms) orelse 0,
-        .updated_at_ms = std.math.cast(i64, state.updated_ms) orelse 0,
-    };
+    var restored = try settingsFrom(alloc, sa, state);
     errdefer restored.deinit(alloc);
-    if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
-    if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
-    if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
-    if (state.usage) |raw| restored.usage = (try decodeUsage(alloc, raw)).snapshot;
 
     var history: std.ArrayList(types.HistoryTurn) = .empty;
     errdefer {
@@ -1465,6 +1463,37 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
     return restored;
 }
 
+/// fx's settings from `state`, with an empty history. Caller owns the result.
+fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
+    const language = if (state.language) |raw| try decodeLanguage(sa, raw) else types.ConversationLanguage.default();
+    var restored: Restored = .{
+        .history = &.{},
+        .language = language,
+        .created_at_ms = std.math.cast(i64, state.created_ms) orelse 0,
+        .updated_at_ms = std.math.cast(i64, state.updated_ms) orelse 0,
+    };
+    errdefer restored.deinit(alloc);
+    if (state.title) |raw| restored.title = try alloc.dupe(u8, try std.json.parseFromSliceLeaky([]const u8, sa, raw, .{}));
+    if (state.prefs) |raw| restored.preferences = try decodePreferences(alloc, raw);
+    if (state.permissions) |raw| restored.permission_state = try session_codec.decodePermissionState(alloc, raw);
+    if (state.usage) |raw| restored.usage = (try decodeUsage(alloc, raw)).snapshot;
+    return restored;
+}
+
+/// Every turn in the log, oldest first, with each compaction's summary where
+/// its line sits, as v1's archive lists them for `fx session {id}` (D32).
+/// Pages are freed as they are read. Caller owns the result.
+fn detailHistory(src: Source, alloc: Allocator) ![]types.HistoryTurn {
+    var history: std.ArrayList(types.HistoryTurn) = .empty;
+    errdefer {
+        for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
+        history.deinit(alloc);
+    }
+    var sink: DetailSink = .{ .alloc = alloc, .history = &history };
+    try replay(src, alloc, alloc, .start, null, &sink);
+    return history.toOwnedSlice(alloc);
+}
+
 /// Keeps each turn for resume, with the number of the turn that holds it.
 const RestoreSink = struct {
     alloc: Allocator,
@@ -1476,6 +1505,40 @@ const RestoreSink = struct {
         try sink.history.ensureUnusedCapacity(sink.alloc, 1);
         if (sink.numbers) |n| try n.list.append(n.alloc, number);
         sink.history.appendAssumeCapacity(value);
+    }
+
+    /// The newest summary already leads the history (`restoreFrom`).
+    fn summary(_: *RestoreSink, _: []const u8) !void {}
+};
+
+/// Keeps every turn and each compaction's summary where its line sits,
+/// counted as v1's archive counts them: the turns before the summary, and
+/// its place among the compactions (D32).
+const DetailSink = struct {
+    alloc: Allocator,
+    history: *std.ArrayList(types.HistoryTurn),
+    turns: usize = 0,
+    compactions: usize = 0,
+
+    fn turn(sink: *DetailSink, value: types.HistoryTurn, _: ?u64) !void {
+        errdefer types.freeHistoryTurn(sink.alloc, value);
+        try sink.history.append(sink.alloc, value);
+        sink.turns += 1;
+    }
+
+    fn summary(sink: *DetailSink, data: []const u8) !void {
+        const parsed = try std.json.parseFromSlice(CompactedData, sink.alloc, data, .{});
+        defer parsed.deinit();
+        const text = try sink.alloc.dupe(u8, parsed.value.summary);
+        errdefer sink.alloc.free(text);
+        try sink.history.append(sink.alloc, .{ .compacted_summary = .{
+            .summary = text,
+            .removed_turn_count = sink.turns,
+            .compaction_count = sink.compactions + 1,
+            .root_user_messages_complete = false,
+            .permission_feedback_complete = false,
+        } });
+        sink.compactions += 1;
     }
 };
 
@@ -1529,7 +1592,8 @@ fn replay(
     sa: Allocator,
     start: sm.From,
     skip_offset: ?u64,
-    /// Takes each finished turn, even when it fails: `turn(value, number)`.
+    /// Takes each finished turn, even when it fails: `turn(value, number)`,
+    /// and each compaction's stored data where its line sits: `summary(data)`.
     sink: anytype,
 ) !void {
     var builder = session_log.ConversationTurnBuilder.init(alloc);
@@ -1621,7 +1685,8 @@ fn replay(
                     if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ src.id, ended.turn, answered });
                     try sink.turn(turn, ended.turn);
                 },
-                .session_created, .compacted, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
+                .compacted => |line| try sink.summary(line.data),
+                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
             }
         }
         from = .{ .at = page.next orelse break };
@@ -2651,6 +2716,56 @@ test "resume after a compaction starts with its summary and keeps the retained t
     try testing.expectEqualStrings("turns one and two", restored.history[0].compacted_summary.summary);
     try testing.expectEqualStrings("three", restored.history[1].assistant.user.text);
     try testing.expectEqualStrings("four", restored.history[2].assistant.user.text);
+}
+
+test "fx session lists every turn with each summary where it happened, as v1 counts it (D32)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const language = types.ConversationLanguage.default();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    // fx's own count differs from the log's; the listing counts the log.
+    var first = "turn one".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 1, .compaction_count = 1 }, false, .{ .turns = 1 });
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    var second = "turns one to three".*;
+    try s.commitCompaction(.{ .summary = &second, .removed_turn_count = 2, .compaction_count = 2 }, false, null);
+    try s.commitTurn(assistantTurn("four", "4"), language);
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    var detail = try readSession(&t.store, testing.allocator, id);
+    defer detail.deinit(testing.allocator);
+    const Want = struct { prompt: ?[]const u8 = null, summary: ?[]const u8 = null, removed: usize = 0, count: usize = 0 };
+    const want = [_]Want{
+        .{ .prompt = "one" },
+        .{ .prompt = "two" },
+        .{ .summary = "turn one", .removed = 2, .count = 1 },
+        .{ .prompt = "three" },
+        .{ .summary = "turns one to three", .removed = 3, .count = 2 },
+        .{ .prompt = "four" },
+    };
+    try testing.expectEqual(want.len, detail.state.history.len);
+    for (want, detail.state.history) |w, got| {
+        if (w.summary) |text| {
+            try testing.expectEqualStrings(text, got.compacted_summary.summary);
+            try testing.expectEqual(w.removed, got.compacted_summary.removed_turn_count);
+            try testing.expectEqual(w.count, got.compacted_summary.compaction_count);
+        } else try testing.expectEqualStrings(w.prompt.?, got.assistant.user.text);
+    }
+
+    // Resume still starts at the newest summary.
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("turns one to three", restored.history[0].compacted_summary.summary);
+    try testing.expectEqualStrings("four", restored.history[1].assistant.user.text);
 }
 
 test "a piece above the inline limit goes to a blob and comes back whole" {

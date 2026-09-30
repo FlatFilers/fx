@@ -1818,6 +1818,99 @@ test("fx sessions and fx session show v2 sessions by workspace, page them, and v
   }
 }, TIMEOUT * 4);
 
+/// Waits until some file under `dir` contains `needle`, on either store.
+async function waitForSavedText(dir: string, needle: string, timeoutMs = TIMEOUT) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const files = existsSync(dir) ? (readdirSync(dir, { recursive: true }) as string[]) : [];
+    for (const name of files) {
+      const path = join(dir, name);
+      if (statSync(path).isFile() && readFileSync(path, "utf8").includes(needle)) return;
+    }
+    await Bun.sleep(50);
+  }
+  throw new Error(`no saved file ever contained ${needle}`);
+}
+
+test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn and summary as v1 does", async () => {
+  // The same turns and `/compact` on each store, then `fx session {id}`.
+  const shapes: Record<string, unknown[]> = {};
+  for (const v2 of [false, true]) {
+    const fixture = createFixture(v2 ? "fx-v2-detail-compacted-" : "fx-v1-detail-compacted-");
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("DETAIL_EARLIER"),
+      fakeGatewayFinalText("DETAIL_MIDDLE"),
+      fakeGatewayFinalText("DETAIL_LATEST"),
+      fakeGatewayFinalText("DETAIL_SUMMARY: the earlier work is done."),
+      fakeGatewayFinalText("DETAIL_AFTER"),
+    ]);
+    let session: TmuxSession | undefined;
+    try {
+      const stderrPath = join(fixture.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      session = await TmuxSession.create({
+        cmd: v2 ? `${FX_BIN} --sessions-v2` : FX_BIN,
+        cwd: fixture.workspace,
+        env: { ...env(fixture, gateway, false), NO_COLOR: "1" },
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const turns = [
+        ["Earlier detail request", "DETAIL_EARLIER"],
+        ["Middle detail request", "DETAIL_MIDDLE"],
+        ["Latest detail request", "DETAIL_LATEST"],
+      ];
+      for (const [prompt, answer] of turns) {
+        await session.sendText(prompt!);
+        await scrollbackContains(session, answer!);
+        await session.waitForComposer(TIMEOUT);
+      }
+      await session.sendText("/compact");
+      await waitForSavedText(join(fixture.home, ".fx", "sessions"), "DETAIL_SUMMARY");
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("After detail request");
+      await scrollbackContains(session, "DETAIL_AFTER");
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const last = await command(fixture, gateway, ["session", "last", "--json"], v2);
+      expect(last.code).toBe(0);
+      const id = JSON.parse(last.stdout).id;
+      const detail = await command(fixture, gateway, ["session", id, "--json"], v2);
+      expect(detail.code).toBe(0);
+      expect(detail.stderr).toBe("");
+      const shown = JSON.parse(detail.stdout);
+      expect(shown.history_len).toBe(shown.history.length);
+      // The summary's text carries fx's own handles, so only its marker counts.
+      shapes[v2 ? "v2" : "v1"] = shown.history.map((entry: any) =>
+        entry.kind === "compacted_summary"
+          ? ["summary", String(entry.summary).includes("DETAIL_SUMMARY"), entry.removed_turn_count, entry.compaction_count]
+          : [entry.kind, entry.user?.text, entry.assistant],
+      );
+      if (v2) {
+        const text = await command(fixture, gateway, ["session", id], true);
+        expect(text.stdout).toContain("Earlier detail request");
+        expect(text.stdout).toContain("[compacted] removed_turns=3 compactions=1");
+        expectWholeLog(fixture, id);
+      }
+    } finally {
+      if (session) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+  expect(shapes.v2).toEqual([
+    ["assistant", "Earlier detail request", "DETAIL_EARLIER"],
+    ["assistant", "Middle detail request", "DETAIL_MIDDLE"],
+    ["assistant", "Latest detail request", "DETAIL_LATEST"],
+    ["summary", true, 3, 1],
+    ["assistant", "After detail request", "DETAIL_AFTER"],
+  ]);
+  expect(shapes.v2).toEqual(shapes.v1);
+}, TIMEOUT * 8);
+
 test("fx session reads a session another process holds, and reads past a torn tail without cutting it", async () => {
   const fixture = createFixture("fx-v2-peek-");
   let stalled: () => void = () => {};
