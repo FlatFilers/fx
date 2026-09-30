@@ -55,6 +55,7 @@ pub const Input = struct {
     session_id: ?[]const u8 = null,
     chars: ?[]const u8 = null,
     force: bool = false,
+    notify_on_exit: bool = false,
 };
 
 pub const public_field_names = blk: {
@@ -73,7 +74,7 @@ pub const ActionFieldContract = struct {
 pub fn actionFieldContract(action: Action) ActionFieldContract {
     return switch (action) {
         .run => .{
-            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
+            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "notify_on_exit" },
             .required = &.{ "action", "command" },
             .conflicts = &.{.{ "profile", "shell" }},
         },
@@ -577,6 +578,7 @@ fn callRun(
         .on_output_chunk = ctx.on_output_chunk,
         .yield_time_ms = input.yield_time_ms,
         .cancel_flag = ctx.cancel_flag,
+        .notify_on_exit = input.notify_on_exit,
     }) catch |err| {
         if (err == error.Cancelled and
             ctx.cancel_flag != null and
@@ -1830,7 +1832,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 test "shell action fields are closed and command authority covers every run" {
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
+        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "notify_on_exit" },
         actionFieldContract(.run).allowed,
     );
     try std.testing.expectEqualSlices(

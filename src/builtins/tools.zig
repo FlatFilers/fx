@@ -70,6 +70,7 @@ const shell_run_properties = [_]model_tool_schema.Property{
     .{ .name = "tty", .json_type = .boolean, .description = "Use a persistent TTY when interactive input or human attachment is required. Defaults to false." },
     .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_yield_time_ms }, .description = "Initial observation window. Defaults to 30000; use 0 to return the owned running handle immediately." },
     .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Set only when the user explicitly requests a finite deadline. Omit for commands intended to remain running, receive input, continue across turns, or be stopped later." },
+    .{ .name = "notify_on_exit", .json_type = .boolean, .description = "tty=false only. When the command is still running after yield_time_ms, fx starts a new [event] turn with its exit status and output tail once it exits, if nobody is waiting on it. Use with yield_time_ms 0 for watchers that exit on an event. Defaults to false." },
 };
 
 const shell_interact_properties = [_]model_tool_schema.Property{
@@ -93,6 +94,7 @@ const shell_profile_run_properties = [_]model_tool_schema.Property{
     shell_run_properties[5],
     shell_run_properties[6],
     shell_run_properties[7],
+    shell_run_properties[8],
 };
 
 const shell_explicit_run_properties = [_]model_tool_schema.Property{
@@ -933,7 +935,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "51b79260638620ff5f046a835b16f37d50dead5156206b600d0357177edf23d7",
+        "b7377231dcf9f7b8d1379f73e6e19c2d292cd8317c6ca8b627bf0dd54c52247b",
         &actual_hex,
     );
 }

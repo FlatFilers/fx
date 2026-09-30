@@ -5,6 +5,8 @@
 ### New Features
 
 - `/every <interval> <prompt>` sends a prompt into the interactive session on a fixed interval (`10s` to `24h`), which is useful as an agent heartbeat. A beat is skipped when a turn is running or queued, or when you have text in the composer. `/every` shows the schedule and `/every off` stops it. The schedule lasts only for the current fx process.
+- Inside an Inby terminal, the tab's icon, colour and sidebar pin now follow fx's state. A hammer on aqua shows while a turn runs and a raised hand on amber while fx is blocked on you. When the turn ends, the tab returns to its resting look. The title and anything you set yourself are left alone. Set `FX_INBY=0` to turn it off.
+- `shell.run` accepts `notify_on_exit`. When a command is still running after `yield_time_ms` and later exits while nothing is waiting on it, fx starts a new turn that begins `[event] shell-N exited <code>: <command>` and includes the output tail. Pair it with a command that exits on an event, such as a GitHub watcher, to wake the agent the moment something happens.
 
 ## 0.0.12
 

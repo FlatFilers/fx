@@ -34,7 +34,41 @@ pub const StartCapturedInput = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     yield_time_ms: u32 = contract.default_yield_time_ms,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// Queue an exit notice for the host when this execution finishes after
+    /// being handed to the model as running.
+    notify_on_exit: bool = false,
 };
+
+/// Bytes of trailing output carried in an exit notice.
+pub const exit_notice_tail_bytes: usize = 2048;
+
+/// A backgrounded execution that finished while nobody was waiting on it.
+/// Owns every slice.
+pub const ExitNotice = struct {
+    execution_id: []u8,
+    command: []u8,
+    state: SnapshotState,
+    output_tail: []u8,
+
+    pub fn deinit(self: *ExitNotice, alloc: Allocator) void {
+        alloc.free(self.execution_id);
+        alloc.free(self.command);
+        alloc.free(self.output_tail);
+    }
+};
+
+pub fn freeExitNotices(alloc: Allocator, notices: []ExitNotice) void {
+    for (notices) |*notice| notice.deinit(alloc);
+    alloc.free(notices);
+}
+
+/// Returns the last `max_bytes` of `bytes`, starting on a UTF-8 boundary.
+pub fn utf8Tail(bytes: []const u8, max_bytes: usize) []const u8 {
+    if (bytes.len <= max_bytes) return bytes;
+    var start = bytes.len - max_bytes;
+    while (start < bytes.len and (bytes[start] & 0xC0) == 0x80) start += 1;
+    return bytes[start..];
+}
 
 pub const TtyCursor = struct {
     segment: u64 = 1,
@@ -204,6 +238,8 @@ const Entry = struct {
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
     pending_delete: bool = false,
+    notify_on_exit: bool = false,
+    exit_notice_pending: bool = false,
 
     fn init(runtime: *Runtime, input: StartCapturedInput) !*Entry {
         const entry = try runtime.alloc.create(Entry);
@@ -274,6 +310,7 @@ const Entry = struct {
             .output_chunk_lifecycle_id = output_chunk_lifecycle_id,
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
+            .notify_on_exit = input.notify_on_exit,
         };
         return entry;
     }
@@ -454,6 +491,7 @@ const Entry = struct {
             );
             self.state = state_for_worker_error(err);
             self.barrier.output_drained = true;
+            if (self.notify_on_exit) self.markExitNoticeLocked();
             self.mutex.unlock(zio);
             return;
         };
@@ -471,7 +509,13 @@ const Entry = struct {
         next = contract.transition(next.state, next.barrier, .output_drained);
         self.state = next.state;
         self.barrier = next.barrier;
+        if (self.notify_on_exit) self.markExitNoticeLocked();
         self.mutex.unlock(zio);
+    }
+
+    fn markExitNoticeLocked(self: *Entry) void {
+        self.exit_notice_pending = true;
+        self.runtime.exit_notice_signal.store(true, .release);
     }
 
     fn finalizeReplayLocked(self: *Entry) void {
@@ -502,6 +546,9 @@ pub const Runtime = struct {
     shutting_down: bool = false,
     replay_store: command_replay_store.EphemeralStore,
     pending_admissions: usize = 0,
+    /// Set by a worker when an entry queues an exit notice; lets the host
+    /// poll cheaply every loop tick before draining.
+    exit_notice_signal: std.atomic.Value(bool) = .init(false),
 
     pub fn init(alloc: Allocator) Runtime {
         return .{
@@ -968,6 +1015,47 @@ pub const Runtime = struct {
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
         return self.prepareSnapshotForEntry(alloc, entry);
+    }
+
+    /// Drains exit notices for executions that finished after the model was
+    /// told they were running. A notice is dropped rather than delivered when
+    /// the model is waiting on that execution right now, since it sees the
+    /// exit itself. Caller owns the result; free with `freeExitNotices`.
+    pub fn takeExitNotices(self: *Runtime, alloc: Allocator) ![]ExitNotice {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        self.exit_notice_signal.store(false, .release);
+        var result: std.ArrayList(ExitNotice) = .empty;
+        errdefer {
+            for (result.items) |*notice| notice.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for (self.entries) |candidate| {
+            const entry = candidate orelse continue;
+            entry.mutex.lockUncancelable(zio);
+            defer entry.mutex.unlock(zio);
+            if (!entry.exit_notice_pending) continue;
+            entry.exit_notice_pending = false;
+            if (!entry.published_running or entry.active_waiter != null) continue;
+            const execution_id = try alloc.dupe(u8, entry.execution_id);
+            errdefer alloc.free(execution_id);
+            const command = try alloc.dupe(u8, entry.command);
+            errdefer alloc.free(command);
+            const tail = try alloc.dupe(u8, utf8Tail(entry.output.items, exit_notice_tail_bytes));
+            errdefer alloc.free(tail);
+            try result.append(alloc, .{
+                .execution_id = execution_id,
+                .command = command,
+                .state = entry.statusSnapshot(),
+                .output_tail = tail,
+            });
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
+    pub fn hasPendingExitNotices(self: *Runtime) bool {
+        return self.exit_notice_signal.load(.acquire);
     }
 
     pub fn list(self: *Runtime, alloc: Allocator) ![]ListItem {
@@ -2181,4 +2269,11 @@ test "TTY cursor advances monotonically and delivers each delta once" {
         .max_output_bytes = 64,
         .published_running = true,
     }));
+}
+
+test "utf8Tail keeps whole characters" {
+    try std.testing.expectEqualStrings("abc", utf8Tail("abc", 8));
+    try std.testing.expectEqualStrings("cd", utf8Tail("abcd", 2));
+    // A cut through the two-byte "\xc3\xa9" moves forward to the next character.
+    try std.testing.expectEqualStrings("z", utf8Tail("a\xc3\xa9z", 2));
 }

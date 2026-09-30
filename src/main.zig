@@ -84,6 +84,7 @@ const app_mcp_menu_runtime = @import("core/app/app_mcp_menu_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const heartbeat = @import("core/heartbeat/heartbeat.zig");
+const exit_events = @import("core/app/exit_events.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
 const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
@@ -1146,9 +1147,10 @@ const App = struct {
         return self.shell.fullTranscriptFocusedWorkActive();
     }
 
-    /// Idle means a submitted prompt cannot interrupt the user or a turn: no
-    /// turn running, queued, pending, or compacting, and nothing in the composer.
-    fn heartbeatIdle(self: *App) bool {
+    /// True when a host-submitted prompt (heartbeat beat or shell exit event)
+    /// cannot interrupt the user or a turn: no turn running, queued, pending,
+    /// or compacting, and nothing in the composer.
+    fn canSubmitAutonomousPrompt(self: *App) bool {
         return !self.worker.isProcessing() and
             self.worker.queuedPromptCount() == 0 and
             self.submission.pending == null and
@@ -1157,9 +1159,25 @@ const App = struct {
             self.pending_images.items.len == 0;
     }
 
+    /// Starts an `[event]` turn for background shells that exited while the
+    /// model was not waiting on them. Notices stay queued until the session is
+    /// idle, so an event never interrupts the user or a running turn.
+    fn collectShellExitFacts(self: *App) !void {
+        if (!self.managed_executions.hasPendingExitNotices()) return;
+        if (!self.canSubmitAutonomousPrompt()) return;
+        const notices = try self.managed_executions.takeExitNotices(self.alloc);
+        defer managed_execution.freeExitNotices(self.alloc, notices);
+        if (notices.len == 0) return;
+        const text = try exit_events.formatPrompt(self.alloc, notices);
+        defer self.alloc.free(text);
+        debug_trace.logf("events", "shell_exit_event_submitted count={d}", .{notices.len});
+        try self.input_runtime.edit_state.setText(self.alloc, text);
+        try InputSubmitRuntime.submit(self, max_prompt_history);
+    }
+
     fn collectHeartbeatFacts(self: *App) !void {
         if (!self.heartbeat.active()) return;
-        switch (self.heartbeat.tick(io_mod.milliTimestamp(), self.heartbeatIdle())) {
+        switch (self.heartbeat.tick(io_mod.milliTimestamp(), self.canSubmitAutonomousPrompt())) {
             .none => {},
             .skipped => debug_trace.logf("every", "beat_skipped reason=busy skipped={d}", .{self.heartbeat.skipped_count}),
             .fire => {
@@ -3098,6 +3116,7 @@ const App = struct {
             try AuthAppRuntime.collectApiKeySaveFacts(self);
         }
         try self.processNextCooperativePrompt();
+        try self.collectShellExitFacts();
         try self.collectHeartbeatFacts();
 
         const cols_before_resize = self.shell.layout.cols;
@@ -4807,6 +4826,8 @@ test {
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/app_entry_runtime.zig");
+    _ = @import("core/app/exit_events.zig");
+    _ = @import("core/heartbeat/heartbeat.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = input_submit_runtime;
     _ = @import("core/app/app_lifecycle.zig");
