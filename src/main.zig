@@ -538,6 +538,7 @@ const App = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
+    inby: builtin_hooks.InbyClient = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -869,6 +870,8 @@ const App = struct {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        // Returns the Inby tab to its resting look; idempotent across both shutdown paths.
+        self.inby.deinit();
         self.stopStream();
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
@@ -932,6 +935,8 @@ const App = struct {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        // Returns the Inby tab to its resting look; idempotent across both shutdown paths.
+        self.inby.deinit();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
 

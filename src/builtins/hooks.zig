@@ -7,15 +7,21 @@
 const std = @import("std");
 const hooks = @import("../core/hooks/hooks.zig");
 const herdr = @import("hooks/herdr.zig");
+const inby = @import("hooks/inby.zig");
 
 pub const notifications = @import("hooks/notifications.zig");
 pub const Client = herdr.Client;
+pub const InbyClient = inby.Client;
 
 pub fn Runtime(comptime App: type) type {
     return struct {
         /// Must run before the lifecycle runtime is frozen (currently the
         /// notification runtime performs the sole freeze right after this).
         pub fn configure(app: *App, active_session_id: ?[]const u8) !void {
+            if (comptime @hasField(App, "inby")) {
+                app.inby.initFromEnv(app.alloc);
+                if (app.inby.enabled) try registerInby(app);
+            }
             app.herdr.initFromEnv(app.alloc);
             if (!app.herdr.enabled) return;
 
@@ -42,7 +48,33 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn reportWorking(app: *App) void {
+            if (comptime @hasField(App, "inby")) app.inby.report(.working);
             app.herdr.reportState(.working, null);
+        }
+
+        fn registerInby(app: *App) !void {
+            try app.lifecycle_runtime.registerPostTurnEnd(.{
+                .name = "fx.inby.turn_end",
+                .ctx = app,
+                .run = inbyTurnEndHandler,
+            });
+            try app.lifecycle_runtime.registerAttentionRequired(.{
+                .name = "fx.inby.attention_required",
+                .ctx = app,
+                .run = inbyAttentionHandler,
+            });
+        }
+
+        fn inbyTurnEndHandler(raw: *anyopaque, input: hooks.PostTurnEndInput) hooks.HandlerError!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (input.invocation.scope.kind != .interactive) return;
+            app.inby.report(.idle);
+        }
+
+        fn inbyAttentionHandler(raw: *anyopaque, input: hooks.AttentionRequiredInput) hooks.HandlerError!void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            if (input.invocation.scope.kind != .interactive) return;
+            app.inby.report(.needs_you);
         }
 
         fn postTurnEndHandler(
