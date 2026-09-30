@@ -137,6 +137,21 @@ pub fn save(alloc: Allocator, store: Store, id: Id, content: []const u8) Store.E
     return store.write(alloc, fileName(&buffer, id), content);
 }
 
+/// The highest turn and tool call numbers saved; zero when there are none.
+pub const Highest = struct { turns: usize = 0, tools: usize = 0 };
+
+pub fn highestSaved(arena: Allocator, store: Store) Store.Error!Highest {
+    var highest: Highest = .{};
+    for (try store.list(arena)) |name| {
+        const id = parseFileName(name) orelse continue;
+        switch (id.kind) {
+            .turn => highest.turns = @max(highest.turns, id.number),
+            .tool => highest.tools = @max(highest.tools, id.number),
+        }
+    }
+    return highest;
+}
+
 /// The whole of file `name` when it is exactly `bytes` long and no larger
 /// than a searched file, else null. `arena` owns the bytes.
 pub fn readExact(arena: Allocator, store: Store, name: []const u8, bytes: usize) Allocator.Error!?[]const u8 {

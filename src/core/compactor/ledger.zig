@@ -84,7 +84,7 @@ pub fn writeRequest(alloc: Allocator, text: *std.ArrayList(u8), asked: Asked) Al
     }
     try text.appendSlice(alloc, "Then only the new entries of these sections, each starting with its ID and the turn or tool call it comes from, like `F<number> (T<number>):`:\n\n");
     try text.print(alloc, "Rules:\nR1, R2, ...: each new instruction, rule or preference from the user, quoted word for word in double quotes, with {s}{s}.\n\n", .{
-        if (asked.saved) "the ID of its turn, like M<number>" else "the number of its turn",
+        if (asked.saved) "the ID of its turn, like M<number>" else "its turn, like `(turn <number>)`",
         if (asked.open != null) ", or `(turn in progress)` for the turn still in progress" else "",
     });
     try text.appendSlice(alloc, "Facts:\nF1, F2, ...: facts the work depends on, from these turns: names, paths, values, results, causes.\n\n" ++
@@ -141,6 +141,8 @@ fn writeHeadingRest(alloc: Allocator, text: *std.ArrayList(u8), turn: Heading) A
 fn writeHighestIds(alloc: Allocator, text: *std.ArrayList(u8), entries: []const checkpoint.Entry) Allocator.Error!void {
     var highest = [_]usize{0} ** entry_kinds.len;
     for (entries) |entry| {
+        // A saved checkpoint is read back from disk, where an ID may be empty.
+        if (entry.id.len == 0) continue;
         const kind = std.mem.findScalar(u8, entry_kinds, entry.id[0]) orelse continue;
         const number = std.fmt.parseInt(usize, entry.id[1..], 10) catch continue;
         highest[kind] = @max(highest[kind], number);
@@ -734,6 +736,13 @@ fn stringArgument(arena: Allocator, arguments: []const u8, field: []const u8) Al
 }
 
 const testing = std.testing;
+
+test "a saved entry with an empty ID is skipped when new IDs are numbered" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try writeHighestIds(testing.allocator, &text, &.{ .{ .id = "", .text = "" }, .{ .id = "F4", .text = "F4 (T1): x" } });
+    try testing.expectEqualStrings(" The highest IDs so far: F4. Number new entries after them.", text.items);
+}
 
 test "entries are found by their IDs, with the lines that continue them" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

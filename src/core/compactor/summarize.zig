@@ -696,10 +696,6 @@ fn finalIndex(turn: Turn) ?usize {
     return final_index;
 }
 
-fn finalReply(turn: Turn) []const u8 {
-    return if (finalIndex(turn)) |index| turn.items[index].assistant else "";
-}
-
 fn hasCall(tools: []const PendingTool, number: usize) bool {
     for (tools) |tool| if (tool.number == number) return tool.call != null;
     return false;

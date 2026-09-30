@@ -224,8 +224,13 @@ fn latestCompactionCount(history: []const types.HistoryTurn) usize {
 /// readable.
 fn earlierFrom(arena: Allocator, store: ?Store, earlier: ?[]const u8) !?summarize.Compacted {
     const saved = earlier orelse return null;
-    return try checkpoint.parse(arena, saved) orelse
-        try legacyEarlier(arena, store, saved) orelse .{ .earlier = saved };
+    if (try checkpoint.parse(arena, saved)) |payload| return payload;
+    if (try legacyEarlier(arena, store, saved)) |legacy| return legacy;
+    // An unreadable checkpoint may have saved turns and tool calls already;
+    // numbering after them keeps the new ones from replacing them.
+    const highest: records.Highest = if (store) |kept| try records.highestSaved(arena, kept) else .{};
+    if (highest.turns > 0 or highest.tools > 0) trace.log(false, "earlier checkpoint unreadable; new turns and tool calls are numbered after the saved ones turns={d} tools={d}", .{ highest.turns, highest.tools });
+    return .{ .earlier = saved, .turn_count = highest.turns, .tool_count = highest.tools };
 }
 
 /// The first user message starts each turn; later ones are messages the user
@@ -306,6 +311,27 @@ test "a clipped result keeps the handle of its saved whole output" {
     try std.testing.expectEqualStrings("", savedOutputHandle(.{ .output_handle = handle }, "whole text"));
     try std.testing.expectEqualStrings("", savedOutputHandle(clipped_page, "preview; full result: " ++ handle));
     try std.testing.expectEqualStrings("", savedOutputHandle(null, "no memory"));
+}
+
+test "an unreadable checkpoint numbers new turns and tool calls after the saved ones" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var memory = records.MemoryStore{ .alloc = std.testing.allocator };
+    defer memory.deinit();
+    const store = memory.store();
+    try records.save(arena, store, .{ .kind = .turn, .number = 3 }, "turn three");
+    try records.save(arena, store, .{ .kind = .tool, .number = 7 }, "tool seven");
+    try records.save(arena, store, .{ .kind = .tool, .number = 2 }, "tool two");
+    try store.write(arena, "result-shell-1.txt", "not a record");
+
+    const broken = "fx-compactor-v1\n{\"turns\": [";
+    const earlier = (try earlierFrom(arena, store, broken)).?;
+    try std.testing.expectEqualStrings(broken, earlier.earlier);
+    try std.testing.expectEqual(@as(usize, 3), earlier.turn_count);
+    try std.testing.expectEqual(@as(usize, 7), earlier.tool_count);
+    // Without a store nothing was saved, so numbering starts at one.
+    try std.testing.expectEqual(@as(usize, 0), (try earlierFrom(arena, null, broken)).?.turn_count);
 }
 
 test {

@@ -160,6 +160,16 @@ fn citations(arena: Allocator, text: []const u8) Allocator.Error![]const Citatio
     var out: std.ArrayList(Citation) = .empty;
     var at: usize = 0;
     while (at < text.len) : (at += 1) {
+        // Without saved records a turn is named like `turn 3`.
+        const turn_word = "turn ";
+        if ((at == 0 or !isWordByte(text[at - 1])) and std.ascii.startsWithIgnoreCase(text[at..], turn_word)) {
+            var end = at + turn_word.len;
+            if (readNumber(text, &end)) |number| if (end >= text.len or !isWordByte(text[end])) {
+                try out.append(arena, .{ .kind = 'M', .first = number, .last = number });
+                at = end - 1;
+                continue;
+            };
+        }
         const kind = text[at];
         if ((kind != 'M' and kind != 'T') or (at > 0 and isWordByte(text[at - 1]))) continue;
         var end = at + 1;
@@ -532,6 +542,8 @@ test "entries that name their source and state what it holds pass unmarked" {
         .{ .id = "F3", .text = "F3 (M4): resumeForWrite lives in src/core/app.zig" },
         .{ .id = "R1", .text = "R1 (M4): \"never push to main\"" },
         .{ .id = "R2", .text = "R2 (turn in progress): \"keep the fix small\"" },
+        // Without saved records a turn is cited by its number.
+        .{ .id = "R3", .text = "R3 (turn 4): \"never push to main\"" },
         .{ .id = "S1", .text = "S1 (T7): 141 tests run, 2 fail; replaces S0" },
     };
     var counts: Counts = .{};
@@ -554,6 +566,7 @@ test "what an entry gets wrong is marked, and the entry stays" {
         .{ .id = "R2", .text = "R2 (M4): keep it small" },
         // Numbers with more around them and case count as found.
         .{ .id = "F4", .text = "F4 (T9): LIBFX went to 0.0.10-dev after ~707AFAC508E1" },
+        .{ .id = "F5", .text = "F5 (turn 9): 141 tests" },
     };
     var counts: Counts = .{};
     const result = try checked(arena, .{ .entries = &entries }, &.{}, &counts);
@@ -564,9 +577,10 @@ test "what an entry gets wrong is marked, and the entry stays" {
     try testing.expectEqualStrings("R1 (M4): \"never force push\" [check: not the user's exact words]", result.entries[4].text);
     try testing.expectEqualStrings("R2 (M4): keep it small [check: no quote of the user's words]", result.entries[5].text);
     try testing.expectEqualStrings(entries[6].text, result.entries[6].text);
-    try testing.expectEqual(@as(usize, 6), counts.marked);
+    try testing.expectEqualStrings("F5 (turn 9): 141 tests [check: M9 does not exist]", result.entries[7].text);
+    try testing.expectEqual(@as(usize, 7), counts.marked);
     try testing.expectEqual(@as(usize, 1), counts.no_source);
-    try testing.expectEqual(@as(usize, 1), counts.missing_ids);
+    try testing.expectEqual(@as(usize, 2), counts.missing_ids);
     try testing.expectEqual(@as(usize, 2), counts.unfound_values);
     try testing.expectEqual(@as(usize, 1), counts.bad_replaces);
     try testing.expectEqual(@as(usize, 2), counts.unquoted);
